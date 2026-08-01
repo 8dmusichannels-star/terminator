@@ -107,6 +107,38 @@ class TerminalBuffer(
     /** How many lines are available to scroll back through right now. */
     val maxScrollOffset: Int get() = scrollback.size
 
+    /**
+     * Plain text between two screen positions (row, col), as currently
+     * rendered - i.e. respecting [scrollOffset] the same way [lineAt] does,
+     * so selecting into scrollback and copying grabs what's actually on
+     * screen rather than the live grid underneath it. The two endpoints can
+     * be given in either order (drag-up or drag-down selection); this
+     * normalizes them internally. Each line's trailing spaces are trimmed
+     * (the common terminal-copy convention - unwritten cells are blank
+     * padding, not real content) but a run of spaces in the *middle* of a
+     * line is preserved untouched. Multi-row selections are newline-joined.
+     */
+    fun selectedText(startRow: Int, startCol: Int, endRow: Int, endCol: Int, scrollOffset: Int): String {
+        var r1 = startRow; var c1 = startCol
+        var r2 = endRow; var c2 = endCol
+        if (r1 > r2 || (r1 == r2 && c1 > c2)) {
+            val tr = r1; val tc = c1
+            r1 = r2; c1 = c2
+            r2 = tr; c2 = tc
+        }
+        val lines = mutableListOf<String>()
+        for (row in r1..r2) {
+            val fromCol = (if (row == r1) c1 else 0).coerceIn(0, columns - 1)
+            val toCol = (if (row == r2) c2 else columns - 1).coerceIn(0, columns - 1)
+            val sb = StringBuilder()
+            for (col in fromCol..toCol) {
+                sb.append(lineAt(row, col, scrollOffset).char)
+            }
+            lines.add(sb.toString().trimEnd(' '))
+        }
+        return lines.joinToString("\n")
+    }
+
     fun setCell(row: Int, col: Int, cell: Cell) {
         if (row in 0 until rows && col in 0 until columns) {
             grid[row][col] = cell

@@ -97,6 +97,12 @@ fun TerminalView(
     // 0 = showing the live screen (normal). >0 = the user has dragged the
     // terminal down to look at scrollback history, this many lines back.
     scrollOffset: Int = 0,
+    // Long-press-to-select range, in (row, col) screen space - null when
+    // nothing is selected. Order doesn't matter (start can be after end,
+    // e.g. dragging upward); the highlight and the copied text both
+    // normalize it the same way.
+    selectionStart: Pair<Int, Int>? = null,
+    selectionEnd: Pair<Int, Int>? = null,
     modifier: Modifier = Modifier
 ) {
     // bufferVersion is bumped by the caller's ViewModel on every
@@ -106,7 +112,7 @@ fun TerminalView(
     Canvas(modifier = modifier.fillMaxSize()) {
         @Suppress("UNUSED_EXPRESSION")
         bufferVersion
-        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset)
+        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectionStart, selectionEnd)
     }
 }
 
@@ -116,7 +122,9 @@ private fun DrawScope.drawTerminal(
     fontFamily: Typeface,
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
-    scrollOffset: Int = 0
+    scrollOffset: Int = 0,
+    selectionStart: Pair<Int, Int>? = null,
+    selectionEnd: Pair<Int, Int>? = null
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -142,6 +150,35 @@ private fun DrawScope.drawTerminal(
     val charHeight = paint.fontSpacing
 
     drawRect(color = Color(palette.defaultBackground).copy(alpha = backgroundAlpha.coerceIn(0f, 1f)), size = size)
+
+    // Selection highlight, drawn before glyphs so text stays legible on top
+    // of it. Normalized the same way TerminalBuffer.selectedText() does -
+    // start/end can be given in either order (dragging up vs down) - so the
+    // two stay visually and textually consistent with each other.
+    if (selectionStart != null && selectionEnd != null) {
+        var (r1, c1) = selectionStart
+        var (r2, c2) = selectionEnd
+        if (r1 > r2 || (r1 == r2 && c1 > c2)) {
+            val tr = r1; val tc = c1
+            r1 = r2; c1 = c2
+            r2 = tr; c2 = tc
+        }
+        val highlightColor = Color(0xFF4A90D9).copy(alpha = 0.45f)
+        for (row in r1..r2) {
+            if (row !in 0 until buffer.rows) continue
+            val fromCol = (if (row == r1) c1 else 0).coerceIn(0, buffer.columns - 1)
+            val toCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
+            if (fromCol > toCol) continue
+            val x = fromCol * charWidth
+            val y = (row + 1) * charHeight
+            val width = (toCol - fromCol + 1) * charWidth
+            drawRect(
+                color = highlightColor,
+                topLeft = Offset(x, y - charHeight),
+                size = androidx.compose.ui.geometry.Size(width, charHeight)
+            )
+        }
+    }
 
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {

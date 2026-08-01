@@ -10,6 +10,9 @@ import androidx.activity.viewModels
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -309,6 +312,14 @@ class MainActivity : ComponentActivity() {
                             // ends, via the commit block in the pointerInput below.
                             var liveZoomSize by remember(activeSessionId) { mutableStateOf<Float?>(null) }
                             var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
+
+                            // Long-press-to-select range (row, col screen-space), shown as a
+                            // highlight in TerminalView and backing the Copy/Paste toolbar
+                            // below. Reset whenever the active session changes so a leftover
+                            // selection from a different session's screen can never linger.
+                            var selectionStart by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
+                            var selectionEnd by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
+                            val clipboardManager = LocalClipboardManager.current
                             val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
                             // The pinch gesture's pointerInput below is keyed only on
                             // activeSessionId (not effectiveTextSize) so it doesn't restart
@@ -443,12 +454,61 @@ class MainActivity : ComponentActivity() {
                                                 var moved = false
                                                 var lastPos = down.position
                                                 var pointerCount = 1
+                                                // Text selection: a long-press with the finger
+                                                // still down and (near-)stationary starts it,
+                                                // exactly like Android's native text selection.
+                                                // Raced against the existing tap/scroll/pinch
+                                                // handling below via a per-iteration
+                                                // withTimeoutOrNull instead of a second, separate
+                                                // pointerInput - this loop is deliberately the
+                                                // ONLY thing reading the touch stream (see the
+                                                // comment above), so a long-press timeout has to
+                                                // live inside it rather than compete with it.
+                                                var selecting = false
+                                                val longPressDeadline = System.currentTimeMillis() + viewConfiguration.longPressTimeoutMillis
                                                 while (true) {
-                                                    val event = awaitPointerEvent()
+                                                    val remainingMillis = longPressDeadline - System.currentTimeMillis()
+                                                    val event = if (!moved && !selecting && remainingMillis > 0) {
+                                                        withTimeoutOrNull(remainingMillis) { awaitPointerEvent() }
+                                                    } else {
+                                                        awaitPointerEvent()
+                                                    }
+
+                                                    if (event == null) {
+                                                        // Timed out with the finger still down and
+                                                        // stationary (no event arrived within the
+                                                        // deadline) - that's the long-press.
+                                                        selecting = true
+                                                        moved = true
+                                                        val (charWidth, charHeight) = charMetrics
+                                                        if (charWidth > 0f && charHeight > 0f) {
+                                                            val cell = (lastPos.x / charWidth).toInt() to (lastPos.y / charHeight).toInt()
+                                                            selectionStart = cell
+                                                            selectionEnd = cell
+                                                        }
+                                                        continue
+                                                    }
+
                                                     val changes = event.changes
                                                     pointerCount = changes.count { it.pressed }
                                                     val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
                                                     if (primary == null || !changes.any { it.pressed }) break
+
+                                                    if (selecting) {
+                                                        // Dragging while selecting extends the
+                                                        // range instead of scrolling/pinching -
+                                                        // exactly one finger is expected here since
+                                                        // a second finger joining mid-selection just
+                                                        // keeps tracking the original one.
+                                                        val (charWidth, charHeight) = charMetrics
+                                                        if (charWidth > 0f && charHeight > 0f) {
+                                                            selectionEnd = (primary.position.x / charWidth).toInt() to
+                                                                (primary.position.y / charHeight).toInt()
+                                                        }
+                                                        primary.consume()
+                                                        lastPos = primary.position
+                                                        continue
+                                                    }
 
                                                     if (pointerCount >= 2) {
                                                         // Pinch: two (or more) fingers down -
@@ -518,13 +578,18 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
 
-                                                if (!moved && softKeyboardEnabled) {
-                                                    if (keyboardOpen) {
-                                                        keyboardController?.hide()
-                                                        focusManager.clearFocus()
-                                                    } else {
-                                                        focusRequester.requestFocus()
-                                                        keyboardController?.show()
+                                                if (!selecting) {
+                                                    if (selectionStart != null) {
+                                                        selectionStart = null
+                                                        selectionEnd = null
+                                                    } else if (!moved && softKeyboardEnabled) {
+                                                        if (keyboardOpen) {
+                                                            keyboardController?.hide()
+                                                            focusManager.clearFocus()
+                                                        } else {
+                                                            focusRequester.requestFocus()
+                                                            keyboardController?.show()
+                                                        }
                                                     }
                                                 }
                                             }
@@ -566,6 +631,8 @@ class MainActivity : ComponentActivity() {
                                             // behind it - otherwise stay fully opaque as before.
                                             backgroundAlpha = if (wallpaperUriStr.isNotBlank()) blurAlpha else 1f,
                                             scrollOffset = state.scrollOffset,
+                                            selectionStart = selectionStart,
+                                            selectionEnd = selectionEnd,
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     }
@@ -577,6 +644,35 @@ class MainActivity : ComponentActivity() {
                                             .fillMaxSize()
                                             .background(Color.Black.copy(alpha = 0.12f))
                                     )
+
+                                    if (selectionStart != null && selectionEnd != null) {
+                                        SelectionToolbar(
+                                            modifier = Modifier
+                                                .align(Alignment.TopCenter)
+                                                .padding(top = 8.dp),
+                                            onCopy = {
+                                                val (r1, c1) = selectionStart!!
+                                                val (r2, c2) = selectionEnd!!
+                                                val text = buffer?.selectedText(r1, c1, r2, c2, state.scrollOffset).orEmpty()
+                                                if (text.isNotEmpty()) {
+                                                    clipboardManager.setText(AnnotatedString(text))
+                                                }
+                                                selectionStart = null
+                                                selectionEnd = null
+                                            },
+                                            onPaste = {
+                                                clipboardManager.getText()?.text?.let { pasted ->
+                                                    if (pasted.isNotEmpty()) viewModel.sendInput(pasted)
+                                                }
+                                                selectionStart = null
+                                                selectionEnd = null
+                                            },
+                                            onCancel = {
+                                                selectionStart = null
+                                                selectionEnd = null
+                                            }
+                                        )
+                                    }
 
                                     // Invisible field that actually captures IME input and
                                     // forwards it to the active session, one keystroke at a time.
