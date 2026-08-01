@@ -29,6 +29,7 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
     val virtualKeys by repo.flow(SettingsKeys.VIRTUAL_KEYS, true).collectAsState(initial = true)
     val inputMode by repo.flow(SettingsKeys.INPUT_MODE, "Default").collectAsState(initial = "Default")
     val seccompEnabled by repo.flow(SettingsKeys.SECCOMP_ENABLED, false).collectAsState(initial = false)
+    val termType by repo.flow(SettingsKeys.TERM_TYPE, "xterm-256color").collectAsState(initial = "xterm-256color")
     var showKeymapper by remember { mutableStateOf(false) }
 
     if (showKeymapper) {
@@ -75,6 +76,32 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
                 description = "Fixes Samsung keyboard echo; may break Gboard CJK input",
                 selected = inputMode == "Legacy"
             ) { scope.launch { repo.set(SettingsKeys.INPUT_MODE, "Legacy") } }
+
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("Terminal Type (TERM)", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "What full-screen apps (nano, vim, htop...) see as \$TERM. " +
+                    "Only takes effect for sessions started after changing it.",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            InputModeOption(
+                title = "xterm-256color (Recommended)",
+                description = "Full color and feature support; uses this app's bundled terminfo entry",
+                selected = termType == "xterm-256color"
+            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "xterm-256color") } }
+
+            InputModeOption(
+                title = "vt100",
+                description = "Minimal, near-universal - works even without a terminfo entry",
+                selected = termType == "vt100"
+            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "vt100") } }
+
+            InputModeOption(
+                title = "ansi",
+                description = "Basic ANSI/DOS-style compatibility, no color extensions",
+                selected = termType == "ansi"
+            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "ansi") } }
 
             Spacer(modifier = Modifier.height(24.dp))
             OutlinedButton(onClick = { showKeymapper = true }) {

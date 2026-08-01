@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.terminator.app.session.SessionEntry
 import com.terminator.app.session.SessionRepository
+import com.terminator.app.settings.SettingsKeys
+import com.terminator.app.settings.SettingsRepository
 import com.terminator.emulator.TerminalBuffer
 import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalSession
@@ -46,7 +48,11 @@ data class MainUiState(
 
 class MainViewModel(
     private val repository: SessionRepository,
-    private val historyDir: File
+    private val historyDir: File,
+    private val settingsRepository: SettingsRepository,
+    // Root of the bundled terminfo db extracted by TerminatorApp.onCreate -
+    // see its extractBundledTerminfo() doc for why xterm-256color needs it.
+    private val terminfoDir: String
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MainUiState())
@@ -57,6 +63,19 @@ class MainViewModel(
     // Which entry each runtime id was spawned from, so "+" can duplicate
     // whatever is currently active and the drawer can label running rows.
     private val liveEntries = mutableMapOf<String, SessionEntry>()
+
+    // Latest value of Settings > Keyboard > Terminal Type. Kept as a plain
+    // field (rather than read fresh per-launch) so a newly spawned session
+    // always uses whatever the user currently has selected, without every
+    // call site needing to be a suspend function just to read one
+    // preference. Sessions already running keep whatever TERM they started
+    // with - this only affects new ones from this point on.
+    private var termType: String = "xterm-256color"
+
+    // Latest value of Settings > Keyboard > SECCOMP. Same "plain field kept
+    // fresh via a collector" pattern as termType above - applies to every
+    // session launched from this point on.
+    private var seccompEnabled: Boolean = false
 
     // Last measured terminal viewport, in character columns/rows. Updated by
     // MainActivity whenever the actual drawing area changes size (rotation,
@@ -74,6 +93,12 @@ class MainViewModel(
                     list.firstOrNull { it.isDefault }?.let { openSession(it) }
                 }
             }
+        }
+        viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.TERM_TYPE, "xterm-256color").collect { termType = it }
+        }
+        viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.SECCOMP_ENABLED, false).collect { seccompEnabled = it }
         }
     }
 
@@ -126,7 +151,10 @@ class MainViewModel(
             id = runtimeId,
             spec = entry.toSpec(),
             historyFile = historyFile,
-            useRoot = entry.useRoot
+            useRoot = entry.useRoot,
+            termType = termType,
+            seccompWorkaround = seccompEnabled,
+            terminfoDir = terminfoDir
         )
         val listener = object : TerminalEmulator.Listener {
             override fun onBell() {
@@ -272,6 +300,14 @@ class MainViewModel(
      *  fall through to the normal scroll/select/pinch-zoom gestures. */
     fun activeSessionWantsMouseEvents(): Boolean =
         liveSessions[_uiState.value.activeSessionId]?.emulator?.mouseMode != TerminalEmulator.MouseMode.NONE
+
+    /** Whether the running program has switched the terminal into
+     *  "application cursor keys" mode (DECCKM, CSI ?1h) - e.g. nano/vim via
+     *  ncurses' keypad(TRUE). While active, arrow/home/end keys need to be
+     *  sent as SS3 (\EO..) sequences instead of the normal CSI (\E[..) form
+     *  or the running program won't recognize them at all. */
+    fun activeSessionApplicationCursorKeys(): Boolean =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.applicationCursorKeys == true
 
     fun sendMouseEvent(kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
         liveSessions[_uiState.value.activeSessionId]?.sendMouseEvent(kind, col, row, button)

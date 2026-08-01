@@ -33,6 +33,20 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
 
     val fontFamily by repo.flow(SettingsKeys.FONT_FAMILY, "Monospace").collectAsState(initial = "Monospace")
+    // Was written by the font picker below but never read back anywhere -
+    // this is what lets the screen actually show which file is imported
+    // instead of just a generic "Custom" label.
+    val fontUri by repo.flow(SettingsKeys.FONT_URI, "").collectAsState(initial = "")
+    val importedFontName = remember(fontUri) {
+        if (fontUri.isBlank()) null
+        else runCatching {
+            context.contentResolver.query(android.net.Uri.parse(fontUri), null, null, null, null)
+                ?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (cursor.moveToFirst() && nameIndex >= 0) cursor.getString(nameIndex) else null
+                }
+        }.getOrNull()
+    }
     val textSize by repo.flow(SettingsKeys.TEXT_SIZE, 14f).collectAsState(initial = 14f)
     val columns by repo.flow(SettingsKeys.COLUMNS, 80f).collectAsState(initial = 80f)
     val blurAlpha by repo.flow(SettingsKeys.BLUR_ALPHA, 0.3f).collectAsState(initial = 0.3f)
@@ -98,7 +112,15 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
                             }
                         }
                     )
-                    Text(if (option == "Custom") "Custom (import .ttf/.otf)" else option)
+                    Text(
+                        if (option == "Custom") {
+                            if (fontFamily == "Custom" && importedFontName != null) {
+                                "Custom (imported: $importedFontName)"
+                            } else {
+                                "Custom (import .ttf/.otf)"
+                            }
+                        } else option
+                    )
                 }
             }
 

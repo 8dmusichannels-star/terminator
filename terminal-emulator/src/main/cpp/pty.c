@@ -14,9 +14,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+// Some OEM kernels install a seccomp-bpf filter that rejects the specific
+// clone flags bionic's fork() passes (it goes through the clone3 syscall,
+// or falls back to clone() with CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID),
+// which shows up to the app as "fork failed: Operation not permitted" even
+// though nothing else about the call is disallowed. A plain
+// syscall(SYS_clone, SIGCHLD, 0, ...) with every other argument zeroed asks
+// for the same "act like fork()" behavior but without any of the flags
+// those policies filter, so it's used instead when the user has enabled
+// Settings > Keyboard > SECCOMP.
+static pid_t seccomp_safe_fork(void) {
+#if defined(__NR_clone)
+    return (pid_t) syscall(__NR_clone, SIGCHLD, 0, 0, 0, 0);
+#else
+    return fork();
+#endif
+}
 
 static int throw_ioexception(JNIEnv *env, const char *msg) {
     jclass cls = (*env)->FindClass(env, "java/io/IOException");
@@ -52,7 +70,7 @@ JNIEXPORT jint JNICALL
 Java_com_terminator_emulator_NativePty_createSubprocess(
         JNIEnv *env, jclass clazz,
         jstring j_cmd, jstring j_cwd, jobjectArray j_argv, jobjectArray j_envp,
-        jintArray j_pidOut, jint rows, jint cols) {
+        jintArray j_pidOut, jint rows, jint cols, jboolean j_seccompWorkaround) {
 
     int masterFd = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
     if (masterFd < 0) {
@@ -87,7 +105,7 @@ Java_com_terminator_emulator_NativePty_createSubprocess(
     int envc = 0;
     char **envp = string_array_to_native(env, j_envp, &envc);
 
-    pid_t pid = fork();
+    pid_t pid = j_seccompWorkaround ? seccomp_safe_fork() : fork();
     if (pid < 0) {
         (*env)->ReleaseStringUTFChars(env, j_cmd, cmd);
         if (cwd != NULL) (*env)->ReleaseStringUTFChars(env, j_cwd, cwd);

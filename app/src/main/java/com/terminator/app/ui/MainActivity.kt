@@ -42,7 +42,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.asImageBitmap
 import android.graphics.BitmapFactory
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.terminator.app.TerminatorApp
@@ -50,7 +55,9 @@ import com.terminator.app.session.SessionForegroundService
 import com.terminator.app.settings.SettingsKeys
 import com.terminator.app.ui.settings.DEFAULT_CUSTOM_BG
 import com.terminator.app.ui.settings.DEFAULT_CUSTOM_FG
+import com.terminator.app.ui.settings.KeymapEntry
 import com.terminator.app.ui.settings.SettingsActivity
+import com.terminator.app.ui.settings.decodeKeymaps
 import com.terminator.app.ui.theme.TerminatorTheme
 import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalPalette
@@ -62,7 +69,7 @@ class MainActivity : ComponentActivity() {
         viewModelFactory {
             initializer {
                 val app = application as TerminatorApp
-                MainViewModel(app.sessionRepository, filesDir)
+                MainViewModel(app.sessionRepository, filesDir, app.settingsRepository, app.terminfoDir)
             }
         }
     }
@@ -119,6 +126,25 @@ class MainActivity : ComponentActivity() {
             val customSoundUri by repo.flow(SettingsKeys.CUSTOM_SOUND_URI, "").collectAsState(initial = "")
             val horizontalModeEnabled by repo.flow(SettingsKeys.HORIZONTAL_MODE, true)
                 .collectAsState(initial = true)
+            // Forced terminal width from Settings > Appearance > "Terminal
+            // width" slider. Was persisted by AppearanceSettingsScreen but
+            // never read anywhere - the pty always got whatever column count
+            // the viewport happened to auto-fit to.
+            val columnsSetting by repo.flow(SettingsKeys.COLUMNS, 80f).collectAsState(initial = 80f)
+            // Settings > Display > "Show statusbar". Was persisted by
+            // DisplaySettingsScreen but never read - the system status bar
+            // stayed hidden (edge-to-edge) regardless of this toggle.
+            val showStatusbar by repo.flow(SettingsKeys.SHOW_STATUSBAR, false).collectAsState(initial = false)
+            // Settings > Keyboard > Input Mode. See the keyboardOptions
+            // wiring on the hidden input field below for what each mode
+            // actually changes.
+            val inputMode by repo.flow(SettingsKeys.INPUT_MODE, "Default").collectAsState(initial = "Default")
+            // Settings > Keyboard > "Keyboard shortcuts & keymapper" - named
+            // macros the user built from VirtualKey combos. Was persisted by
+            // KeymapperScreen but never surfaced anywhere the user could
+            // actually trigger one.
+            val keymapsJson by repo.flow(SettingsKeys.KEYMAPS, "").collectAsState(initial = "")
+            val keymaps = remember(keymapsJson) { decodeKeymaps(keymapsJson) }
 
             // This setting was persisted by DisplaySettingsScreen but never
             // actually read anywhere, so toggling "Horizontal (landscape)
@@ -129,6 +155,19 @@ class MainActivity : ComponentActivity() {
                     android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
                 } else {
                     android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                }
+            }
+
+            // Same "persisted but never applied" bug as horizontalModeEnabled
+            // above: actually show/hide the system status bar in step with
+            // the Settings > Display toggle instead of it always staying
+            // hidden from the edge-to-edge setup in onCreate().
+            LaunchedEffect(showStatusbar) {
+                val controller = WindowInsetsControllerCompat(window, window.decorView)
+                if (showStatusbar) {
+                    controller.show(WindowInsetsCompat.Type.statusBars())
+                } else {
+                    controller.hide(WindowInsetsCompat.Type.statusBars())
                 }
             }
 
@@ -330,7 +369,13 @@ class MainActivity : ComponentActivity() {
                                                 val (charWidth, charHeight) = charMetrics
                                                 val finalSize = latestTerminalSize
                                                 if (charWidth > 0f && charHeight > 0f && finalSize != null) {
-                                                    val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                                    // Settings > Appearance > "Terminal width" is a
+                                                    // forced column count (like a real terminal's
+                                                    // COLUMNS), not just a starting guess - so it wins
+                                                    // over the pixel-width auto-fit that used to be the
+                                                    // only source for this. Rows still auto-fit to the
+                                                    // available height as before.
+                                                    val cols = columnsSetting.toInt().coerceAtLeast(1)
                                                     val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
                                                     viewModel.updateTerminalSize(cols, rws)
                                                 }
@@ -497,8 +542,40 @@ class MainActivity : ComponentActivity() {
 
                                     // Invisible field that actually captures IME input and
                                     // forwards it to the active session, one keystroke at a time.
+                                    // Was persisted by KeyboardSettingsScreen but never read, so
+                                    // every mode behaved identically to "Default" no matter what
+                                    // was picked. Per the descriptions shown in that screen:
+                                    //  - Default: full IME compatibility, autocorrect/suggestions
+                                    //    and composing (CJK etc.) all left on.
+                                    //  - Strict Terminal: "semantically correct but may break some
+                                    //    IMEs" - restrict to a raw ASCII keyboard type with
+                                    //    autocorrect off, so every keystroke commits immediately
+                                    //    as its literal byte instead of going through a composing
+                                    //    region (composing IMEs, e.g. CJK, fall back or don't work).
+                                    //  - Legacy Workaround: "fixes Samsung keyboard echo" - many
+                                    //    Samsung keyboards double-emit characters when autocorrect
+                                    //    and predictive text are active alongside this field's
+                                    //    per-keystroke reset; turning autocorrect off (while
+                                    //    keeping the normal Text keyboard type, unlike Strict) is
+                                    //    the actual fix without going as far as blocking CJK.
+                                    val fieldKeyboardOptions = remember(inputMode) {
+                                        when (inputMode) {
+                                            "Strict" -> KeyboardOptions(
+                                                keyboardType = KeyboardType.Ascii,
+                                                capitalization = KeyboardCapitalization.None,
+                                                autoCorrect = false
+                                            )
+                                            "Legacy" -> KeyboardOptions(
+                                                keyboardType = KeyboardType.Text,
+                                                capitalization = KeyboardCapitalization.None,
+                                                autoCorrect = false
+                                            )
+                                            else -> KeyboardOptions(keyboardType = KeyboardType.Text)
+                                        }
+                                    }
                                     BasicTextField(
                                         value = hiddenInput,
+                                        keyboardOptions = fieldKeyboardOptions,
                                         onValueChange = { new ->
                                             val newText = new.text
                                             when {
@@ -509,6 +586,18 @@ class MainActivity : ComponentActivity() {
                                                     // CTRL/ALT modifier, then consume it (one-shot).
                                                     val typed = newText.substring(inputPlaceholder.length)
                                                     var toSend = typed
+                                                    // Real terminals send CR (\r, 0x0D) for the Enter
+                                                    // key, not LF (\n, 0x0A) - the pty/shell's own line
+                                                    // discipline (icrnl) is what turns that \r into a
+                                                    // newline for canonical-mode reads. The IME composes
+                                                    // Enter as a literal '\n' in the text field, and that
+                                                    // was being forwarded byte-for-byte. Full-screen apps
+                                                    // read raw, unprocessed input though, so they see the
+                                                    // literal 0x0A - and nano's default keybinding for
+                                                    // ^J (0x0A) is "Justify Paragraph", not "insert
+                                                    // newline". That's exactly what made Enter in nano
+                                                    // justify the paragraph instead of adding a line.
+                                                    toSend = toSend.replace('\n', '\r')
                                                     if (ctrlActive) {
                                                         toSend = toSend.map(::applyCtrl).joinToString("")
                                                         ctrlActive = false
@@ -528,7 +617,7 @@ class MainActivity : ComponentActivity() {
                                                     val activeIsExited = state.runningSessions
                                                         .firstOrNull { it.runtimeId == state.activeSessionId }
                                                         ?.exited == true
-                                                    if (activeIsExited && toSend.contains('\n')) {
+                                                    if (activeIsExited && toSend.contains('\r')) {
                                                         val shouldExitApp = viewModel.dismissExitedActiveSession()
                                                         if (shouldExitApp) {
                                                             finish()
@@ -603,6 +692,40 @@ class MainActivity : ComponentActivity() {
                                     VirtualKeyBar(
                                         ctrlActive = ctrlActive,
                                         altActive = altActive,
+                                        keymaps = keymaps,
+                                        onKeymapTriggered = { entry ->
+                                            // Each saved shortcut is a short list of VirtualKey
+                                            // names (e.g. ["CTRL", "ESC"]) - CTRL/ALT act as
+                                            // modifiers on whatever key follows them, same as a
+                                            // one-shot tap on the real key bar; every other key in
+                                            // the list just sends its own escape sequence in order.
+                                            var pendingCtrl = false
+                                            var pendingAlt = false
+                                            val sequence = StringBuilder()
+                                            entry.keys.forEach { keyName ->
+                                                val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
+                                                when (vk) {
+                                                    VirtualKey.CTRL -> pendingCtrl = true
+                                                    VirtualKey.ALT -> pendingAlt = true
+                                                    null -> {}
+                                                    else -> {
+                                                        var seq = vk.sendSequence
+                                                        if (pendingCtrl) {
+                                                            seq = seq.map(::applyCtrl).joinToString("")
+                                                            pendingCtrl = false
+                                                        }
+                                                        if (pendingAlt) {
+                                                            seq = "\u001B$seq"
+                                                            pendingAlt = false
+                                                        }
+                                                        sequence.append(seq)
+                                                    }
+                                                }
+                                            }
+                                            if (sequence.isNotEmpty()) {
+                                                viewModel.sendInput(sequence.toString())
+                                            }
+                                        },
                                         onTextSubmitted = { text -> viewModel.sendInput(text) },
                                         onTextFieldFocusChanged = { focused -> textPageFieldFocused = focused },
                                         onKeyPressed = { key ->
@@ -611,6 +734,25 @@ class MainActivity : ComponentActivity() {
                                                 VirtualKey.ALT -> altActive = !altActive
                                                 else -> if (key.sendSequence.isNotEmpty()) {
                                                     var seq = key.sendSequence
+                                                    // Arrow/Home/End keys are encoded differently
+                                                    // depending on whether the running program has
+                                                    // switched into "application cursor keys" mode
+                                                    // (DECCKM) - nano/vim do this via ncurses'
+                                                    // keypad(TRUE) at startup. The CSI form below is
+                                                    // only correct in normal mode; in application mode
+                                                    // the same keys must go out as SS3 (\EO..) instead,
+                                                    // or the program won't recognize them as anything.
+                                                    if (viewModel.activeSessionApplicationCursorKeys()) {
+                                                        seq = when (key) {
+                                                            VirtualKey.UP -> "\u001BOA"
+                                                            VirtualKey.DOWN -> "\u001BOB"
+                                                            VirtualKey.RIGHT -> "\u001BOC"
+                                                            VirtualKey.LEFT -> "\u001BOD"
+                                                            VirtualKey.HOME -> "\u001BOH"
+                                                            VirtualKey.END -> "\u001BOF"
+                                                            else -> seq
+                                                        }
+                                                    }
                                                     if (ctrlActive) {
                                                         seq = seq.map(::applyCtrl).joinToString("")
                                                         ctrlActive = false

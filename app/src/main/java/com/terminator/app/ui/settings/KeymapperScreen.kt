@@ -30,7 +30,7 @@ private val ALL_KEY_OPTIONS = listOf(
     "HOME", "END", "PGUP", "PGDN", "UP", "DOWN", "LEFT", "RIGHT"
 )
 
-private fun decodeKeymaps(json: String): List<KeymapEntry> {
+fun decodeKeymaps(json: String): List<KeymapEntry> {
     if (json.isBlank()) return emptyList()
     return runCatching {
         val arr = JSONArray(json)

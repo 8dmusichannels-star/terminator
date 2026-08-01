@@ -28,7 +28,15 @@ object NativePty {
         envp: Array<String>,
         pidOut: IntArray,
         rows: Int,
-        cols: Int
+        cols: Int,
+        // Settings > Keyboard > SECCOMP. Some OEM kernels ship a seccomp-bpf
+        // policy that rejects the clone flags glibc/bionic's fork() adds
+        // (via the clone3 path), surfacing as "fork failed: Operation not
+        // permitted" even though the process has every other permission it
+        // needs. When true, pty.c spawns the child via a raw, minimal
+        // syscall(SYS_clone, SIGCHLD, ...) instead of fork(), which avoids
+        // the flags those policies filter.
+        seccompWorkaround: Boolean
     ): Int
 
     @JvmStatic

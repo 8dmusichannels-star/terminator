@@ -91,6 +91,11 @@ fun VirtualKeyBar(
     // the "basınca kayboluyor" bug. This callback lets the parent also
     // treat focus on the text-entry page's own field as "keyboard open".
     onTextFieldFocusChanged: (Boolean) -> Unit = {},
+    // Settings > Keyboard > "Keyboard shortcuts & keymapper" entries. Each
+    // one was previously saved to disk and never surfaced anywhere - tapping
+    // its chip here is what actually sends its key combo to the terminal.
+    keymaps: List<com.terminator.app.ui.settings.KeymapEntry> = emptyList(),
+    onKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var textEntryOpen by remember { mutableStateOf(false) }
@@ -164,6 +169,25 @@ fun VirtualKeyBar(
                 ) {
                     VirtualKeyRow(row1, onKeyPressed, ctrlActive, altActive, scrollState)
                     VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
+                    if (keymaps.isNotEmpty()) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            keymaps.forEach { entry ->
+                                TextButton(onClick = { onKeymapTriggered(entry) }) {
+                                    Text(
+                                        entry.name,
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.secondary
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 // Long-text entry page - replaces the key rows entirely while

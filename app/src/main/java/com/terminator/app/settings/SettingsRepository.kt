@@ -49,6 +49,16 @@ object SettingsKeys {
     val INPUT_MODE = stringPreferencesKey("input_mode")
     val SECCOMP_ENABLED = booleanPreferencesKey("seccomp_enabled")
     val KEYMAPS = stringPreferencesKey("keymaps_json")
+
+    // Terminal compatibility - which TERM value child processes see.
+    // "xterm-256color" (default) gives full color/feature support. It used
+    // to need a device-provided terminfo entry to be fully recognized by
+    // ncurses apps; the app now bundles its own compiled entry (see
+    // TerminatorApp.extractBundledTerminfo / TerminalSession's TERMINFO env
+    // var) so this works even on devices with no terminfo db at all.
+    // "vt100"/"ansi" remain available since ncurses ships hardcoded
+    // fallback definitions for those very common names too.
+    val TERM_TYPE = stringPreferencesKey("term_type") // "xterm-256color" | "vt100" | "ansi"
 }
 
 /**

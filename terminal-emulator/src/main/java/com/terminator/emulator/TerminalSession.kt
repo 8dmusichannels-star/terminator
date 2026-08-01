@@ -35,7 +35,20 @@ class TerminalSession(
     val id: String,
     val spec: SessionSpec,
     private val historyFile: File,
-    private val useRoot: Boolean = false
+    private val useRoot: Boolean = false,
+    // User-selectable via Settings > Keyboard > Terminal Type. Defaults to
+    // xterm-256color for full feature support; vt100/ansi are there for
+    // devices/binaries where full-screen apps don't recognize
+    // xterm-256color for lack of a matching terminfo entry.
+    private val termType: String = "xterm-256color",
+    // Settings > Keyboard > SECCOMP. See NativePty.createSubprocess for what
+    // this actually changes at the syscall level.
+    private val seccompWorkaround: Boolean = false,
+    // Root of the app-bundled terminfo database (see
+    // TerminatorApp.extractBundledTerminfo), or null to leave $TERMINFO
+    // unset and rely on whatever the device itself provides (or ncurses'
+    // hardcoded vt100/ansi fallbacks).
+    private val terminfoDir: String? = null
 ) {
     private var masterFd: Int = -1
     private var pid: Int = -1
@@ -87,7 +100,8 @@ class TerminalSession(
                 envp = envp,
                 pidOut = pidOut,
                 rows = rows,
-                cols = columns
+                cols = columns,
+                seccompWorkaround = seccompWorkaround
             )
         } catch (e: IOException) {
             throw IOException("Unable to start session: $executablePath", e)
@@ -125,17 +139,25 @@ class TerminalSession(
 
     /**
      * Minimal, predictable environment for the child - PATH so a bare "su"
-     * resolves, HOME pointed at the session's own history directory, and a
-     * capable TERM so full-screen apps render correctly.
+     * resolves, HOME pointed at the session's own history directory, TERM
+     * set to whatever the user picked in Settings > Keyboard > Terminal
+     * Type, and (when available) TERMINFO pointed at the app's bundled
+     * terminfo db so xterm-256color actually resolves via ncurses'
+     * standard TERMINFO env-var lookup, same mechanism real terminfo
+     * installs use - not just a hardcoded guess this app makes up.
      */
     private fun buildEnvironment(cwd: String?): Array<String> {
         val path = System.getenv("PATH") ?: "/system/bin:/system/xbin"
-        return arrayOf(
+        val base = mutableListOf(
             "PATH=$path",
             "HOME=${cwd ?: "/sdcard"}",
-            "TERM=xterm-256color",
+            "TERM=$termType",
             "TMPDIR=${cwd ?: "/sdcard"}"
         )
+        if (!terminfoDir.isNullOrBlank()) {
+            base += "TERMINFO=$terminfoDir"
+        }
+        return base.toTypedArray()
     }
 
     fun write(data: String) {

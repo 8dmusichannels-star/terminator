@@ -49,6 +49,18 @@ class TerminalEmulator(
     var mouseSgrMode: Boolean = false
         private set
 
+    // DECCKM (CSI ?1h/l) - "application cursor keys" mode. ncurses turns
+    // this on at startup for any full-screen program (nano included - see
+    // its smkx/rmkx terminfo capability) and from then on expects arrow/
+    // home/end keys to arrive as SS3 sequences (\EOA..\EOD, \EOH, \EOF)
+    // instead of the normal CSI form (\E[A.. etc). Previously silently
+    // ignored, which meant the app always sent the CSI form regardless -
+    // wrong whenever a full-screen program had switched modes. The UI
+    // layer (VirtualKeyBar/MainActivity) reads this to decide which form
+    // to actually send for arrow/home/end key presses.
+    var applicationCursorKeys: Boolean = false
+        private set
+
     // Current SGR (graphic rendition) state, applied to newly written cells
     private var curFg = TerminalBuffer.DEFAULT_FOREGROUND
     private var curBg = TerminalBuffer.DEFAULT_BACKGROUND
@@ -278,10 +290,10 @@ class TerminalEmulator(
                 1002 -> mouseMode = if (enable) MouseMode.BUTTON_EVENT else MouseMode.NONE
                 1003 -> mouseMode = if (enable) MouseMode.ANY_EVENT else MouseMode.NONE
                 1006 -> mouseSgrMode = enable
-                // 1: application cursor keys, 2004: bracketed paste - not
-                // implemented, but explicitly ignored now rather than
-                // falling through to the generic (and wrong) non-private
-                // h/l no-op.
+                1 -> applicationCursorKeys = enable
+                // 2004: bracketed paste - not implemented, but explicitly
+                // ignored now rather than falling through to the generic
+                // (and wrong) non-private h/l no-op.
                 else -> { /* unsupported private mode - ignore */ }
             }
         }
@@ -499,6 +511,7 @@ class TerminalEmulator(
         scrollTop = 0
         scrollBottom = buffer.rows - 1
         cursorVisible = true
+        applicationCursorKeys = false
         state = State.NORMAL
     }
 
