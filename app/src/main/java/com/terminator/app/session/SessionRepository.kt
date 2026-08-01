@@ -22,55 +22,62 @@ class SessionRepository(private val context: Context) {
     private val sessionsKey = stringPreferencesKey("sessions_json")
 
     val sessions: Flow<List<SessionEntry>> = context.sessionDataStore.data.map { prefs ->
-        val json = prefs[sessionsKey]
-        if (json.isNullOrBlank()) {
-            listOf(SessionEntry.defaultAndroidShell())
-        } else {
-            decode(json)
-        }
+        decodeOrDefault(prefs[sessionsKey])
     }
 
     suspend fun currentSessions(): List<SessionEntry> = sessions.first()
 
-    suspend fun save(entry: SessionEntry) {
-        val current = currentSessions().toMutableList()
+    suspend fun save(entry: SessionEntry) = mutate { current ->
         val idx = current.indexOfFirst { it.id == entry.id }
-        if (idx >= 0) current[idx] = entry else current.add(entry)
-        persist(current)
+        if (idx >= 0) current.toMutableList().apply { this[idx] = entry } else current + entry
     }
 
-    suspend fun delete(id: String) {
-        val current = currentSessions().toMutableList()
-        current.removeAll { it.id == id }
+    suspend fun delete(id: String) = mutate { current ->
+        val remaining = current.filterNot { it.id == id }.toMutableList()
         // Enforce: at least one default session must always remain.
-        if (current.none { it.isDefault }) {
-            if (current.isEmpty()) {
-                current.add(SessionEntry.defaultAndroidShell())
+        if (remaining.none { it.isDefault }) {
+            if (remaining.isEmpty()) {
+                remaining.add(SessionEntry.defaultAndroidShell())
             } else {
-                val first = current[0]
-                current[0] = first.copy(isDefault = true)
+                remaining[0] = remaining[0].copy(isDefault = true)
             }
         }
-        persist(current)
+        remaining
     }
 
-    suspend fun setDefault(id: String) {
-        val current = currentSessions().map { it.copy(isDefault = it.id == id) }
-        persist(current)
+    suspend fun setDefault(id: String) = mutate { current ->
+        current.map { it.copy(isDefault = it.id == id) }
     }
 
-    suspend fun setFavorite(id: String, favorite: Boolean) {
-        val current = currentSessions().map {
-            if (it.id == id) it.copy(isFavorite = favorite) else it
-        }
-        persist(current)
+    suspend fun setFavorite(id: String, favorite: Boolean) = mutate { current ->
+        current.map { if (it.id == id) it.copy(isFavorite = favorite) else it }
     }
 
-    private suspend fun persist(list: List<SessionEntry>) {
+    /**
+     * Reads, transforms and writes the session list in ONE atomic DataStore
+     * transaction instead of a separate currentSessions() read followed by
+     * a separate persist() write. The old two-step version was a classic
+     * read-modify-write race: any two calls landing close together (a fast
+     * double-tap on the star, the drawer's live collector and the settings
+     * screen's own collector both triggering around the same time, etc.)
+     * could each read the same pre-change snapshot and then write back over
+     * each other, silently dropping whichever one wrote second - which from
+     * the outside looks exactly like "toggling the star never actually
+     * takes effect". DataStore's edit {} block is already a single atomic
+     * transaction; doing the read (via prefs[sessionsKey], captured at
+     * transaction time, not beforehand) AND the transform inside that same
+     * block closes the gap entirely - there's no longer a window for
+     * another write to land in between.
+     */
+    private suspend fun mutate(transform: (List<SessionEntry>) -> List<SessionEntry>) {
         context.sessionDataStore.edit { prefs ->
-            prefs[sessionsKey] = encode(list)
+            val current = decodeOrDefault(prefs[sessionsKey])
+            prefs[sessionsKey] = encode(transform(current))
         }
     }
+
+    private fun decodeOrDefault(json: String?): List<SessionEntry> =
+        if (json.isNullOrBlank()) listOf(SessionEntry.defaultAndroidShell()) else decode(json)
 
     private fun encode(list: List<SessionEntry>): String {
         val arr = JSONArray()

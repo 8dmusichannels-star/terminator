@@ -43,8 +43,7 @@ data class SessionEntry(
             name = "Android Shell",
             type = SessionType.COMMAND_ARG,
             commandPath = "/system/bin/sh",
-            isDefault = true,
-            isFavorite = true
+            isDefault = true
         )
     }
 }
