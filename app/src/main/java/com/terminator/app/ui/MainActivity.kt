@@ -342,6 +342,31 @@ class MainActivity : ComponentActivity() {
                                 metricsPaint.measureText("M") to metricsPaint.fontSpacing
                             }
 
+                            // Recomputes cols/rows from the current pixel size and char metrics,
+                            // then pushes them to the pty (SIGWINCH). Normally cols stays pinned
+                            // to Settings > Appearance > "Terminal width" and only rows auto-fit
+                            // to the available height (see the comment below). But while this
+                            // session has an active pinch-zoom override (liveZoomSize mid-pinch,
+                            // or sessionTextSize once committed), cols is derived from the real
+                            // pixel width / charWidth too, so full-screen apps (nano, vim, htop)
+                            // actually reflow to match what the user is seeing instead of quietly
+                            // keeping the old grid. The moment the override is gone - pinch back
+                            // to the global size, or the session closes - cols snaps back to the
+                            // fixed setting on the next resize.
+                            fun applyResize() {
+                                val (charWidth, charHeight) = charMetrics
+                                val finalSize = latestTerminalSize
+                                if (charWidth <= 0f || charHeight <= 0f || finalSize == null) return
+                                val zoomActive = liveZoomSize != null || sessionTextSize != null
+                                val cols = if (zoomActive) {
+                                    (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                } else {
+                                    columnsSetting.toInt().coerceAtLeast(1)
+                                }
+                                val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                viewModel.updateTerminalSize(cols, rws)
+                            }
+
                             Column(modifier = Modifier.fillMaxSize()) {
                                 Box(
                                     modifier = Modifier
@@ -366,19 +391,7 @@ class MainActivity : ComponentActivity() {
                                             resizeDebounceJob?.cancel()
                                             resizeDebounceJob = coroutineScope.launch {
                                                 delay(120)
-                                                val (charWidth, charHeight) = charMetrics
-                                                val finalSize = latestTerminalSize
-                                                if (charWidth > 0f && charHeight > 0f && finalSize != null) {
-                                                    // Settings > Appearance > "Terminal width" is a
-                                                    // forced column count (like a real terminal's
-                                                    // COLUMNS), not just a starting guess - so it wins
-                                                    // over the pixel-width auto-fit that used to be the
-                                                    // only source for this. Rows still auto-fit to the
-                                                    // available height as before.
-                                                    val cols = columnsSetting.toInt().coerceAtLeast(1)
-                                                    val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                                    viewModel.updateTerminalSize(cols, rws)
-                                                }
+                                                applyResize()
                                             }
                                         }
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
@@ -458,6 +471,31 @@ class MainActivity : ComponentActivity() {
                                                                         delay(150)
                                                                         viewModel.setSessionTextSize(activeSessionId, newSize)
                                                                         liveZoomSize = null
+                                                                        // sessionTextSize (the state
+                                                                        // read at the top of this
+                                                                        // composable) won't reflect
+                                                                        // the value just committed
+                                                                        // above until the next
+                                                                        // recomposition, so
+                                                                        // applyResize() here would
+                                                                        // still see zoomActive as
+                                                                        // false on a *first* pinch.
+                                                                        // Recompute charMetrics
+                                                                        // against newSize directly
+                                                                        // instead of relying on that
+                                                                        // stale closure.
+                                                                        val metricsPaint = android.graphics.Paint().apply {
+                                                                            typeface = terminalTypeface
+                                                                            textSize = newSize * density * fontScale
+                                                                        }
+                                                                        val charWidth = metricsPaint.measureText("M")
+                                                                        val charHeight = metricsPaint.fontSpacing
+                                                                        val finalSize = latestTerminalSize
+                                                                        if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                                                            val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                                                            val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                                                            viewModel.updateTerminalSize(cols, rws)
+                                                                        }
                                                                     }
                                                                 }
                                                             }
