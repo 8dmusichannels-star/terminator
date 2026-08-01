@@ -94,6 +94,9 @@ fun TerminalView(
     // previously this rect was always fully opaque and hid any wallpaper
     // completely regardless of the Appearance > blur/alpha slider.
     backgroundAlpha: Float = 1f,
+    // 0 = showing the live screen (normal). >0 = the user has dragged the
+    // terminal down to look at scrollback history, this many lines back.
+    scrollOffset: Int = 0,
     modifier: Modifier = Modifier
 ) {
     // bufferVersion is bumped by the caller's ViewModel on every
@@ -103,7 +106,7 @@ fun TerminalView(
     Canvas(modifier = modifier.fillMaxSize()) {
         @Suppress("UNUSED_EXPRESSION")
         bufferVersion
-        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha)
+        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset)
     }
 }
 
@@ -112,7 +115,8 @@ private fun DrawScope.drawTerminal(
     palette: TerminalPalette,
     fontFamily: Typeface,
     fontSizeSp: Float,
-    backgroundAlpha: Float = 1f
+    backgroundAlpha: Float = 1f,
+    scrollOffset: Int = 0
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -142,7 +146,7 @@ private fun DrawScope.drawTerminal(
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {
             for (col in 0 until buffer.columns) {
-                val cell = buffer.cellAt(row, col)
+                val cell = buffer.lineAt(row, col, scrollOffset)
                 val x = col * charWidth
                 val y = (row + 1) * charHeight
 
@@ -182,7 +186,11 @@ private fun DrawScope.drawTerminal(
         // Block cursor: solid white rectangle at the current input position,
         // with that cell's character redrawn in black on top so it stays
         // readable. This is what shows where the next keystroke will land.
-        if (buffer.cursorVisible && buffer.cursorRow in 0 until buffer.rows && buffer.cursorCol in 0 until buffer.columns) {
+        // Only drawn on the live screen - while scrolled back into history
+        // (scrollOffset > 0) the cursor's actual row/col don't correspond
+        // to what's currently being displayed, so drawing it would just
+        // put a stray white block over unrelated scrollback text.
+        if (scrollOffset == 0 && buffer.cursorVisible && buffer.cursorRow in 0 until buffer.rows && buffer.cursorCol in 0 until buffer.columns) {
             val cursorX = buffer.cursorCol * charWidth
             val cursorY = (buffer.cursorRow + 1) * charHeight
             bgPaint.color = android.graphics.Color.WHITE

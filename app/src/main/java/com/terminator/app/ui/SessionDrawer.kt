@@ -244,11 +244,22 @@ private fun SessionRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        // combinedClickable lives ONLY on this column now, not on the
+        // whole row. It was on the outer Row before, which meant its
+        // press-gesture handling covered the star IconButton's area too -
+        // combinedClickable's long-press detection swallows the initial
+        // press before the nested IconButton's own clickable ever sees it,
+        // so taps on the star did nothing. Scoping it to just the
+        // name/default text leaves the star fully outside that gesture
+        // area, so it gets presses normally again.
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+        ) {
             Text(session.name, style = MaterialTheme.typography.bodyLarge)
             if (session.isDefault) {
                 Text(

@@ -78,6 +78,35 @@ class TerminalBuffer(
 
     fun cellAt(row: Int, col: Int): Cell = grid[row][col]
 
+    /**
+     * Reads a cell at a given scroll offset above the live grid - offset 0
+     * is the normal (live) screen, offset 1 is one line scrolled back into
+     * history, etc. Used by the renderer when the user has dragged the
+     * terminal down to look at old output instead of always showing
+     * whatever's currently at the bottom.
+     *
+     * scrollback stores lines oldest-first via addLast (see scrollUp
+     * below), so "N lines back from the bottom of scrollback" is
+     * `scrollback[scrollback.size - offset]`.
+     */
+    fun lineAt(row: Int, col: Int, scrollOffset: Int): Cell {
+        if (scrollOffset <= 0) return cellAt(row, col)
+        val totalScrollback = scrollback.size
+        // The visible window is `rows` lines tall. At scrollOffset, the
+        // first `scrollOffset` visible rows come from the tail of
+        // scrollback and the rest from the top of the live grid.
+        val scrollbackRowsShown = scrollOffset.coerceAtMost(totalScrollback)
+        return if (row < scrollbackRowsShown) {
+            val idx = totalScrollback - scrollbackRowsShown + row
+            scrollback.getOrNull(idx)?.getOrNull(col) ?: Cell()
+        } else {
+            cellAt(row - scrollbackRowsShown, col)
+        }
+    }
+
+    /** How many lines are available to scroll back through right now. */
+    val maxScrollOffset: Int get() = scrollback.size
+
     fun setCell(row: Int, col: Int, cell: Cell) {
         if (row in 0 until rows && col in 0 until columns) {
             grid[row][col] = cell

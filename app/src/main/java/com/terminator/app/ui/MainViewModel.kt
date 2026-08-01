@@ -35,7 +35,13 @@ data class MainUiState(
     // Per-runtimeId pinch-to-zoom text size override, in sp. Absent entries
     // fall back to the global Settings > Appearance > Text Size. Cleared
     // automatically when that runtime session ends.
-    val sessionTextSizes: Map<String, Float> = emptyMap()
+    val sessionTextSizes: Map<String, Float> = emptyMap(),
+    // How many lines back into scrollback the active session's view is
+    // dragged (0 = live screen). Reset to 0 whenever new output arrives or
+    // the active session changes - see bumpVersion()/setActiveSession-style
+    // call sites - so the user is never silently stuck looking at history
+    // while missing new output with no indication why nothing's updating.
+    val scrollOffset: Int = 0
 )
 
 class MainViewModel(
@@ -77,7 +83,7 @@ class MainViewModel(
         if (!entry.allowMultipleInstances) {
             val existing = liveSessions[entry.id]
             if (existing != null && existing.isAlive()) {
-                _uiState.value = _uiState.value.copy(activeSessionId = entry.id, drawerOpen = false)
+                _uiState.value = _uiState.value.copy(activeSessionId = entry.id, drawerOpen = false, scrollOffset = 0)
                 return
             }
             launchLiveSession(runtimeId = entry.id, entry = entry)
@@ -108,7 +114,7 @@ class MainViewModel(
     /** Switches to an already-running instance without spawning anything new. */
     fun openRunningSession(runtimeId: String) {
         if (liveSessions[runtimeId]?.isAlive() == true) {
-            _uiState.value = _uiState.value.copy(activeSessionId = runtimeId, drawerOpen = false)
+            _uiState.value = _uiState.value.copy(activeSessionId = runtimeId, drawerOpen = false, scrollOffset = 0)
         }
     }
 
@@ -157,7 +163,8 @@ class MainViewModel(
         _uiState.value = _uiState.value.copy(
             runningSessions = relabel(running),
             activeSessionId = runtimeId,
-            drawerOpen = false
+            drawerOpen = false,
+            scrollOffset = 0
         )
     }
 
@@ -180,7 +187,8 @@ class MainViewModel(
         _uiState.value = _uiState.value.copy(
             runningSessions = remaining,
             activeSessionId = nextActiveId,
-            sessionTextSizes = _uiState.value.sessionTextSizes - activeId
+            sessionTextSizes = _uiState.value.sessionTextSizes - activeId,
+            scrollOffset = 0
         )
         bumpVersion()
         return nextActiveId == null
@@ -229,6 +237,33 @@ class MainViewModel(
 
     fun sendInput(text: String) {
         liveSessions[_uiState.value.activeSessionId]?.write(text)
+        // Typing always jumps back to the live screen, same as a real
+        // terminal/tmux - otherwise keystrokes would land while the user is
+        // looking at scrollback and they'd never see what they just typed.
+        if (_uiState.value.scrollOffset != 0) {
+            _uiState.value = _uiState.value.copy(scrollOffset = 0)
+        }
+    }
+
+    /** True while the active session's running program has switched to the
+     *  alternate screen buffer (nano/vim/htop/less, CSI ?1049h/?47h) - its
+     *  scrollback stays empty the whole time (see TerminalBuffer.scrollUp),
+     *  so dragging to "scroll back" would have nothing to show and should
+     *  just be disabled instead of silently doing nothing. */
+    fun activeSessionInAlternateScreen(): Boolean =
+        liveSessions[_uiState.value.activeSessionId]?.buffer?.inAlternateScreen == true
+
+    /** Applied by the terminal's pan gesture: positive deltaLines (dragging
+     *  down) reveals older scrollback, negative (dragging up) moves back
+     *  toward the live screen. Clamped to [0, maxScrollOffset] so it can
+     *  never scroll past what's actually available or go negative. */
+    fun adjustScrollOffset(deltaLines: Float) {
+        val buffer = activeBuffer() ?: return
+        val current = _uiState.value.scrollOffset
+        val next = (current + deltaLines.toInt()).coerceIn(0, buffer.maxScrollOffset)
+        if (next != current) {
+            _uiState.value = _uiState.value.copy(scrollOffset = next)
+        }
     }
 
     /** True only while the active session's program has actually enabled

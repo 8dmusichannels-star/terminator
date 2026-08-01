@@ -101,9 +101,9 @@ fun VirtualKeyBar(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .background(Color.Black)
+            .background(MaterialTheme.colorScheme.surface)
     ) {
-        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
 
         // Was a hard if/else cut before - AnimatedContent gives the page
         // swap an actual card-flip slide instead of an instant swap, and
@@ -208,7 +208,7 @@ fun VirtualKeyBar(
                         Icon(
                             Icons.Filled.KeyboardArrowLeft,
                             contentDescription = "Back to keys",
-                            tint = Color(0xFF7EC8FF)
+                            tint = MaterialTheme.colorScheme.primary
                         )
                     }
                     OutlinedTextField(
@@ -274,13 +274,13 @@ private fun VirtualKeyRow(
                     horizontal = 10.dp, vertical = verticalPadding
                 ),
                 modifier = Modifier.background(
-                    if (isActive) Color.White.copy(alpha = 0.18f) else Color.Transparent
+                    if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
                 )
             ) {
                 Text(
                     key.label,
                     fontSize = fontSize,
-                    color = if (isActive) Color.White else Color(0xFF7EC8FF)
+                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary
                 )
             }
         }

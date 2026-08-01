@@ -258,7 +258,27 @@ class MainActivity : ComponentActivity() {
                             // always starts back at the global size.
                             val activeSessionId = state.activeSessionId
                             val sessionTextSize = activeSessionId?.let { state.sessionTextSizes[it] }
-                            val effectiveTextSize = sessionTextSize ?: textSize
+                            // Pinch gestures fire on essentially every frame while a finger
+                            // is moving. Previously each of those frames called
+                            // viewModel.setSessionTextSize() directly, which copies the
+                            // sessionTextSizes map and pushes a new StateFlow value -
+                            // triggering a full recomposition of the whole screen (drawer,
+                            // titlebar, virtual key bar, everything) 60+ times a second.
+                            // That's what made pinch-zoom feel sluggish/stuttery instead of
+                            // smooth. liveZoomSize is purely local Compose state that only
+                            // this Box's subtree reads, so during an active pinch only the
+                            // terminal itself recomposes; the ViewModel (and therefore the
+                            // rest of the screen) is only touched once, when the gesture
+                            // ends, via the commit block in the pointerInput below.
+                            var liveZoomSize by remember(activeSessionId) { mutableStateOf<Float?>(null) }
+                            var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
+                            val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
+                            // The pinch gesture's pointerInput below is keyed only on
+                            // activeSessionId (not effectiveTextSize) so it doesn't restart
+                            // mid-pinch - rememberUpdatedState lets that long-lived gesture
+                            // callback still always compute zoom deltas against the latest
+                            // effectiveTextSize instead of a stale value captured once.
+                            val latestEffectiveTextSize = rememberUpdatedState(effectiveTextSize)
 
                             // Debounce state for the IME-animation resize fix below.
                             val coroutineScope = rememberCoroutineScope()
@@ -337,12 +357,41 @@ class MainActivity : ComponentActivity() {
                                         // the gesture's zoom factor against whatever size was
                                         // already in effect when the pinch started, so repeated
                                         // pinches compound instead of resetting each time.
-                                        .pointerInput(activeSessionId, effectiveTextSize) {
-                                            detectTransformGestures { _, _, zoom, _ ->
+                                        //
+                                        // The same gesture's pan is now also used to drag the
+                                        // terminal into scrollback (drag down = look at older
+                                        // output, back to 0 = live screen again) - previously
+                                        // this pan value was just thrown away, so there was no
+                                        // way to see anything that had scrolled off-screen.
+                                        // Disabled while mouse reporting is active (the touch
+                                        // belongs to the running program instead, handled by the
+                                        // pointerInput block below) or while in the alternate
+                                        // screen (nano/htop/vim manage their own screen and don't
+                                        // populate scrollback - see TerminalBuffer.scrollUp).
+                                        .pointerInput(activeSessionId) {
+                                            detectTransformGestures { _, pan, zoom, _ ->
                                                 if (zoom != 1f && activeSessionId != null) {
-                                                    val newSize = (effectiveTextSize * zoom)
+                                                    val newSize = (latestEffectiveTextSize.value * zoom)
                                                         .coerceIn(8f, 40f)
-                                                    viewModel.setSessionTextSize(activeSessionId, newSize)
+                                                    liveZoomSize = newSize
+                                                    zoomCommitJob?.cancel()
+                                                    zoomCommitJob = coroutineScope.launch {
+                                                        delay(150)
+                                                        viewModel.setSessionTextSize(activeSessionId, newSize)
+                                                        liveZoomSize = null
+                                                    }
+                                                }
+                                                if (pan.y != 0f &&
+                                                    !viewModel.activeSessionWantsMouseEvents() &&
+                                                    !viewModel.activeSessionInAlternateScreen()
+                                                ) {
+                                                    val (_, charHeight) = charMetrics
+                                                    if (charHeight > 0f) {
+                                                        // Drag down (positive pan.y) = reveal
+                                                        // older lines = increase scrollOffset.
+                                                        val deltaLines = (pan.y / charHeight)
+                                                        viewModel.adjustScrollOffset(deltaLines)
+                                                    }
                                                 }
                                             }
                                         }
@@ -424,6 +473,7 @@ class MainActivity : ComponentActivity() {
                                             // translucent when there's actually a wallpaper
                                             // behind it - otherwise stay fully opaque as before.
                                             backgroundAlpha = if (wallpaperUriStr.isNotBlank()) blurAlpha else 1f,
+                                            scrollOffset = state.scrollOffset,
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     }
