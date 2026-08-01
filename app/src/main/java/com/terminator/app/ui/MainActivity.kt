@@ -486,7 +486,7 @@ class MainActivity : ComponentActivity() {
                                                                         // stale closure.
                                                                         val metricsPaint = android.graphics.Paint().apply {
                                                                             typeface = terminalTypeface
-                                                                            textSize = newSize * density * fontScale
+                                                                            this.textSize = newSize * density * fontScale
                                                                         }
                                                                         val charWidth = metricsPaint.measureText("M")
                                                                         val charHeight = metricsPaint.fontSpacing
