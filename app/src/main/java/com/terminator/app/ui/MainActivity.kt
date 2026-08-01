@@ -13,8 +13,6 @@ import kotlinx.coroutines.launch
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.ui.text.TextRange
 import androidx.compose.material3.MaterialTheme
@@ -338,9 +336,106 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             }
                                         }
-                                        .pointerInput(softKeyboardEnabled) {
-                                            if (softKeyboardEnabled) {
-                                                detectTapGestures(onTap = {
+                                        .pointerInput(activeSessionId, softKeyboardEnabled) {
+                                            awaitEachGesture {
+                                                val down = awaitFirstDown(requireUnconsumed = false)
+
+                                                if (viewModel.activeSessionWantsMouseEvents()) {
+                                                    // Mouse reporting owns this entire gesture -
+                                                    // press/drag/release all become xterm mouse
+                                                    // escape sequences for the running ncurses
+                                                    // program (mc, vim, htop, ...) instead of tap-
+                                                    // to-toggle-keyboard or pinch/pan, which don't
+                                                    // apply while a program has grabbed the mouse.
+                                                    down.consume()
+                                                    val (charWidth, charHeight) = charMetrics
+                                                    if (charWidth <= 0f || charHeight <= 0f) return@awaitEachGesture
+
+                                                    fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
+                                                        (offset.x / charWidth).toInt() to (offset.y / charHeight).toInt()
+
+                                                    var (col, row) = cellOf(down.position)
+                                                    viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
+
+                                                    while (true) {
+                                                        val event = awaitPointerEvent()
+                                                        val change = event.changes.firstOrNull() ?: break
+                                                        change.consume()
+                                                        if (!change.pressed) {
+                                                            val (rCol, rRow) = cellOf(change.position)
+                                                            viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+                                                            break
+                                                        }
+                                                        val (dCol, dRow) = cellOf(change.position)
+                                                        if (dCol != col || dRow != row) {
+                                                            col = dCol; row = dRow
+                                                            viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                                        }
+                                                    }
+                                                    return@awaitEachGesture
+                                                }
+
+                                                // No mouse reporting active: fall back to the
+                                                // previous behavior - tap toggles the soft
+                                                // keyboard, drag pinches zoom / pans scrollback.
+                                                // Tracked by hand here (instead of the separate
+                                                // detectTapGestures/detectTransformGestures calls
+                                                // this replaced) so this single gesture loop is
+                                                // the only thing reading the touch stream.
+                                                var moved = false
+                                                var lastPos = down.position
+                                                var pointerCount = 1
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    val changes = event.changes
+                                                    pointerCount = changes.count { it.pressed }
+                                                    val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
+                                                    if (primary == null || !changes.any { it.pressed }) break
+
+                                                    if (pointerCount >= 2) {
+                                                        // Pinch: two (or more) fingers down -
+                                                        // compute zoom from the ratio of current
+                                                        // to previous distance between the first
+                                                        // two pointers.
+                                                        val p1 = changes.getOrNull(0)
+                                                        val p2 = changes.getOrNull(1)
+                                                        if (p1 != null && p2 != null) {
+                                                            val prevDist = (p1.previousPosition - p2.previousPosition).getDistance()
+                                                            val curDist = (p1.position - p2.position).getDistance()
+                                                            if (prevDist > 0f) {
+                                                                val zoom = curDist / prevDist
+                                                                if (zoom != 1f && activeSessionId != null) {
+                                                                    val newSize = (latestEffectiveTextSize.value * zoom)
+                                                                        .coerceIn(8f, 40f)
+                                                                    liveZoomSize = newSize
+                                                                    zoomCommitJob?.cancel()
+                                                                    zoomCommitJob = coroutineScope.launch {
+                                                                        delay(150)
+                                                                        viewModel.setSessionTextSize(activeSessionId, newSize)
+                                                                        liveZoomSize = null
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        moved = true
+                                                        changes.forEach { it.consume() }
+                                                    } else {
+                                                        val dy = primary.position.y - lastPos.y
+                                                        if (kotlin.math.abs(dy) > 2f) {
+                                                            moved = true
+                                                            if (!viewModel.activeSessionInAlternateScreen()) {
+                                                                val (_, charHeight) = charMetrics
+                                                                if (charHeight > 0f) {
+                                                                    viewModel.adjustScrollOffset(dy / charHeight)
+                                                                }
+                                                            }
+                                                            primary.consume()
+                                                        }
+                                                        lastPos = primary.position
+                                                    }
+                                                }
+
+                                                if (!moved && softKeyboardEnabled) {
                                                     if (keyboardOpen) {
                                                         keyboardController?.hide()
                                                         focusManager.clearFocus()
@@ -348,92 +443,6 @@ class MainActivity : ComponentActivity() {
                                                         focusRequester.requestFocus()
                                                         keyboardController?.show()
                                                     }
-                                                })
-                                            }
-                                        }
-                                        // Pinch-to-zoom: scales this session's text size only
-                                        // (see effectiveTextSize above) - never the global
-                                        // Settings value, and never other sessions. Accumulates
-                                        // the gesture's zoom factor against whatever size was
-                                        // already in effect when the pinch started, so repeated
-                                        // pinches compound instead of resetting each time.
-                                        //
-                                        // The same gesture's pan is now also used to drag the
-                                        // terminal into scrollback (drag down = look at older
-                                        // output, back to 0 = live screen again) - previously
-                                        // this pan value was just thrown away, so there was no
-                                        // way to see anything that had scrolled off-screen.
-                                        // Disabled while mouse reporting is active (the touch
-                                        // belongs to the running program instead, handled by the
-                                        // pointerInput block below) or while in the alternate
-                                        // screen (nano/htop/vim manage their own screen and don't
-                                        // populate scrollback - see TerminalBuffer.scrollUp).
-                                        .pointerInput(activeSessionId) {
-                                            detectTransformGestures { _, pan, zoom, _ ->
-                                                if (zoom != 1f && activeSessionId != null) {
-                                                    val newSize = (latestEffectiveTextSize.value * zoom)
-                                                        .coerceIn(8f, 40f)
-                                                    liveZoomSize = newSize
-                                                    zoomCommitJob?.cancel()
-                                                    zoomCommitJob = coroutineScope.launch {
-                                                        delay(150)
-                                                        viewModel.setSessionTextSize(activeSessionId, newSize)
-                                                        liveZoomSize = null
-                                                    }
-                                                }
-                                                if (pan.y != 0f &&
-                                                    !viewModel.activeSessionWantsMouseEvents() &&
-                                                    !viewModel.activeSessionInAlternateScreen()
-                                                ) {
-                                                    val (_, charHeight) = charMetrics
-                                                    if (charHeight > 0f) {
-                                                        // Drag down (positive pan.y) = reveal
-                                                        // older lines = increase scrollOffset.
-                                                        val deltaLines = (pan.y / charHeight)
-                                                        viewModel.adjustScrollOffset(deltaLines)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Mouse reporting: when the running program (mc, vim,
-                                        // htop, less, etc.) has asked for it via DECSET 1000/
-                                        // 1002/1003, forward touches as xterm mouse escape
-                                        // sequences instead of leaving the terminal as a purely
-                                        // read-only text view. A whole press-drag-release only
-                                        // becomes one gesture if the program actually asked for
-                                        // it (activeSessionWantsMouseEvents() checked once at
-                                        // the start of each gesture); if it hasn't, this block
-                                        // does nothing and awaitEachGesture below just lets the
-                                        // touch fall through untouched to the tap/pinch handlers
-                                        // above.
-                                        .pointerInput(activeSessionId) {
-                                            awaitEachGesture {
-                                                val down = awaitFirstDown(requireUnconsumed = false)
-                                                if (!viewModel.activeSessionWantsMouseEvents()) return@awaitEachGesture
-                                                val (charWidth, charHeight) = charMetrics
-                                                if (charWidth <= 0f || charHeight <= 0f) return@awaitEachGesture
-
-                                                fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
-                                                    (offset.x / charWidth).toInt() to (offset.y / charHeight).toInt()
-
-                                                var (col, row) = cellOf(down.position)
-                                                viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
-
-                                                while (true) {
-                                                    val event = awaitPointerEvent()
-                                                    val change = event.changes.firstOrNull() ?: break
-                                                    if (!change.pressed) {
-                                                        val (rCol, rRow) = cellOf(change.position)
-                                                        viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
-                                                        change.consume()
-                                                        break
-                                                    }
-                                                    val (dCol, dRow) = cellOf(change.position)
-                                                    if (dCol != col || dRow != row) {
-                                                        col = dCol; row = dRow
-                                                        viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
-                                                    }
-                                                    change.consume()
                                                 }
                                             }
                                         }
