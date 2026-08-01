@@ -231,6 +231,17 @@ class MainViewModel(
         liveSessions[_uiState.value.activeSessionId]?.write(text)
     }
 
+    /** True only while the active session's program has actually enabled
+     *  mouse reporting (DECSET 1000/1002/1003) - lets the UI decide whether
+     *  a touch on the terminal should become a mouse escape sequence or
+     *  fall through to the normal scroll/select/pinch-zoom gestures. */
+    fun activeSessionWantsMouseEvents(): Boolean =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.mouseMode != TerminalEmulator.MouseMode.NONE
+
+    fun sendMouseEvent(kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
+        liveSessions[_uiState.value.activeSessionId]?.sendMouseEvent(kind, col, row, button)
+    }
+
     /**
      * Called whenever the actual on-screen terminal area changes size (in
      * character columns/rows, already converted from pixels by the caller
@@ -286,9 +297,9 @@ class MainViewModel(
 
 private fun SessionEntry.toSpec(): com.terminator.emulator.SessionSpec = when (type) {
     com.terminator.app.session.SessionType.COMMAND_ARG ->
-        com.terminator.emulator.SessionSpec.CommandArg(name, commandPath ?: "/system/bin/sh")
+        com.terminator.emulator.SessionSpec.CommandArg(name, commandPath ?: "/system/bin/sh", workingDirectory)
     com.terminator.app.session.SessionType.FILE_BASE ->
         com.terminator.emulator.SessionSpec.FileBase(
-            name, filePath ?: "/sdcard/Terminator", fileName ?: "session.sh"
+            name, filePath ?: "/sdcard/Terminator", fileName ?: "session.sh", workingDirectory
         )
 }

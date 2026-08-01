@@ -31,6 +31,24 @@ class TerminalEmulator(
     private var cursorCol = 0
         set(value) { field = value; buffer.cursorCol = value }
 
+    /**
+     * Which xterm mouse-tracking mode the running program (mc, vim, htop,
+     * etc.) last asked for via DECSET, if any. NONE means the app hasn't
+     * requested mouse reporting - touches on the terminal should fall back
+     * to normal scroll/select/zoom gestures instead of being turned into
+     * mouse escape sequences the app never asked for and wouldn't parse.
+     */
+    enum class MouseMode { NONE, X10, NORMAL, BUTTON_EVENT, ANY_EVENT }
+    var mouseMode: MouseMode = MouseMode.NONE
+        private set
+    // SGR (1006) extended coordinates vs. the legacy fixed-width encoding.
+    // Nearly everything modern (including mc, vim, htop) requests 1006
+    // because the legacy encoding breaks past column/row 223 - but both are
+    // supported here since some older curses builds only ask for the plain
+    // 1000/1002/1003 modes.
+    var mouseSgrMode: Boolean = false
+        private set
+
     // Current SGR (graphic rendition) state, applied to newly written cells
     private var curFg = TerminalBuffer.DEFAULT_FOREGROUND
     private var curBg = TerminalBuffer.DEFAULT_BACKGROUND
@@ -217,12 +235,75 @@ class TerminalEmulator(
                     scrollTop = 0
                     scrollBottom = buffer.rows - 1
                 }
-                // 1: application cursor keys, 1000/1002/1003/1006: mouse
-                // reporting, 2004: bracketed paste - not implemented, but
-                // explicitly ignored now rather than falling through to the
-                // generic (and wrong) non-private h/l no-op.
+                // X10 (click only), Normal (1000: click+release), Button-
+                // event (1002: click+release+drag while a button is held),
+                // Any-event (1003: also reports plain hover motion). These
+                // are mutually exclusive in real xterm - the app enables
+                // whichever one matches how much motion detail it wants, so
+                // the last one set wins here too.
+                9 -> mouseMode = if (enable) MouseMode.X10 else MouseMode.NONE
+                1000 -> mouseMode = if (enable) MouseMode.NORMAL else MouseMode.NONE
+                1002 -> mouseMode = if (enable) MouseMode.BUTTON_EVENT else MouseMode.NONE
+                1003 -> mouseMode = if (enable) MouseMode.ANY_EVENT else MouseMode.NONE
+                1006 -> mouseSgrMode = enable
+                // 1: application cursor keys, 2004: bracketed paste - not
+                // implemented, but explicitly ignored now rather than
+                // falling through to the generic (and wrong) non-private
+                // h/l no-op.
                 else -> { /* unsupported private mode - ignore */ }
             }
+        }
+    }
+
+    /**
+     * Touch/pointer event kinds a UI layer can report. Mirrors the subset
+     * of xterm mouse-tracking button semantics that DECSET modes 1000/
+     * 1002/1003 distinguish between.
+     */
+    enum class MouseEventKind { PRESS, RELEASE, DRAG, MOVE }
+
+    /**
+     * Encodes a touch at 0-indexed (col, row) into the escape sequence the
+     * currently-running program expects, given whatever mouse mode it last
+     * requested via DECSET - or returns null if nothing should be sent
+     * (mouse reporting is off, or this event kind isn't reported under the
+     * active mode - e.g. plain hover MOVE only goes out under 1003).
+     *
+     * button: 0=left, 1=middle, 2=right - only meaningful for PRESS/DRAG.
+     */
+    fun encodeMouseEvent(kind: MouseEventKind, col: Int, row: Int, button: Int = 0): String? {
+        if (mouseMode == MouseMode.NONE) return null
+        if (kind == MouseEventKind.MOVE && mouseMode != MouseMode.ANY_EVENT) return null
+        if (kind == MouseEventKind.DRAG && mouseMode != MouseMode.BUTTON_EVENT && mouseMode != MouseMode.ANY_EVENT) return null
+        if (kind == MouseEventKind.RELEASE && mouseMode == MouseMode.X10) return null // X10 never reports release
+
+        // xterm mouse coordinates are 1-indexed from the top-left.
+        val c = (col + 1).coerceIn(1, buffer.columns)
+        val r = (row + 1).coerceIn(1, buffer.rows)
+
+        val cb = when (kind) {
+            MouseEventKind.PRESS -> button
+            MouseEventKind.DRAG -> button or 32   // motion-while-pressed flag
+            MouseEventKind.MOVE -> 3 or 32         // no button + motion flag
+            MouseEventKind.RELEASE -> if (mouseSgrMode) button else 3 // legacy encoding has no distinct release button id
+        }
+
+        return if (mouseSgrMode) {
+            // SGR (1006) extended encoding: CSI < cb ; col ; row M/m - the
+            // final byte itself (M press/drag/move, m release) carries the
+            // press/release distinction, so cb doesn't need the legacy
+            // "release = 3" placeholder above.
+            val finalByte = if (kind == MouseEventKind.RELEASE) 'm' else 'M'
+            "\u001B[<$cb;$c;$r$finalByte"
+        } else {
+            // Legacy X10/1000/1002 encoding: CSI M then three raw bytes
+            // (button+32, col+32, row+32). Breaks past col/row 223 - real
+            // xterm has the same limitation in this mode, that's why 1006
+            // exists and everything modern asks for it too.
+            val btnByte = (cb + 32).coerceIn(32, 255).toChar()
+            val colByte = (c + 32).coerceIn(32, 255).toChar()
+            val rowByte = (r + 32).coerceIn(32, 255).toChar()
+            "\u001B[M$btnByte$colByte$rowByte"
         }
     }
 

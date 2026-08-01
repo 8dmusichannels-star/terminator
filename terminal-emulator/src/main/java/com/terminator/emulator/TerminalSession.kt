@@ -13,9 +13,11 @@ import java.io.IOException
  * FILE_BASE: a directory (path) + filename combined into one executable, e.g.
  *            path=/sdcard/Terminator, filename=session.sh -> /sdcard/Terminator/session.sh
  */
-sealed class SessionSpec(val displayName: String) {
-    class CommandArg(name: String, val commandPath: String) : SessionSpec(name)
-    class FileBase(name: String, val path: String, val filename: String) : SessionSpec(name) {
+sealed class SessionSpec(val displayName: String, val workingDirectory: String?) {
+    class CommandArg(name: String, val commandPath: String, workingDirectory: String? = null) :
+        SessionSpec(name, workingDirectory)
+    class FileBase(name: String, val path: String, val filename: String, workingDirectory: String? = null) :
+        SessionSpec(name, workingDirectory) {
         fun resolvedPath(): String = File(path, filename).absolutePath
     }
 }
@@ -70,7 +72,10 @@ class TerminalSession(
         }
 
         val argv = if (useRoot) arrayOf("su", "-c", executablePath) else arrayOf(executablePath)
-        val cwd = historyFile.parentFile?.absolutePath
+        // A configured working directory (Settings > Sessions > entry path)
+        // takes priority; otherwise fall back to this session's own
+        // per-session history directory, same as before this field existed.
+        val cwd = spec.workingDirectory?.takeIf { it.isNotBlank() } ?: historyFile.parentFile?.absolutePath
         val envp = buildEnvironment(cwd)
         val pidOut = IntArray(1)
 
@@ -140,6 +145,18 @@ class TerminalSession(
         } catch (_: IOException) {
             // pty closed underneath us; nothing to do
         }
+    }
+
+    /**
+     * Reports a touch as an xterm mouse-tracking escape sequence, if (and
+     * only if) the running program has actually asked for mouse reporting
+     * via DECSET - see TerminalEmulator.encodeMouseEvent. col/row are
+     * 0-indexed terminal cell coordinates, not pixels; the caller (the
+     * touch-handling UI code) is responsible for that pixel->cell mapping.
+     */
+    fun sendMouseEvent(kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
+        val seq = emulator.encodeMouseEvent(kind, col, row, button) ?: return
+        write(seq)
     }
 
     fun resize(columns: Int, rows: Int) {

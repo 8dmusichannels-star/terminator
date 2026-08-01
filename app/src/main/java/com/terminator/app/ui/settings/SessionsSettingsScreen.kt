@@ -1,5 +1,6 @@
 package com.terminator.app.ui.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -39,6 +40,7 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
     val repo = rememberSessionRepository()
     val scope = rememberCoroutineScope()
     var showAddDialog by remember { mutableStateOf(false) }
+    var editingSession by remember { mutableStateOf<SessionEntry?>(null) }
     val sessions by repo.sessions.collectAsState(initial = emptyList())
 
     Scaffold(
@@ -73,6 +75,7 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
                 items(sessions, key = { it.id }) { session ->
                     SessionSettingsRow(
                         session = session,
+                        onClick = { editingSession = session },
                         onToggleFavorite = {
                             scope.launch { repo.setFavorite(session.id, !session.isFavorite) }
                         },
@@ -91,10 +94,22 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
 
     if (showAddDialog) {
         AddSessionDialog(
+            existing = null,
             onDismiss = { showAddDialog = false },
             onSave = { entry ->
                 scope.launch { repo.save(entry) }
                 showAddDialog = false
+            }
+        )
+    }
+
+    editingSession?.let { session ->
+        AddSessionDialog(
+            existing = session,
+            onDismiss = { editingSession = null },
+            onSave = { entry ->
+                scope.launch { repo.save(entry) }
+                editingSession = null
             }
         )
     }
@@ -103,6 +118,7 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
 @Composable
 private fun SessionSettingsRow(
     session: SessionEntry,
+    onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
     onSetDefault: () -> Unit,
     onDelete: () -> Unit
@@ -110,6 +126,7 @@ private fun SessionSettingsRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -145,19 +162,24 @@ private fun SessionSettingsRow(
 
 @Composable
 private fun AddSessionDialog(
+    existing: SessionEntry?,
     onDismiss: () -> Unit,
     onSave: (SessionEntry) -> Unit
 ) {
-    var name by remember { mutableStateOf("") }
-    var type by remember { mutableStateOf(SessionType.COMMAND_ARG) }
-    var commandPath by remember { mutableStateOf("") }
-    var filePath by remember { mutableStateOf("/sdcard/Terminator") }
-    var fileName by remember { mutableStateOf("session.sh") }
-    var useRoot by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf(existing?.name ?: "") }
+    var type by remember { mutableStateOf(existing?.type ?: SessionType.COMMAND_ARG) }
+    var commandPath by remember { mutableStateOf(existing?.commandPath ?: "") }
+    var filePath by remember { mutableStateOf(existing?.filePath ?: "/sdcard/Terminator") }
+    var fileName by remember { mutableStateOf(existing?.fileName ?: "session.sh") }
+    // Entry path: the directory the spawned process starts in (its cwd /
+    // $HOME). Blank means "no override" - TerminalSession falls back to
+    // the session's own history directory, same as before this existed.
+    var workingDirectory by remember { mutableStateOf(existing?.workingDirectory ?: "") }
+    var useRoot by remember { mutableStateOf(existing?.useRoot ?: false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add session") },
+        title = { Text(if (existing != null) "Edit session" else "Add session") },
         text = {
             Column {
                 OutlinedTextField(
@@ -208,6 +230,14 @@ private fun AddSessionDialog(
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = workingDirectory,
+                    onValueChange = { workingDirectory = it },
+                    label = { Text("Entry path / spawn directory (optional)") },
+                    placeholder = { Text("e.g. /sdcard, /data/local/tmp") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = useRoot, onCheckedChange = { useRoot = it })
                     Text("Use root (su)")
@@ -216,12 +246,13 @@ private fun AddSessionDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                val entry = SessionEntry(
+                val entry = (existing ?: SessionEntry(name = "", type = type)).copy(
                     name = name.ifBlank { "Session" },
                     type = type,
                     commandPath = commandPath.ifBlank { null },
                     filePath = filePath.ifBlank { null },
                     fileName = fileName.ifBlank { null },
+                    workingDirectory = workingDirectory.ifBlank { null },
                     useRoot = useRoot
                 )
                 onSave(entry)

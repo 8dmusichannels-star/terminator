@@ -82,6 +82,7 @@ class SessionRepository(private val context: Context) {
             o.put("commandPath", e.commandPath ?: JSONObject.NULL)
             o.put("filePath", e.filePath ?: JSONObject.NULL)
             o.put("fileName", e.fileName ?: JSONObject.NULL)
+            o.put("workingDirectory", e.workingDirectory ?: JSONObject.NULL)
             o.put("useRoot", e.useRoot)
             o.put("isFavorite", e.isFavorite)
             o.put("isDefault", e.isDefault)
@@ -102,6 +103,9 @@ class SessionRepository(private val context: Context) {
                 commandPath = o.optString("commandPath").takeIf { o.get("commandPath") != JSONObject.NULL },
                 filePath = o.optString("filePath").takeIf { o.get("filePath") != JSONObject.NULL },
                 fileName = o.optString("fileName").takeIf { o.get("fileName") != JSONObject.NULL },
+                workingDirectory = if (o.has("workingDirectory"))
+                    o.optString("workingDirectory").takeIf { o.get("workingDirectory") != JSONObject.NULL }
+                else null,
                 useRoot = o.optBoolean("useRoot", false),
                 isFavorite = o.optBoolean("isFavorite", false),
                 isDefault = o.optBoolean("isDefault", false),

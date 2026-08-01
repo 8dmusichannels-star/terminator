@@ -19,6 +19,10 @@ data class SessionEntry(
     // FILE_BASE
     val filePath: String? = null,
     val fileName: String? = null,
+    // Directory the spawned process starts in (its cwd / $HOME). Null
+    // falls back to whatever TerminalSession.start() already used before
+    // this existed - the session's own per-session history directory.
+    val workingDirectory: String? = null,
     val useRoot: Boolean = false,
     val isFavorite: Boolean = false,
     val isDefault: Boolean = false,

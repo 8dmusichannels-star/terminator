@@ -167,7 +167,15 @@ private fun DrawScope.drawTerminal(
                 paint.isUnderlineText = cell.underline
                 paint.textSkewX = if (cell.italic) -0.25f else 0f
 
-                canvas.nativeCanvas.drawText(cell.char.toString(), x, y, paint)
+                // A plain space draws nothing visible - skipping the
+                // drawText call for it (the common case: blank lines,
+                // cleared regions, right-padding after short output) cuts
+                // a meaningful fraction of the ~1920 drawText calls a full
+                // 80x24 redraw would otherwise make. Underlined spaces
+                // still need to draw (the underline itself is visible).
+                if (cell.char != ' ' || cell.underline) {
+                    canvas.nativeCanvas.drawText(cell.char.toString(), x, y, paint)
+                }
             }
         }
 

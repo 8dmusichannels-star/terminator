@@ -30,6 +30,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -52,6 +54,7 @@ import com.terminator.app.ui.settings.DEFAULT_CUSTOM_BG
 import com.terminator.app.ui.settings.DEFAULT_CUSTOM_FG
 import com.terminator.app.ui.settings.SettingsActivity
 import com.terminator.app.ui.theme.TerminatorTheme
+import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 
@@ -340,6 +343,48 @@ class MainActivity : ComponentActivity() {
                                                     val newSize = (effectiveTextSize * zoom)
                                                         .coerceIn(8f, 40f)
                                                     viewModel.setSessionTextSize(activeSessionId, newSize)
+                                                }
+                                            }
+                                        }
+                                        // Mouse reporting: when the running program (mc, vim,
+                                        // htop, less, etc.) has asked for it via DECSET 1000/
+                                        // 1002/1003, forward touches as xterm mouse escape
+                                        // sequences instead of leaving the terminal as a purely
+                                        // read-only text view. A whole press-drag-release only
+                                        // becomes one gesture if the program actually asked for
+                                        // it (activeSessionWantsMouseEvents() checked once at
+                                        // the start of each gesture); if it hasn't, this block
+                                        // does nothing and awaitEachGesture below just lets the
+                                        // touch fall through untouched to the tap/pinch handlers
+                                        // above.
+                                        .pointerInput(activeSessionId) {
+                                            awaitEachGesture {
+                                                val down = awaitFirstDown(requireUnconsumed = false)
+                                                if (!viewModel.activeSessionWantsMouseEvents()) return@awaitEachGesture
+                                                val (charWidth, charHeight) = charMetrics
+                                                if (charWidth <= 0f || charHeight <= 0f) return@awaitEachGesture
+
+                                                fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
+                                                    (offset.x / charWidth).toInt() to (offset.y / charHeight).toInt()
+
+                                                var (col, row) = cellOf(down.position)
+                                                viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
+
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    val change = event.changes.firstOrNull() ?: break
+                                                    if (!change.pressed) {
+                                                        val (rCol, rRow) = cellOf(change.position)
+                                                        viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+                                                        change.consume()
+                                                        break
+                                                    }
+                                                    val (dCol, dRow) = cellOf(change.position)
+                                                    if (dCol != col || dRow != row) {
+                                                        col = dCol; row = dRow
+                                                        viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                                    }
+                                                    change.consume()
                                                 }
                                             }
                                         }
