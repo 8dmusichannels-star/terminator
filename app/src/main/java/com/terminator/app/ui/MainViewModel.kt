@@ -1,6 +1,5 @@
 package com.terminator.app.ui
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.terminator.app.session.SessionEntry
@@ -337,9 +336,7 @@ class MainViewModel(
     }
 
     fun toggleFavorite(entry: SessionEntry) = viewModelScope.launch {
-        Log.d("FAVDEBUG", "toggleFavorite CALLED id=${entry.id} name=${entry.name} currentIsFavorite=${entry.isFavorite} -> requesting=${!entry.isFavorite}")
         repository.setFavorite(entry.id, !entry.isFavorite)
-        Log.d("FAVDEBUG", "toggleFavorite repository.setFavorite RETURNED for id=${entry.id}")
     }
 
     fun setDefault(entry: SessionEntry) = viewModelScope.launch {

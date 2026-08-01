@@ -19,7 +19,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -160,11 +159,21 @@ fun SessionDrawer(
                         items = sessions.sortedByDescending { it.isFavorite },
                         key = { it.id }
                     ) { session ->
+                        // Re-look up the entry by id from the *current* sessions list on every
+                        // recomposition instead of trusting the `session` this lambda captured
+                        // when the item was first placed. LazyColumn keeps a composable slot
+                        // alive across recompositions via `key`, but since this list is
+                        // re-sorted (sortedByDescending isFavorite) on every call, the slot's
+                        // captured `session` could still reflect the pre-toggle snapshot for a
+                        // frame - which is what made the star icon look like it wasn't
+                        // updating/disappearing even though the DataStore write had already
+                        // completed underneath it.
+                        val current = sessions.firstOrNull { it.id == session.id } ?: session
                         SessionRow(
-                            session = session,
-                            onClick = { onSessionSelected(session) },
-                            onLongClick = { onSetDefault(session) },
-                            onToggleFavorite = { onToggleFavorite(session) }
+                            session = current,
+                            onClick = { onSessionSelected(current) },
+                            onLongClick = { onSetDefault(current) },
+                            onToggleFavorite = { onToggleFavorite(current) }
                         )
                     }
                 }
@@ -271,8 +280,13 @@ private fun SessionRow(
         }
         IconButton(onClick = onToggleFavorite) {
             Icon(
-                if (session.isFavorite) Icons.Filled.Star else Icons.Outlined.Star,
-                contentDescription = "Toggle favorite"
+                Icons.Filled.Star,
+                contentDescription = "Toggle favorite",
+                tint = if (session.isFavorite) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    Color.White.copy(alpha = 0.35f)
+                }
             )
         }
     }

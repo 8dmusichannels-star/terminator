@@ -1,7 +1,6 @@
 package com.terminator.app.session
 
 import android.content.Context
-import android.util.Log
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -51,10 +50,7 @@ class SessionRepository(private val context: Context) {
     }
 
     suspend fun setFavorite(id: String, favorite: Boolean) = mutate { current ->
-        Log.d("FAVDEBUG", "setFavorite mutate: id=$id favorite=$favorite currentList=${current.map { it.id to it.isFavorite }}")
-        val result = current.map { if (it.id == id) it.copy(isFavorite = favorite) else it }
-        Log.d("FAVDEBUG", "setFavorite mutate: resultList=${result.map { it.id to it.isFavorite }}")
-        result
+        current.map { if (it.id == id) it.copy(isFavorite = favorite) else it }
     }
 
     /**
@@ -74,16 +70,10 @@ class SessionRepository(private val context: Context) {
      * another write to land in between.
      */
     private suspend fun mutate(transform: (List<SessionEntry>) -> List<SessionEntry>) {
-        try {
-            context.sessionDataStore.edit { prefs ->
-                val current = decodeOrDefault(prefs[sessionsKey])
-                val transformed = transform(current)
-                prefs[sessionsKey] = encode(transformed)
-            }
-            Log.d("FAVDEBUG", "mutate: DataStore.edit completed OK")
-        } catch (e: Exception) {
-            Log.e("FAVDEBUG", "mutate: DataStore.edit THREW", e)
-            throw e
+        context.sessionDataStore.edit { prefs ->
+            val current = decodeOrDefault(prefs[sessionsKey])
+            val transformed = transform(current)
+            prefs[sessionsKey] = encode(transformed)
         }
     }
 

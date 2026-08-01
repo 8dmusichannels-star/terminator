@@ -167,8 +167,28 @@ private fun DrawScope.drawTerminal(
         for (row in r1..r2) {
             if (row !in 0 until buffer.rows) continue
             val fromCol = (if (row == r1) c1 else 0).coerceIn(0, buffer.columns - 1)
-            val toCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
-            if (fromCol > toCol) continue
+            val rawToCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
+
+            // Trailing blank cells on a row (columns never written to, or
+            // cleared back to a space) aren't real content - selectedText()
+            // already trims them from what actually gets copied. The
+            // highlight used to always paint out to the row's raw toCol
+            // (the far edge of the screen for every row except the last),
+            // so dragging a selection down past a couple lines of real
+            // text into the blank rows below it painted a solid full-width
+            // bar across all that empty space - looking like one giant
+            // block instead of just the two or three lines actually
+            // selected. Clamping to the row's last non-space character
+            // keeps the highlight's shape matching what Copy will actually
+            // produce.
+            val lastNonBlankCol = buffer.lastNonBlankColumn(row, scrollOffset)
+            // Only clamp the *end* of the row's highlighted range - the
+            // drag's start column (fromCol, on r1) is always where the
+            // user actually put their finger, so it's left untouched even
+            // if that lands past the last real character.
+            val toCol = if (lastNonBlankCol != null) rawToCol.coerceAtMost(lastNonBlankCol) else -1
+            if (toCol < fromCol) continue
+
             val x = fromCol * charWidth
             val y = (row + 1) * charHeight
             val width = (toCol - fromCol + 1) * charWidth

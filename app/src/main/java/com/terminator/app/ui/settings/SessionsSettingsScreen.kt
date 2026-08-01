@@ -8,7 +8,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -149,8 +148,13 @@ private fun SessionSettingsRow(
         }
         IconButton(onClick = onToggleFavorite) {
             Icon(
-                if (session.isFavorite) Icons.Filled.Star else Icons.Outlined.Star,
-                contentDescription = "Toggle favorite"
+                Icons.Filled.Star,
+                contentDescription = "Toggle favorite",
+                tint = if (session.isFavorite) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    LocalContentColor.current.copy(alpha = 0.35f)
+                }
             )
         }
         // Deletable even if it's the current default - SessionRepository

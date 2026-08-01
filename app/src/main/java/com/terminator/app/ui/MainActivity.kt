@@ -320,6 +320,24 @@ class MainActivity : ComponentActivity() {
                             var selectionStart by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
                             var selectionEnd by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
                             val clipboardManager = LocalClipboardManager.current
+
+                            // selectionStart/End are absolute (row, col) screen positions, not
+                            // tied to any particular piece of text. The moment new output prints
+                            // to the live screen (bufferVersion bumps), every row after the first
+                            // changed line shifts - whatever the user had highlighted no longer
+                            // lines up with the same on-screen rows, which is what made the
+                            // highlighted/"about to copy" region appear to silently jump/fall to
+                            // a different spot. Clearing the selection as soon as the buffer
+                            // changes underneath it means a finished selection stays exactly
+                            // where the user left it (nothing more prints once they've stopped
+                            // and are just about to tap Copy), while a genuinely live-updating
+                            // screen can't leave a stale, now-wrong highlight sitting around.
+                            LaunchedEffect(state.bufferVersion, activeSessionId) {
+                                if (selectionStart != null || selectionEnd != null) {
+                                    selectionStart = null
+                                    selectionEnd = null
+                                }
+                            }
                             val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
                             // The pinch gesture's pointerInput below is keyed only on
                             // activeSessionId (not effectiveTextSize) so it doesn't restart
@@ -480,11 +498,54 @@ class MainActivity : ComponentActivity() {
                                                         // deadline) - that's the long-press.
                                                         selecting = true
                                                         moved = true
+                                                        // Starting a text selection shouldn't imply
+                                                        // "close the keyboard" - without this, focus
+                                                        // silently drops off the hidden IME field the
+                                                        // moment the long-press gesture takes over
+                                                        // (nothing else claims focus during selection),
+                                                        // and Android auto-dismisses the keyboard as
+                                                        // soon as the focused field loses focus with
+                                                        // nothing requesting it elsewhere. Re-requesting
+                                                        // keeps typing available immediately after
+                                                        // Copy/Paste/Cancel without the user having to
+                                                        // tap the terminal again to bring it back.
+                                                        if (keyboardOpen) {
+                                                            focusRequester.requestFocus()
+                                                        }
                                                         val (charWidth, charHeight) = charMetrics
                                                         if (charWidth > 0f && charHeight > 0f) {
-                                                            val cell = (lastPos.x / charWidth).toInt() to (lastPos.y / charHeight).toInt()
-                                                            selectionStart = cell
-                                                            selectionEnd = cell
+                                                            val touchedRow = (lastPos.y / charHeight).toInt()
+                                                            val touchedCol = (lastPos.x / charWidth).toInt()
+                                                            // A long-press very commonly lands on blank
+                                                            // terminal space below the actual output -
+                                                            // with only a couple of lines printed, most
+                                                            // of the screen is empty. Starting the
+                                                            // selection exactly where the finger is in
+                                                            // that case just selects nothing (and Copy
+                                                            // silently does nothing). Snap up to the
+                                                            // nearest row above the touch that actually
+                                                            // has content, landing on its last real
+                                                            // character, so a long-press anywhere below
+                                                            // the visible output still selects that
+                                                            // output instead of empty space.
+                                                            val liveBuffer = viewModel.activeBuffer()
+                                                            val snapped = if (liveBuffer != null &&
+                                                                liveBuffer.lastNonBlankColumn(touchedRow, state.scrollOffset) == null
+                                                            ) {
+                                                                val contentRow = (touchedRow downTo 0).firstOrNull { r ->
+                                                                    liveBuffer.lastNonBlankColumn(r, state.scrollOffset) != null
+                                                                }
+                                                                if (contentRow != null) {
+                                                                    val lastCol = liveBuffer.lastNonBlankColumn(contentRow, state.scrollOffset)!!
+                                                                    contentRow to lastCol
+                                                                } else {
+                                                                    touchedRow to touchedCol
+                                                                }
+                                                            } else {
+                                                                touchedRow to touchedCol
+                                                            }
+                                                            selectionStart = snapped
+                                                            selectionEnd = snapped
                                                         }
                                                         continue
                                                     }
@@ -502,8 +563,45 @@ class MainActivity : ComponentActivity() {
                                                         // keeps tracking the original one.
                                                         val (charWidth, charHeight) = charMetrics
                                                         if (charWidth > 0f && charHeight > 0f) {
-                                                            selectionEnd = (primary.position.x / charWidth).toInt() to
-                                                                (primary.position.y / charHeight).toInt()
+                                                            val rawCol = (primary.position.x / charWidth).toInt()
+                                                            val rawRow = (primary.position.y / charHeight).toInt()
+                                                            val current = selectionEnd
+                                                            if (current == null) {
+                                                                selectionEnd = rawRow to rawCol
+                                                            } else {
+                                                                val (curRow, curCol) = current
+                                                                // Hysteresis band around each cell's
+                                                                // boundary: a few natural-tremor pixels
+                                                                // (well under one whole cell) sitting
+                                                                // right at the edge between two rows/
+                                                                // cols used to flip selectionEnd back
+                                                                // and forth every frame with a plain
+                                                                // floor(position/cellSize) - visually
+                                                                // that read as the selection endpoint
+                                                                // "falling"/jittering even though the
+                                                                // finger barely moved. Only actually
+                                                                // moves to a new cell once the touch is
+                                                                // solidly inside it (past a margin from
+                                                                // the boundary), same idea as how native
+                                                                // Android text-selection handles keeps
+                                                                // handles from chattering at cell edges.
+                                                                val margin = 0.25f
+                                                                val rowCenterOffset = (primary.position.y / charHeight) - rawRow
+                                                                val colCenterOffset = (primary.position.x / charWidth) - rawCol
+                                                                val newRow = when {
+                                                                    rawRow == curRow -> curRow
+                                                                    rawRow > curRow && rowCenterOffset > margin -> rawRow
+                                                                    rawRow < curRow && rowCenterOffset < (1f - margin) -> rawRow
+                                                                    else -> curRow
+                                                                }
+                                                                val newCol = when {
+                                                                    rawCol == curCol -> curCol
+                                                                    rawCol > curCol && colCenterOffset > margin -> rawCol
+                                                                    rawCol < curCol && colCenterOffset < (1f - margin) -> rawCol
+                                                                    else -> curCol
+                                                                }
+                                                                selectionEnd = newRow to newCol
+                                                            }
                                                         }
                                                         primary.consume()
                                                         lastPos = primary.position
@@ -563,9 +661,23 @@ class MainActivity : ComponentActivity() {
                                                         moved = true
                                                         changes.forEach { it.consume() }
                                                     } else {
-                                                        val dy = primary.position.y - lastPos.y
-                                                        if (kotlin.math.abs(dy) > 2f) {
+                                                        // Compares TOTAL displacement from the initial
+                                                        // press (down.position), not this frame's delta
+                                                        // against lastPos - and against the platform's
+                                                        // real touch slop instead of a fixed 2px. A
+                                                        // per-frame-delta/2px check treated the very
+                                                        // first bit of natural finger tremor during a
+                                                        // "hold still for a long-press" gesture as an
+                                                        // intentional scroll, setting moved=true and
+                                                        // permanently blocking the long-press timeout
+                                                        // branch above from ever firing - which is why
+                                                        // long-press-to-select never actually started.
+                                                        val totalDx = primary.position.x - down.position.x
+                                                        val totalDy = primary.position.y - down.position.y
+                                                        val totalDistance = kotlin.math.sqrt(totalDx * totalDx + totalDy * totalDy)
+                                                        if (totalDistance > viewConfiguration.touchSlop) {
                                                             moved = true
+                                                            val dy = primary.position.y - lastPos.y
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
                                                                 val (_, charHeight) = charMetrics
                                                                 if (charHeight > 0f) {

@@ -76,7 +76,8 @@ class TerminalBuffer(
     // Persisted incrementally to disk by TerminalSession (.history file).
     val scrollback: ArrayDeque<Array<Cell>> = ArrayDeque()
 
-    fun cellAt(row: Int, col: Int): Cell = grid[row][col]
+    fun cellAt(row: Int, col: Int): Cell =
+        if (row in grid.indices && col in 0 until columns) grid[row][col] else Cell()
 
     /**
      * Reads a cell at a given scroll offset above the live grid - offset 0
@@ -104,6 +105,17 @@ class TerminalBuffer(
         }
     }
 
+    /**
+     * Last column on [row] that has real (non-space) content, respecting
+     * [scrollOffset] the same way [lineAt] does - or null if the whole row
+     * is blank. Used to snap a long-press/drag that landed on empty
+     * terminal space (very common with only a couple of lines of output -
+     * most of the screen below the prompt is blank) onto the nearest real
+     * text instead of silently selecting/copying nothing.
+     */
+    fun lastNonBlankColumn(row: Int, scrollOffset: Int): Int? =
+        (0 until columns).lastOrNull { col -> lineAt(row, col, scrollOffset).char != ' ' }
+
     /** How many lines are available to scroll back through right now. */
     val maxScrollOffset: Int get() = scrollback.size
 
@@ -128,6 +140,7 @@ class TerminalBuffer(
         }
         val lines = mutableListOf<String>()
         for (row in r1..r2) {
+            if (row !in 0 until rows) continue
             val fromCol = (if (row == r1) c1 else 0).coerceIn(0, columns - 1)
             val toCol = (if (row == r2) c2 else columns - 1).coerceIn(0, columns - 1)
             val sb = StringBuilder()
