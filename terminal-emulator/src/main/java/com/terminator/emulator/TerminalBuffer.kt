@@ -147,6 +147,28 @@ class TerminalBuffer(
         grid[bottom] = Array(columns) { Cell(bg = bg) }
     }
 
+    /** Scrolls the whole grid down by one line (Reverse Index at the top
+     *  margin) - bottom line is dropped, a blank line appears at the top.
+     *  Never touches scrollback: RI only re-reveals a blank row, never
+     *  "new" content, so there's nothing worth persisting. */
+    fun scrollDown(bg: Int = DEFAULT_BACKGROUND) {
+        for (r in rows - 1 downTo 1) {
+            grid[r] = grid[r - 1]
+        }
+        grid[0] = Array(columns) { Cell(bg = bg) }
+    }
+
+    /** Scrolls the region [top, bottom] (inclusive) down by one line -
+     *  the scrolling-region-aware counterpart of [scrollRegionUp], used for
+     *  Reverse Index when a custom scroll region (DECSTBM) is active. */
+    fun scrollRegionDown(top: Int, bottom: Int, bg: Int = DEFAULT_BACKGROUND) {
+        if (top >= bottom || top !in 0 until rows || bottom !in 0 until rows) return
+        for (r in bottom downTo top + 1) {
+            grid[r] = grid[r - 1]
+        }
+        grid[top] = Array(columns) { Cell(bg = bg) }
+    }
+
     /** Inserts `count` blank lines at `row`, pushing lines down within
      *  [row, bottom] and dropping any that fall off the bottom. */
     fun insertLines(row: Int, bottom: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) {

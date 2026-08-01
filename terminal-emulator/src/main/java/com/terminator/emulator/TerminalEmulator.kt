@@ -136,6 +136,21 @@ class TerminalEmulator(
                 cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
                 state = State.NORMAL
             }
+            // IND (Index) - move down one line, scrolling the region if
+            // already at the bottom margin. Previously fell through to the
+            // `else` below and was silently dropped, which is exactly why
+            // full-screen apps that scroll via IND (nano among them, when
+            // it redraws the edit window at the bottom of the screen)
+            // looked "stuck": the scroll they asked for never happened.
+            'D' -> { lineFeed(); state = State.NORMAL }
+            // NEL (Next Line) - CR+LF in one shot. Same scroll-on-bottom-
+            // margin behavior as IND, plus a carriage return.
+            'E' -> { cursorCol = 0; lineFeed(); state = State.NORMAL }
+            // RI (Reverse Index) - move up one line, scrolling the region
+            // down if already at the top margin. Was silently dropped too;
+            // without it, scrolling upward through a scroll-region (e.g.
+            // Page Up inside nano) never worked.
+            'M' -> { reverseLineFeed(); state = State.NORMAL }
             else -> state = State.NORMAL
         }
     }
@@ -204,6 +219,23 @@ class TerminalEmulator(
                 }
                 cursorRow = scrollTop
                 cursorCol = 0
+            }
+            // SU (Scroll Up) / SD (Scroll Down) - scroll the region by N
+            // lines without touching the cursor position at all. Distinct
+            // from IND/RI (which move the cursor and only scroll as a side
+            // effect of hitting the margin); some redraws issue these
+            // directly instead. Previously unhandled, silently ignored.
+            'S' -> {
+                val savedRow = cursorRow
+                cursorRow = scrollBottom // so each lineFeed() call actually scrolls
+                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { lineFeed() }
+                cursorRow = savedRow
+            }
+            'T' -> {
+                val savedRow = cursorRow
+                cursorRow = scrollTop // so each reverseLineFeed() call actually scrolls
+                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { reverseLineFeed() }
+                cursorRow = savedRow
             }
             'm' -> applySgr(params)
             'h', 'l' -> { /* non-private mode set/reset we don't track - ignore */ }
@@ -349,6 +381,21 @@ class TerminalEmulator(
             }
         } else if (cursorRow < buffer.rows - 1) {
             cursorRow++
+        }
+    }
+
+    /** Reverse Index (ESC M) - the upward counterpart of [lineFeed]: moves
+     *  the cursor up one line, or scrolls the region down if the cursor is
+     *  already sitting at the top margin. */
+    private fun reverseLineFeed() {
+        if (cursorRow == scrollTop) {
+            if (scrollTop == 0 && scrollBottom == buffer.rows - 1) {
+                buffer.scrollDown(curBg)
+            } else {
+                buffer.scrollRegionDown(scrollTop, scrollBottom, curBg)
+            }
+        } else if (cursorRow > 0) {
+            cursorRow--
         }
     }
 
