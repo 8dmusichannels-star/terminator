@@ -1,0 +1,27 @@
+TERMINATOR - Android terminal UI wrapper
+Copyright (C) 2026 TERMINATOR contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+NOTICE:
+The :terminal-emulator module's architecture is inspired by TermOne Plus
+(https://gitlab.com/termapps/termoneplus) and jackpal/Android-Terminal-Emulator,
+both licensed under the Apache License, Version 2.0. No source from those
+projects has been copied verbatim into this repository; the VT100/ANSI
+parsing and buffer model here is an independent implementation written for
+TERMINATOR. If code is ported directly from either project in the future,
+its Apache-2.0 notices must be preserved alongside this GPLv3-or-later
+license per Apache 2.0 §4.

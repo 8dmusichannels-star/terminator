@@ -1,0 +1,79 @@
+name: Build TERMINATOR
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Run unit tests
+        run: gradle test --stacktrace
+
+      - name: Run Android lint
+        run: gradle lint --stacktrace
+
+      - name: Build debug APK (all ABI splits + universal)
+        run: gradle assembleDebug --stacktrace
+
+      # Every push/PR to main: temporary artifact, 90-day retention, for
+      # quick testing from the Actions tab. Not a permanent distribution.
+      - name: Upload debug APKs (temporary artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminator-debug-apks
+          path: app/build/outputs/apk/debug/*.apk
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build release APK (unsigned, all ABIs)
+        run: gradle assembleRelease --stacktrace
+
+      # Only runs when a version tag (e.g. v0.1.0) is pushed: creates a
+      # permanent, versioned GitHub Release with the APKs attached.
+      - name: Create GitHub Release with APKs
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

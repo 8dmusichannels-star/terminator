@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TERMINATOR</string>
+    <string name="settings_title">Settings</string>
+    <string name="notification_channel_name">Terminal Sessions</string>
+    <string name="notification_session_running">A session is running</string>
+</resources>
