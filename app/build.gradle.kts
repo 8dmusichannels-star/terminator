@@ -2,11 +2,9 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
-
 android {
     namespace = "com.terminator.app"
     compileSdk = 35
-
     defaultConfig {
         applicationId = "com.terminator.app"
         minSdk = 33
@@ -14,7 +12,6 @@ android {
         versionCode = 6
         versionName = "0.2.2"
     }
-
     buildFeatures {
         compose = true
     }
@@ -28,9 +25,7 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-
     val keystorePath = System.getenv("KEYSTORE_PATH")
-
     signingConfigs {
         if (keystorePath != null) {
             create("release") {
@@ -44,7 +39,6 @@ android {
             }
         }
     }
-
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -53,14 +47,12 @@ android {
             }
         }
     }
-
     packaging {
         // Universal + per-ABI splits handled in CI (see .github/workflows/build.yml)
         jniLibs {
             useLegacyPackaging = false
         }
     }
-
     splits {
         abi {
             isEnable = true
@@ -70,17 +62,19 @@ android {
         }
     }
 }
-
-// Fail-fast guard: only enforced when actually assembling/bundling a release,
-// not during configuration of unrelated tasks (test, lint, assembleDebug).
+// Reproducible/third-party build support (e.g. F-Droid): when no keystore
+// secrets are present, we build an UNSIGNED release APK instead of failing.
+// CI (.github/workflows/build.yml) always provides KEYSTORE_PATH and
+// produces a signed release; this branch only triggers for builds run
+// outside that pipeline (F-Droid build server, local reproducibility
+// checks, third-party builders).
 tasks.matching { it.name == "assembleRelease" || it.name == "bundleRelease" }.configureEach {
     doFirst {
         if (System.getenv("KEYSTORE_PATH") == null) {
-            throw GradleException("KEYSTORE_PATH not set — release signing requires CI secrets (see .github/workflows/build.yml)")
+            logger.warn("KEYSTORE_PATH not set — building UNSIGNED release APK. This is expected for F-Droid / reproducible builds; CI provides signing secrets for official releases.")
         }
     }
 }
-
 dependencies {
     implementation(project(":terminal-emulator"))
     implementation("androidx.core:core-ktx:1.13.1")
