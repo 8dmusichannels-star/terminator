@@ -1,0 +1,53 @@
+name: Manual - Delete All Workflow Runs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete_all_runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all workflow runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            core.info(`Listing workflow runs for ${owner}/${repo}...`);
+
+            // GitHub API delete is rate-limited; do in batches with pagination
+            const perPage = 100;
+            let page = 1;
+            let totalDeleted = 0;
+
+            while (true) {
+              const res = await github.rest.actions.listWorkflowRunsForRepo({
+                owner,
+                repo,
+                per_page: perPage,
+                page
+              });
+
+              const runs = res.data;
+              if (!runs || runs.length === 0) break;
+
+              core.info(`Page ${page}: ${runs.length} runs`);
+
+              for (const run of runs) {
+                core.info(`Deleting run id=${run.id} status=${run.status} created_at=${run.created_at}`);
+                await github.rest.actions.deleteWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id
+                });
+                totalDeleted++;
+              }
+
+              page++;
+            }
+
+            core.info(`Done. Deleted runs: ${totalDeleted}`);
