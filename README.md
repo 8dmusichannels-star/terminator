@@ -1,44 +1,36 @@
 # TERMINATOR
 
-A lightweight Android terminal UI wrapper. No chroot, no proot, no bundled
-Linux distribution — TERMINATOR talks directly to whatever executable you
-point it at (`/system/bin/sh`, `/system/bin/su`, or your own script), and
-gets out of the way.
+Terminator is Terminal emulator offers comprehensive terminal emulator support with multiple session support that you can directly customize and control. Its main purpose is a terminal emulation that can only be read by the user and is suitable for daily use. The main difference of Terminator is only in the Interface area. It comes with embedded terminal colors and a fully compact interface. It does not offer a ready-made chroot proot envormient support, terminal tool infrastructure and other things are left to the users of the Terminator application. Other terminal envormient and terminal UI are modern. It supports on Android.
 
-## Philosophy
+## Features
 
-Most "solutions" to terminal access on Android reach for isolation: a
-private root filesystem, a bootstrapped package manager, a fork of Debian
-running under proot. That solves a different problem (running a foreign
-Linux userland on top of Bionic) than the one most people actually have,
-which is: *give me a good terminal UI over the shell that's already there.*
+It comes with Material UI, supports all color matches and the terminal applies it to its own color interface.
 
-TERMINATOR doesn't sandbox you and doesn't sandbox itself. It executes,
-renders, and lets you bring your own environment if you want one.
+It has Amoled black support, but there is no dynamic color in the terminal, it only comes with blue and black terminal colors. If you want to keep it simple or plain, just enter the rgb color code and custom css terminal color support is also offered. For example, it comes with the nord theme.
 
-## Status
+It has multiple session support, you can create more than one session, you can choose default or favorite. After adding the session, there is file base session or command arg session support. command arg session you specify the executable file that should be spawned directly. If you are using root, you can activate the root session directly without using `/system/bin/su` and specify the entry path, the directory path that will spawn the starting directory, and the terminal can be started via the session you set as default. The file-based method is the same. You can directly specify the directory to spawn by specifying the shell script file name and path as follows, you can run it with the entry path and by activating the root session.
 
-Early scaffold — core VT100/ANSI emulator, session management, and the
-main Compose UI (drawer, titlebar, settings) are in place. Not yet a
-finished, tested app. See `/areas/terminator-app.md`-style spec notes in
-project history for the full feature list.
+Resizing the terminal size by text size, terminal width or temporary session zoom is supported. Alpha is supported with terminal background support and background blur. There is font support, monospace sans mono serif, mono embedded fonts are available and there is special font support, you can add ttf otf supported fonts.
 
-## Requirements
+Bell sound is supported, you can choose it as custom or default notification sound in the system.
 
-- minSdk 33 (Android 13)
-- Target: Android 13/14/15/16/17
-- ABIs: armeabi-v7a, arm64-v8a, x86, x86_64
+You can hide or show the statusbar and titlebar on the screen. Horizontal landspace mode is supported. You can use the terminal that way as well.
 
-## License
+As keyboard, soft keyboard (tap to terminal open/close) and virtual key are supported (as key bar). As input mode:
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+- **default** — compatible with ALL IMEs including cjk button strict terminal
+- **semantically correct** but may break some IMEs
+- **Legacy workaround** — fixes samsung keyboard echo: may break Gboard
+- **cjk input** is supported but default is recommended.
 
-## Building
+3 types of terminal types are supported:
 
-```
-./gradlew assembleDebug
-```
+- **xterm256-color** — recommended
+- **VT100** — color support is limited and it does not work even without a terminfo entry
+- **ANSI** — color support, but it is compatible with DOS.
 
-APKs (per-ABI + universal) land in `app/build/outputs/apk/debug/`.
-CI builds run automatically via GitHub Actions on push/PR (see
-`.github/workflows/build.yml`).
+Keyboard shortcuts and keymapper support are also provided. You can assign or support virtual keyboards directly from the physical keyboard. And there is also seccomp support to solve operation not permitted errors. and there are more features
+
+## Development status
+
+It is currently under development, more advanced features or improved features will be developed soon, but there may be minor bugs as it is in beta stage and not fully stable.
