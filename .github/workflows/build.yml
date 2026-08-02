@@ -1,5 +1,4 @@
 name: Build TERMINATOR
-
 on:
   push:
     branches: [ "main" ]
@@ -11,7 +10,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,8 +63,31 @@ jobs:
         with:
           gradle-version: 8.9
 
-      - name: Build release APK (unsigned, all ABIs)
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+
+      - name: Build release APK (signed, all ABIs + universal)
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: gradle assembleRelease --stacktrace
+
+      - name: Clean up keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+
+      - name: Verify APK signatures
+        run: |
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n1)
+          for apk in app/build/outputs/apk/release/*.apk; do
+            echo "Verifying $apk"
+            "$BUILD_TOOLS/apksigner" verify --print-certs "$apk"
+          done
 
       # Only runs when a version tag (e.g. v0.1.0) is pushed: creates a
       # permanent, versioned GitHub Release with the APKs attached.
