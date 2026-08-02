@@ -1,4 +1,4 @@
-name: Manual - Delete All Workflow Runs
+name: Manual - Delete Completed Workflow Runs
 
 on:
   workflow_dispatch:
@@ -7,10 +7,10 @@ permissions:
   actions: write
 
 jobs:
-  delete_all_runs:
+  delete_completed:
     runs-on: ubuntu-latest
     steps:
-      - name: Delete all workflow runs (repo-wide)
+      - name: Delete completed runs only
         uses: actions/github-script@v7
         with:
           script: |
@@ -18,9 +18,11 @@ jobs:
             const repo = context.repo.repo;
 
             const perPage = 100;
-            let totalDeleted = 0;
+            let deleted = 0;
+            let skipped = 0;
+            let failed = 0;
 
-            core.info(`Collecting workflow runs for ${owner}/${repo}...`);
+            core.info(`Collecting workflow runs (all) for ${owner}/${repo}...`);
 
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
@@ -30,13 +32,25 @@ jobs:
             core.info(`Total runs found: ${runs.length}`);
 
             for (const run of runs) {
-              core.info(`Deleting run id=${run.id} status=${run.status} created_at=${run.created_at}`);
-              await github.rest.actions.deleteWorkflowRun({
-                owner,
-                repo,
-                run_id: run.id
-              });
-              totalDeleted++;
+              // Only attempt deletion when the run is completed
+              if (run.status !== 'completed') {
+                skipped++;
+                core.info(`Skip id=${run.id} status=${run.status}`);
+                continue;
+              }
+
+              try {
+                core.info(`Delete id=${run.id} conclusion=${run.conclusion}`);
+                await github.rest.actions.deleteWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id
+                });
+                deleted++;
+              } catch (e) {
+                failed++;
+                core.warning(`Failed id=${run.id}. ${e?.message || e}`);
+              }
             }
 
-            core.info(`Done. Deleted runs: ${totalDeleted}`);
+            core.info(`Done. deleted=${deleted} skipped=${skipped} failed=${failed}`);
