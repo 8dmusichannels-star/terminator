@@ -1,0 +1,36 @@
+Terminator is a terminal emulator that offers comprehensive terminal emulation support with multiple session support that you can directly customize and control. Its main purpose is terminal emulation suitable for daily use. The main difference of Terminator is in the interface area: it comes with embedded terminal colors and a fully compact interface. It does not offer ready-made chroot/proot environment support; terminal tool infrastructure and other things are left to the user. It supports on Android.
+
+<b>Features</b>
+
+It comes with Material UI, supports all color matches, and the terminal applies it to its own color interface.
+
+It has AMOLED black support, but there is no dynamic color in the terminal itself; it only comes with blue and black terminal colors. If you want to keep it simple or plain, just enter the RGB color code. Custom CSS terminal color support is also offered, for example it comes with the Nord theme.
+
+It has multiple session support: you can create more than one session and choose default or favorite. After adding a session, there is file-based session or command-arg session support. In command-arg session you specify the executable file that should be spawned directly. If you are using root, you can activate the root session directly without using <i>/system/bin/su</i>, specify the entry path (the directory that will spawn as the starting directory), and the terminal can be started via the session you set as default. The file-based method works the same way: you can directly specify the directory to spawn by specifying the shell script file name and path, and run it with the entry path by activating the root session.
+
+Resizing the terminal by text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background transparency and background blur. There is font support: monospace, sans, mono, serif, and embedded fonts are available, plus special font support where you can add TTF/OTF fonts.
+
+Bell sound is supported; you can choose custom or default system notification sound.
+
+You can hide or show the status bar and title bar on screen. Horizontal landscape mode is supported, and you can use the terminal that way as well.
+
+As keyboard, soft keyboard (tap to open/close terminal) and virtual keys are supported (as a key bar). As input mode:
+<ul>
+<li><b>Default</b> — compatible with all IMEs, including CJK button strict terminal</li>
+<li><b>Semantically correct</b> — may break some IMEs</li>
+<li><b>Legacy workaround</b> — fixes Samsung keyboard echo, may break Gboard</li>
+<li><b>CJK input</b> is supported but default is recommended</li>
+</ul>
+
+3 types of terminal types are supported:
+<ul>
+<li><b>xterm256-color</b> — recommended</li>
+<li><b>VT100</b> — color support is limited and does not work even without a terminfo entry</li>
+<li><b>ANSI</b> — color support, but compatible with DOS</li>
+</ul>
+
+Keyboard shortcuts and keymapper support are also provided; you can assign or support virtual keyboards directly from a physical keyboard. Seccomp support is included to solve "operation not permitted" errors, and there are more features.
+
+<b>Development status</b>
+
+It is currently under development. More advanced or improved features will be developed soon, but there may be minor bugs since it is in beta stage and not fully stable.
