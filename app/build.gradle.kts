@@ -9,8 +9,8 @@ android {
         applicationId = "com.terminator.app"
         minSdk = 33
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.2.2-dev"
+        versionCode = 6
+        versionName = "0.2.2"
     }
     buildFeatures {
         compose = true
@@ -45,6 +45,19 @@ android {
             if (keystorePath != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
+        }
+        // Side-by-side dev builds: separate applicationId means this
+        // installs alongside the release APK on the same device instead of
+        // overwriting it (same applicationId would just replace whatever's
+        // currently installed). versionNameSuffix appends "-dev" to
+        // whatever defaultConfig.versionName is, so that string doesn't
+        // need to be hand-maintained separately from the release version.
+        create("dev") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            isDebuggable = true
+            matchingFallbacks += listOf("debug")
         }
     }
     packaging {
