@@ -415,10 +415,17 @@ class TerminalEmulator(
             }
             // Not actually ST - the ESC we saw was the start of a *new*
             // escape sequence butting up against this OSC with no proper
-            // terminator. Re-dispatch ch through the now-NORMAL state
-            // instead of swallowing it, so that sequence still gets
-            // recognized instead of its first byte silently vanishing.
-            processChar(ch)
+            // terminator (very common with prompts like starship, which
+            // chain an OSC 133 marker straight into an SGR sequence with
+            // no ST in between). ch here is the byte *after* that second
+            // ESC, e.g. '[' in "...ESC \\ ESC [ 4;1m" - not the ESC itself,
+            // which was already consumed when oscPendingSt was set. Route
+            // through handleEscape (not processChar/handleNormal) so that
+            // byte is interpreted as the start of the new sequence instead
+            // of being printed literally - which is exactly what produced
+            // the "4;1m" garbage with the leading ESC and '[' missing.
+            state = State.ESCAPE
+            handleEscape(ch)
             return
         }
         if (ch == '\u0007') {
