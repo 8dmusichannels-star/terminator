@@ -21,6 +21,11 @@ class TerminalEmulator(
         fun onTitleChanged(title: String)
         fun onCursorMoved(row: Int, col: Int)
         fun onContentChanged()
+        // Fired when the emulator itself needs to write bytes back to the
+        // pty in response to something the running program asked for -
+        // currently just DSR/CPR (CSI 6n, "where's the cursor?"). The
+        // caller (TerminalSession) wires this straight to its own write().
+        fun onRespond(data: String)
     }
 
     // Mirrored onto buffer.cursorRow/cursorCol on every write so the
@@ -297,6 +302,20 @@ class TerminalEmulator(
                 cursorRow = savedRow
             }
             'm' -> applySgr(params)
+            // DSR (Device Status Report). Ps=6 is CPR - "where's the
+            // cursor?" - and the caller is expected to block waiting for
+            // an answer on the pty. starship (and other prompts/programs
+            // that probe terminal state on startup) send this and will
+            // hang indefinitely - exactly the "connects but then freezes
+            // until Ctrl+C" symptom - if nothing ever answers it. Reply
+            // with CSI row;col R, 1-indexed per the spec, using the
+            // emulator's own cursor position. Ps=5 ("are you OK?") is
+            // answered with a fixed "OK" status report; some scripts probe
+            // it before deciding whether to enable fancier prompt features.
+            'n' -> when (params.getOrElse(0) { 0 }) {
+                6 -> listener.onRespond("\u001B[${cursorRow + 1};${cursorCol + 1}R")
+                5 -> listener.onRespond("\u001B[0n")
+            }
             'h', 'l' -> { /* non-private mode set/reset we don't track - ignore */ }
             else -> { /* unsupported final byte - ignore */ }
         }

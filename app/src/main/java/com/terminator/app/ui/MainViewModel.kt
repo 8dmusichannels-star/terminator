@@ -163,6 +163,16 @@ class MainViewModel(
             override fun onTitleChanged(title: String) { /* surfaced via titlebar if desired */ }
             override fun onCursorMoved(row: Int, col: Int) { bumpVersion() }
             override fun onContentChanged() { bumpVersion() }
+            // DSR/CPR replies (CSI 6n/5n) - the emulator computed the
+            // answer, this just has to get those bytes back onto the pty.
+            // Without this, anything that probes cursor position on
+            // startup (starship among them) blocks waiting for a reply
+            // that never comes - the "connects fine, then freezes until
+            // Ctrl+C" symptom, since Ctrl+C's SIGINT is what was actually
+            // breaking it out of that wait, not any real recovery.
+            override fun onRespond(data: String) {
+                session.write(data)
+            }
         }
         // Fires once, off the pty reader thread, the moment this process is
         // confirmed gone (natural exit, SIGTERM, or SIGKILL). Flips this
