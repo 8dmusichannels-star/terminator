@@ -169,7 +169,37 @@ class TerminalEmulator(
 
     private fun handleCsi(ch: Char) {
         if (ch.isDigit() || ch == ';' || ch == '?') {
+            // Bail out of a runaway CSI sequence instead of growing
+            // paramBuffer forever. A well-formed CSI sequence's parameter
+            // section is a handful of characters; a malformed/garbled one
+            // (e.g. a stream that never sends a recognized final byte,
+            // which is exactly the kind of thing a hung/misbehaving
+            // program or a torn read chunk can produce) would otherwise
+            // keep every subsequent byte flowing into this branch
+            // indefinitely, doing unbounded allocation on the reader
+            // thread and never reaching a dispatch. Dropping back to
+            // NORMAL after a generous cap means a garbled sequence gets
+            // its raw bytes printed instead of wedging the parser.
+            if (paramBuffer.length >= 64) {
+                state = State.NORMAL
+                return
+            }
             paramBuffer.append(ch)
+            return
+        }
+        if (ch.code in 0x20..0x2F) {
+            // Intermediate byte (e.g. the '$' in DECRQM's "CSI ? Ps $ p",
+            // or ' ' in some DECSCUSR cursor-style sequences) - part of the
+            // sequence but not itself the final byte. Previously this fell
+            // straight through to the dispatch logic below, which treated
+            // it AS the final byte: the sequence got dispatched early on
+            // the wrong byte (silently ignored, since '$'/' ' etc. don't
+            // match any known final byte), state reset to NORMAL, and the
+            // *real* final byte that followed (e.g. 'p') then arrived as
+            // plain text in NORMAL state and got printed literally. That's
+            // the garbled-character pattern seen with prompts/programs that
+            // use two-byte-final CSI sequences. Consuming it here and
+            // continuing to wait for the actual final byte fixes that.
             return
         }
         // Final byte reached - dispatch
@@ -178,6 +208,18 @@ class TerminalEmulator(
         val params = raw.removePrefix("?")
             .split(';')
             .mapNotNull { it.toIntOrNull() }
+            // Numeric CSI params (repeat counts for 'L'/'M'/'P'/'@'/'X'/'S'/'T',
+            // cursor-move distances, etc.) are meant to be small - real
+            // terminals send counts in the tens at most. But nothing here
+            // stopped a huge or malformed count (e.g. a truncated/garbled
+            // sequence whose digits ran into the next chunk) from reaching
+            // repeat()/coerceAtLeast() and looping millions of times before
+            // returning control to the UI thread, which is exactly what an
+            // app hang looks like from the outside even though the loop
+            // does eventually terminate. Clamping here caps every dispatch
+            // below at a bounded amount of work regardless of what a
+            // misbehaving/garbled sequence claims.
+            .map { it.coerceIn(-4096, 4096) }
 
         if (private) {
             handlePrivateMode(params, ch)
@@ -197,10 +239,15 @@ class TerminalEmulator(
             }
             'J' -> eraseInDisplay(params.getOrElse(0) { 0 })
             'K' -> eraseInLine(params.getOrElse(0) { 0 })
-            'L' -> insertLines(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            'M' -> deleteLines(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            'P' -> deleteChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            '@' -> insertChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
+            // Repeat counts additionally clamped to the buffer's own
+            // dimensions - inserting/deleting more lines or chars than the
+            // screen actually has is never meaningful, so there's no reason
+            // to let a large-but-under-4096 count do that much pointless
+            // work on every keystroke's worth of output.
+            'L' -> insertLines(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows))
+            'M' -> deleteLines(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows))
+            'P' -> deleteChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
+            '@' -> insertChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
             // CHA/HPA - absolute column. VPA - absolute row. ECH - erase N
             // chars in place without shifting anything (unlike 'P'/'@').
             // These three are used constantly by nano and other ncurses
@@ -209,7 +256,7 @@ class TerminalEmulator(
             // what made those screens look garbled/misaligned.
             'G', '`' -> cursorCol = ((params.getOrElse(0) { 1 }) - 1).coerceIn(0, buffer.columns - 1)
             'd' -> cursorRow = ((params.getOrElse(0) { 1 }) - 1).coerceIn(0, buffer.rows - 1)
-            'X' -> eraseChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
+            'X' -> eraseChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
             // ANSI.SYS-style save/restore cursor (distinct escape form of
             // the same DECSC/DECRC behavior handled in handleEscape).
             's' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol }
@@ -240,13 +287,13 @@ class TerminalEmulator(
             'S' -> {
                 val savedRow = cursorRow
                 cursorRow = scrollBottom // so each lineFeed() call actually scrolls
-                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { lineFeed() }
+                repeat(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows)) { lineFeed() }
                 cursorRow = savedRow
             }
             'T' -> {
                 val savedRow = cursorRow
                 cursorRow = scrollTop // so each reverseLineFeed() call actually scrolls
-                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { reverseLineFeed() }
+                repeat(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows)) { reverseLineFeed() }
                 cursorRow = savedRow
             }
             'm' -> applySgr(params)
@@ -351,20 +398,61 @@ class TerminalEmulator(
         }
     }
 
+    // Set when the OSC terminator's ESC byte has been seen but its
+    // required follow-up '\' (forming the two-byte ST, ESC \) hasn't
+    // arrived yet.
+    private var oscPendingSt = false
+
     private fun handleOsc(ch: Char) {
-        if (ch == '\u0007' || ch == '\u001B') {
-            // OSC terminator (BEL or ST). Format we care about: "0;title" or "2;title"
-            val content = oscBuffer.toString()
-            val sepIdx = content.indexOf(';')
-            if (sepIdx >= 0) {
-                val code = content.substring(0, sepIdx)
-                if (code == "0" || code == "2") {
-                    listener.onTitleChanged(content.substring(sepIdx + 1))
-                }
-            }
+        if (oscPendingSt) {
+            oscPendingSt = false
             state = State.NORMAL
+            finishOsc()
+            if (ch == '\\') {
+                // The expected second byte of ST (ESC \\) - consumed as
+                // part of the terminator, nothing left to do with it.
+                return
+            }
+            // Not actually ST - the ESC we saw was the start of a *new*
+            // escape sequence butting up against this OSC with no proper
+            // terminator. Re-dispatch ch through the now-NORMAL state
+            // instead of swallowing it, so that sequence still gets
+            // recognized instead of its first byte silently vanishing.
+            processChar(ch)
+            return
+        }
+        if (ch == '\u0007') {
+            state = State.NORMAL
+            finishOsc()
+        } else if (ch == '\u001B') {
+            // Could be the start of ST (ESC \\) - wait for the next byte
+            // before finishing, instead of ending the OSC right here and
+            // leaking the '\\' into NORMAL state as printable text.
+            oscPendingSt = true
         } else {
+            // Same runaway-growth guard as paramBuffer above, sized larger
+            // since real OSC payloads (window titles, OSC 8 hyperlink URLs)
+            // are legitimately longer than a CSI parameter list. A
+            // terminator/BEL that never arrives (garbled stream, torn
+            // chunk) would otherwise grow this without bound instead of
+            // ever reaching handleOsc's terminator branch.
+            if (oscBuffer.length >= 8192) {
+                state = State.NORMAL
+                return
+            }
             oscBuffer.append(ch)
+        }
+    }
+
+    private fun finishOsc() {
+        // Format we care about: "0;title" or "2;title"
+        val content = oscBuffer.toString()
+        val sepIdx = content.indexOf(';')
+        if (sepIdx >= 0) {
+            val code = content.substring(0, sepIdx)
+            if (code == "0" || code == "2") {
+                listener.onTitleChanged(content.substring(sepIdx + 1))
+            }
         }
     }
 
@@ -512,6 +600,7 @@ class TerminalEmulator(
         scrollBottom = buffer.rows - 1
         cursorVisible = true
         applicationCursorKeys = false
+        oscPendingSt = false
         state = State.NORMAL
     }
 

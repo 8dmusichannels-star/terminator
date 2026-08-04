@@ -59,6 +59,16 @@ class TerminalSession(
 
     private var reader: Thread? = null
     @Volatile private var alive = false
+    // Guards masterPfd.close() so it only ever actually runs once. destroy(),
+    // kill(), and the reader thread's EOF path (finally -> markExited()) can
+    // all race to tear the fd down for the same exit; without this guard two
+    // of them can each call ParcelFileDescriptor.close() on the same fd,
+    // and the second close hits an fd fdsan has already marked closed/
+    // unowned - "attempted to close file descriptor X, expected to be
+    // unowned, actually owned by unique_fd/Parcel". This is a compare-and-set
+    // rather than a plain boolean check so two threads calling close() at
+    // the same instant can't both pass the check before either sets it.
+    private val pfdClosed = java.util.concurrent.atomic.AtomicBoolean(false)
     // True once the child process is confirmed gone (EOF on the pty read
     // side, or an explicit kill/destroy). Exposed so the UI can render an
     // "exited" state on the session that just went away.
@@ -202,15 +212,15 @@ class TerminalSession(
     /** Graceful teardown - used when a session profile is deleted, or the
      *  app itself is going away. Gives the child a chance to clean up. */
     fun destroy() {
-        if (pid > 0) {
+        // Guard against sending a signal to a pid that has already exited
+        // and been reused by an unrelated process (destroy()/kill() can be
+        // called after the reader thread's EOF path already tore this
+        // session down, e.g. Enter on an already-exited session).
+        if (pid > 0 && alive) {
             NativePty.sendSignal(pid, SIGTERM)
         }
         reader?.interrupt()
-        try {
-            masterPfd?.close()
-        } catch (_: IOException) {
-            // already closed
-        }
+        closePfdOnce()
         alive = false
         markExited()
     }
@@ -222,17 +232,24 @@ class TerminalSession(
      * caught or ignored by the child, so this is immediate.
      */
     fun kill() {
-        if (pid > 0) {
+        if (pid > 0 && alive) {
             NativePty.sendSignal(pid, SIGKILL)
         }
         reader?.interrupt()
+        closePfdOnce()
+        alive = false
+        markExited()
+    }
+
+    /** Closes [masterPfd] at most once across destroy()/kill()/any future
+     *  caller, no matter how many of them race to tear this session down. */
+    private fun closePfdOnce() {
+        if (!pfdClosed.compareAndSet(false, true)) return
         try {
             masterPfd?.close()
         } catch (_: IOException) {
             // already closed
         }
-        alive = false
-        markExited()
     }
 
     fun isAlive(): Boolean = alive
