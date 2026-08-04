@@ -52,12 +52,13 @@ android {
         // currently installed). versionNameSuffix appends "-dev" to
         // whatever defaultConfig.versionName is, so that string doesn't
         // need to be hand-maintained separately from the release version.
-        create("dev") {
-            initWith(getByName("debug"))
+        // Applied directly to "debug" (not a separate build type) so CI's
+        // existing `gradle assembleDebug` step - and any local
+        // `./gradlew assembleDebug` / Android Studio "Debug" run config -
+        // already produces this, with nothing else needing to change.
+        getByName("debug") {
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
-            isDebuggable = true
-            matchingFallbacks += listOf("debug")
         }
     }
     packaging {
