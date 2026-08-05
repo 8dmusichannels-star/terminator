@@ -98,8 +98,23 @@ class TerminalEmulator(
 
     /** Feed a chunk of decoded output text from the child process into the emulator. */
     fun append(text: CharSequence) {
-        for (ch in text) {
+        var i = 0
+        while (i < text.length) {
+            val ch = text[i]
+            // Only NORMAL-state printable characters can ever be part of a
+            // surrogate pair - escape/CSI/OSC sequences are pure ASCII, so
+            // pairing is only attempted when we're about to hand a
+            // printable character to writeChar (handleNormal's `else`
+            // branch). Char.isHighSurrogate()/isLowSurrogate() are the
+            // standard Kotlin/Java checks for "this code unit is one half
+            // of a UTF-16 surrogate pair".
+            if (state == State.NORMAL && ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate()) {
+                writeChar("" + ch + text[i + 1])
+                i += 2
+                continue
+            }
             processChar(ch)
+            i++
         }
         listener.onContentChanged()
     }
@@ -122,7 +137,17 @@ class TerminalEmulator(
             '\r' -> cursorCol = 0
             '\b' -> if (cursorCol > 0) cursorCol--
             '\t' -> cursorCol = ((cursorCol / 8) + 1) * 8
-            else -> writeChar(ch)
+            // A lone surrogate (the pairing check in append() didn't fire -
+            // e.g. a high surrogate arrived as literally the last char of
+            // one append() call, with its low-surrogate other half not yet
+            // read off the pty) has no valid single-Char rendering. Rather
+            // than writeChar-ing an invalid half-codepoint into a cell,
+            // drop it silently; the common real-world case (split across a
+            // pty read boundary) is naturally rare since pty reads are
+            // usually larger than a handful of bytes, and even when it
+            // happens this just costs one glyph rather than corrupting the
+            // grid with an unpaired surrogate.
+            else -> if (!ch.isSurrogate()) writeChar(ch.toString())
         }
     }
 
@@ -173,18 +198,26 @@ class TerminalEmulator(
     }
 
     private fun handleCsi(ch: Char) {
-        if (ch.isDigit() || ch == ';' || ch == '?') {
-            // Bail out of a runaway CSI sequence instead of growing
-            // paramBuffer forever. A well-formed CSI sequence's parameter
-            // section is a handful of characters; a malformed/garbled one
-            // (e.g. a stream that never sends a recognized final byte,
-            // which is exactly the kind of thing a hung/misbehaving
-            // program or a torn read chunk can produce) would otherwise
-            // keep every subsequent byte flowing into this branch
-            // indefinitely, doing unbounded allocation on the reader
-            // thread and never reaching a dispatch. Dropping back to
-            // NORMAL after a generous cap means a garbled sequence gets
-            // its raw bytes printed instead of wedging the parser.
+        if (ch.isDigit() || ch == ';' || ch == '?' || ch == '>' || ch == '=') {
+            // '?' is the DEC-private-mode prefix (CSI ? Ps h/l, handled by
+            // handlePrivateMode). '>' and '=' are two more CSI prefix bytes
+            // real programs send - '>' for secondary-DA/xterm queries like
+            // XTVERSION ("CSI > 0 q", "CSI > c") and kitty's keyboard-
+            // protocol sequences ("CSI > 1 u"), '=' for tertiary-DA. Before
+            // this, neither was recognized here, so the prefix byte itself
+            // fell straight through to the "final byte reached" dispatch
+            // below with an empty paramBuffer: it got treated AS the final
+            // byte, silently matched no case, and state reset to NORMAL -
+            // right as the sequence's *real* parameters and final byte
+            // (e.g. the "0", " ", "q" of "CSI > 0 q") were still incoming.
+            // Those then arrived one at a time in NORMAL state and got
+            // printed as literal text - exactly the "0q" garbage seen on
+            // fish/starship startup (both send "CSI > 0 q" as a terminal-
+            // capability probe). Folding the prefix into paramBuffer here,
+            // same as '?', keeps the parser in CSI state until the actual
+            // final byte shows up, so the whole sequence dispatches (and
+            // gets silently ignored, correctly) instead of leaking half of
+            // itself onto the screen.
             if (paramBuffer.length >= 64) {
                 state = State.NORMAL
                 return
@@ -210,7 +243,14 @@ class TerminalEmulator(
         // Final byte reached - dispatch
         val raw = paramBuffer.toString()
         val private = raw.startsWith("?")
-        val params = raw.removePrefix("?")
+        // '>' (secondary-DA/XTVERSION/kitty-keyboard queries, e.g. the
+        // "CSI > 0 q" fish/starship send on startup) and '=' (tertiary-DA)
+        // sequences aren't otherwise handled below - stripping the prefix
+        // the same way '?' is stripped means they still hit a real case
+        // (none) and fall through to the unsupported-final-byte `else`,
+        // silently and completely ignored, instead of the leftover prefix
+        // character corrupting the parsed param list.
+        val params = raw.removePrefix("?").removePrefix(">").removePrefix("=")
             .split(';')
             .mapNotNull { it.toIntOrNull() }
             // Numeric CSI params (repeat counts for 'L'/'M'/'P'/'@'/'X'/'S'/'T',
@@ -482,7 +522,7 @@ class TerminalEmulator(
         }
     }
 
-    private fun writeChar(ch: Char) {
+    private fun writeChar(text: String) {
         if (cursorCol >= buffer.columns) {
             cursorCol = 0
             lineFeed()
@@ -490,7 +530,7 @@ class TerminalEmulator(
         buffer.setCell(
             cursorRow, cursorCol,
             TerminalBuffer.Cell(
-                char = ch, fg = curFg, bg = curBg,
+                text = text, fg = curFg, bg = curBg,
                 bold = curBold, underline = curUnderline,
                 inverse = curInverse, italic = curItalic
             )
