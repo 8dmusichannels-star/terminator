@@ -3,7 +3,28 @@ package com.terminator.app
 import android.app.Application
 import com.terminator.app.session.SessionRepository
 import com.terminator.app.settings.SettingsRepository
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+
+/** One running session, as far as the notification needs to know about it -
+ *  just enough to build a per-session action row. Kept separate from
+ *  MainViewModel's RunningSession so the session package doesn't need to
+ *  depend on the ui package. */
+data class NotificationSessionInfo(
+    val runtimeId: String,
+    val label: String
+)
+
+/** A "Close" tap on one of the notification's per-session rows. The
+ *  Service has no access to the live TerminalSession/ViewModel (those only
+ *  exist while an Activity is around), so it can't kill the session itself -
+ *  it just posts the request here and MainViewModel, which does hold the
+ *  live sessions, actually performs the kill. */
+data class NotificationCloseRequest(val runtimeId: String)
 
 class TerminatorApp : Application() {
     lateinit var sessionRepository: SessionRepository
@@ -20,6 +41,34 @@ class TerminatorApp : Application() {
     // doesn't ship one.
     lateinit var terminfoDir: String
         private set
+
+    // Live list of running sessions, kept in sync by MainViewModel and
+    // observed by SessionForegroundService to render the notification's
+    // session count and per-session Open/Close actions. Application-scoped
+    // (rather than ViewModel-scoped) specifically so the Service - which
+    // has no access to the Activity's ViewModel - can see it too.
+    private val _runningSessions = MutableStateFlow<List<NotificationSessionInfo>>(emptyList())
+    val runningSessions: StateFlow<List<NotificationSessionInfo>> = _runningSessions.asStateFlow()
+
+    fun updateRunningSessions(sessions: List<NotificationSessionInfo>) {
+        _runningSessions.value = sessions
+    }
+
+    // Extra buffer capacity of 8: a "Close" tap on the notification can
+    // arrive before MainViewModel's collector (below) has started - e.g.
+    // the app process was fully dead and the notification action is what's
+    // relaunching it - so this needs to hold onto the request rather than
+    // drop it, the way a plain MutableSharedFlow(0) would for any
+    // subscriber that isn't listening yet at emission time.
+    private val _closeRequests = MutableSharedFlow<NotificationCloseRequest>(
+        replay = 0,
+        extraBufferCapacity = 8
+    )
+    val closeRequests: SharedFlow<NotificationCloseRequest> = _closeRequests
+
+    fun requestCloseSession(runtimeId: String) {
+        _closeRequests.tryEmit(NotificationCloseRequest(runtimeId))
+    }
 
     override fun onCreate() {
         super.onCreate()

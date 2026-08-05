@@ -277,9 +277,11 @@ class TerminalSession(
 
     /**
      * Hard kill, unconditionally - used by the trash-can icon in the
-     * session drawer and by Ctrl+D inside the terminal (per spec, Ctrl+D
-     * always sends SIGKILL rather than a graceful EOF). SIGKILL can't be
-     * caught or ignored by the child, so this is immediate.
+     * session drawer, which always means "get rid of this session now"
+     * regardless of what's running in it. SIGKILL can't be caught or
+     * ignored by the child, so this is immediate. Ctrl+D inside the
+     * terminal goes through [sendCtrlDOrKill] instead - see its doc for why
+     * this method isn't the right one for that anymore.
      */
     fun kill() {
         if (pid > 0 && alive) {
@@ -290,6 +292,36 @@ class TerminalSession(
         closePfdOnce()
         alive = false
         markExited()
+    }
+
+    /**
+     * Ctrl+D from the terminal keyboard. Only force-kills (SIGKILL) when
+     * the shell itself is what's currently in the foreground - i.e. no
+     * other program has been launched and taken over. When something else
+     * (vim, a build, top, ...) is in the foreground, this sends a plain
+     * EOT (0x04) into the pty instead, exactly like a real terminal does,
+     * so Ctrl+D behaves as "let the foreground program handle EOF its own
+     * way" rather than killing it and any unsaved work out from under the
+     * user. Previously this always SIGKILLed unconditionally, which is
+     * what made Ctrl+D nuke vim/foreground jobs instead of just, say,
+     * closing vim's own EOF-triggered dialog or exiting a REPL cleanly.
+     *
+     * "Shell is in the foreground" is detected as tcgetpgrp(masterFd)
+     * matching this session's own pid: a freshly-spawned shell is its own
+     * process group leader (pgid == pid), and job control hands foreground
+     * status to a *different* pgid the moment the shell launches anything
+     * else. If the pgrp can't be determined (getForegroundPgrp returns -1),
+     * this conservatively treats that as "something's running" and just
+     * sends EOT rather than risking a kill of unknown work.
+     */
+    fun sendCtrlDOrKill() {
+        if (masterFd < 0 || pid <= 0) return
+        val fgPgrp = NativePty.getForegroundPgrp(masterFd)
+        if (fgPgrp == pid) {
+            kill()
+        } else {
+            write("\u0004")
+        }
     }
 
     /** Closes [masterPfd] at most once across destroy()/kill()/any future

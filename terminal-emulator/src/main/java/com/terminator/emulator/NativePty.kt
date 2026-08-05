@@ -50,4 +50,9 @@ object NativePty {
 
     @JvmStatic
     external fun closeFd(fd: Int)
+
+    // See pty.c's doc comment - reports which process group currently owns
+    // the terminal's foreground (tcgetpgrp). Returns -1 on error.
+    @JvmStatic
+    external fun getForegroundPgrp(fd: Int): Int
 }

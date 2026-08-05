@@ -590,6 +590,18 @@ class TerminalEmulator(
         }
     }
 
+    // Settings > Terminal > "Clear always purges scrollback" (CLEAR_ALWAYS_PTY).
+    // Off by default: `clear`/CSI 2J behaves like a normal terminal (content
+    // just scrolls out of view, still reachable by scrolling up). On: CSI 2J
+    // also wipes scrollback, so `clear` leaves truly nothing above the
+    // screen - this is what "pty kalintilari" (leftover scrollback residue
+    // still visible above a `clear`) was actually asking for: not a bug in
+    // the erase logic itself, but `clear`'s CSI 2J never being wired to
+    // scrollback at all. CSI 3J (explicit "clear scrollback", e.g. from
+    // `clear -x` / tmux's clear-history) always purges scrollback regardless
+    // of this setting, since that sequence's whole purpose is exactly that.
+    var clearAlwaysPurgesScrollback: Boolean = false
+
     private fun eraseInDisplay(mode: Int) {
         when (mode) {
             0 -> { // cursor to end of screen
@@ -600,7 +612,18 @@ class TerminalEmulator(
                 for (r in 0 until cursorRow) buffer.clearRow(r, curBg)
                 eraseInLine(1)
             }
-            2, 3 -> buffer.clearAll(curBg)
+            2 -> {
+                buffer.clearAll(curBg)
+                if (clearAlwaysPurgesScrollback) buffer.clearScrollback()
+            }
+            3 -> {
+                // Real xterm semantics: 3J clears scrollback ONLY, leaving
+                // the live screen's content untouched. Previously grouped
+                // with mode 2 (full clearAll), which meant a `clear -x`/
+                // tmux clear-history erased visible on-screen content it
+                // has no business touching.
+                buffer.clearScrollback()
+            }
         }
     }
 

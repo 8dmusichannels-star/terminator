@@ -192,3 +192,21 @@ JNIEXPORT void JNICALL
 Java_com_terminator_emulator_NativePty_closeFd(JNIEnv *env, jclass clazz, jint fd) {
     close(fd);
 }
+
+// Returns the pgid of the pty's current foreground process group, or -1 on
+// error. Used to implement "Ctrl+D only force-kills when nothing else is in
+// the foreground": tcgetpgrp() reports which process group the terminal
+// driver is currently delivering keyboard-generated signals/input to. When
+// the shell is what's in the foreground (its own pgid, since a shell that
+// hasn't launched a job is its own process group leader), Ctrl+D forcing an
+// exit is safe. When some other program (vim, top, a long-running build)
+// has taken the foreground - which happens the instant it starts, because
+// job control makes the shell hand foreground status to whatever it just
+// launched - tcgetpgrp() returns THAT program's pgid instead, and the
+// caller uses that to decide to send plain EOT (0x04) rather than a signal,
+// so Ctrl+D doesn't kill work in progress out from under the user.
+JNIEXPORT jint JNICALL
+Java_com_terminator_emulator_NativePty_getForegroundPgrp(JNIEnv *env, jclass clazz, jint fd) {
+    pid_t pgrp = tcgetpgrp(fd);
+    return (jint) pgrp;
+}

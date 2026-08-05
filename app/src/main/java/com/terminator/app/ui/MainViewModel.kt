@@ -2,6 +2,8 @@ package com.terminator.app.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.terminator.app.NotificationSessionInfo
+import com.terminator.app.TerminatorApp
 import com.terminator.app.session.SessionEntry
 import com.terminator.app.session.SessionRepository
 import com.terminator.app.settings.SettingsKeys
@@ -12,6 +14,8 @@ import com.terminator.emulator.TerminalSession
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -23,7 +27,14 @@ import java.io.File
 data class RunningSession(
     val runtimeId: String,
     val entryId: String,
+    // Display label, possibly disambiguated by relabel() below (e.g.
+    // "Android Shell (2)") - what the drawer/notification actually show.
     val label: String,
+    // The session entry's own name, never touched by relabel(). Kept
+    // separate from `label` specifically so relabel() always has a clean
+    // starting point to derive from - see its doc for why applying it to
+    // `label` directly caused the "(2) (3) (4)..." runaway suffix bug.
+    val baseLabel: String = label,
     val exited: Boolean = false
 )
 
@@ -47,6 +58,7 @@ data class MainUiState(
 )
 
 class MainViewModel(
+    private val app: TerminatorApp,
     private val repository: SessionRepository,
     private val historyDir: File,
     private val settingsRepository: SettingsRepository,
@@ -77,6 +89,14 @@ class MainViewModel(
     // session launched from this point on.
     private var seccompEnabled: Boolean = false
 
+    // Latest value of Settings > Terminal > "Clear always purges scrollback"
+    // (CLEAR_ALWAYS_PTY). Same "plain field kept fresh via a collector"
+    // pattern as termType/seccompEnabled - pushed onto every live session's
+    // emulator immediately below AND applied to newly spawned sessions, so
+    // toggling it in Settings takes effect on already-open sessions too
+    // (unlike termType/seccomp, which only matter at spawn time).
+    private var clearAlwaysPurgesScrollback: Boolean = false
+
     // Last measured terminal viewport, in character columns/rows. Updated by
     // MainActivity whenever the actual drawing area changes size (rotation,
     // IME opening/closing, virtual key bar toggling) so every session -
@@ -99,6 +119,44 @@ class MainViewModel(
         }
         viewModelScope.launch {
             settingsRepository.flow(SettingsKeys.SECCOMP_ENABLED, false).collect { seccompEnabled = it }
+        }
+        viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.CLEAR_ALWAYS_PTY, false).collect { value ->
+                clearAlwaysPurgesScrollback = value
+                // Unlike termType/seccomp (spawn-time only), this needs to
+                // reach sessions that are already running - the whole point
+                // is the user flipping it mid-session and immediately
+                // seeing `clear` behave differently, not just on their next
+                // new tab.
+                liveSessions.values.forEach { it.emulator.clearAlwaysPurgesScrollback = value }
+            }
+        }
+        // Keeps the app-wide session list (read by SessionForegroundService
+        // to build the notification's session count + per-session Open/
+        // Close actions) in sync with the drawer's own runningSessions.
+        // distinctUntilChanged so a bufferVersion/scrollOffset-only state
+        // update (which happens on essentially every keystroke/line of
+        // output) doesn't re-post the notification's RemoteViews dozens of
+        // times a second - only an actual session list change does.
+        viewModelScope.launch {
+            _uiState
+                .map { it.runningSessions }
+                .distinctUntilChanged()
+                .collect { running ->
+                    app.updateRunningSessions(
+                        running.map { NotificationSessionInfo(it.runtimeId, it.label) }
+                    )
+                }
+        }
+        // "Close" tap on one of the notification's per-session rows -
+        // SessionForegroundService can't kill a session itself (it has no
+        // access to the live TerminalSession map, which only exists here),
+        // so it posts the request through TerminatorApp and this is what
+        // actually performs it.
+        viewModelScope.launch {
+            app.closeRequests.collect { request ->
+                killSession(request.runtimeId)
+            }
         }
     }
 
@@ -190,13 +248,15 @@ class MainViewModel(
         }
 
         session.start(listener, columns = columns, rows = rows)
+        session.emulator.clearAlwaysPurgesScrollback = clearAlwaysPurgesScrollback
         liveSessions[runtimeId] = session
         liveEntries[runtimeId] = entry
 
         val running = _uiState.value.runningSessions + RunningSession(
             runtimeId = runtimeId,
             entryId = entry.id,
-            label = entry.name
+            label = entry.name,
+            baseLabel = entry.name
         )
         _uiState.value = _uiState.value.copy(
             runningSessions = relabel(running),
@@ -248,13 +308,16 @@ class MainViewModel(
     }
 
     /**
-     * Ctrl+D inside the terminal always sends SIGKILL on the active runtime
-     * session (per spec - a harder stop than the usual EOF), rather than
-     * writing 0x04 to the pty and waiting for the shell to notice.
+     * Ctrl+D inside the terminal. Delegates to TerminalSession.sendCtrlDOrKill -
+     * SIGKILL only when the shell itself is in the foreground (nothing else
+     * running), plain EOT (0x04) when some other program has taken the
+     * foreground - see that method's doc for the reasoning. Previously this
+     * always SIGKILLed the whole session unconditionally, which is what
+     * made Ctrl+D forcibly kill vim/any other foreground program.
      */
     fun killActiveSessionHard() {
         val activeId = _uiState.value.activeSessionId ?: return
-        liveSessions[activeId]?.kill()
+        liveSessions[activeId]?.sendCtrlDOrKill()
     }
 
     /** Pinch-to-zoom: per-session text size override in sp, cleared when
@@ -265,10 +328,20 @@ class MainViewModel(
         )
     }
 
-    /** "Android Shell", "Android Shell (2)", "Android Shell (3)", ... in launch order. */
+    /** "Android Shell", "Android Shell (2)", "Android Shell (3)", ... in
+     *  launch order. Always derives from baseLabel (the session's own,
+     *  untouched name) rather than the previous `label` - relabel() runs
+     *  again every time the running-session list changes (e.g. opening a
+     *  third tab re-labels the first two as well), and appending onto an
+     *  already-suffixed label is what previously produced runaway labels
+     *  like "Android Shell (2) (3) (4)" instead of stable ones. */
     private fun relabel(running: List<RunningSession>): List<RunningSession> =
         running.groupBy { it.entryId }.values.flatMap { group ->
-            if (group.size == 1) group else group.mapIndexed { i, r -> r.copy(label = "${r.label} (${i + 1})") }
+            if (group.size == 1) {
+                group.map { it.copy(label = it.baseLabel) }
+            } else {
+                group.mapIndexed { i, r -> r.copy(label = "${r.baseLabel} (${i + 1})") }
+            }
         }.sortedBy { r -> running.indexOfFirst { it.runtimeId == r.runtimeId } }
 
     fun activeBuffer(): TerminalBuffer? = liveSessions[_uiState.value.activeSessionId]?.buffer
@@ -295,10 +368,32 @@ class MainViewModel(
      *  down) reveals older scrollback, negative (dragging up) moves back
      *  toward the live screen. Clamped to [0, maxScrollOffset] so it can
      *  never scroll past what's actually available or go negative. */
+    // Carries the fractional part of adjustScrollOffset's deltaLines across
+    // calls (see that method's doc for why this exists).
+    private var scrollFractionCarry: Float = 0f
+
+    /**
+     * Applies a drag-scroll delta, in fractional lines (pixels / charHeight
+     * - see the caller in MainActivity). Small or slow finger movements
+     * routinely produce a delta under 1.0 - e.g. a 10px move on a ~40px
+     * line height is 0.25 lines - and simply truncating that straight to
+     * Int, as this used to do, drops it entirely: nothing scrolls at all
+     * until a single frame's movement happens to cross a whole line on its
+     * own. That's what made vertical scrolling feel sluggish/laggy - most
+     * of a slow, deliberate drag's motion was being silently discarded
+     * rather than accumulating into an eventual scroll. Carrying the
+     * truncated fractional remainder into the next call means that same
+     * slow drag still adds up to the right number of lines over the course
+     * of the gesture, it just spreads the actual scroll-offset changes out
+     * more evenly instead of only firing on the frames with big jumps.
+     */
     fun adjustScrollOffset(deltaLines: Float) {
         val buffer = activeBuffer() ?: return
         val current = _uiState.value.scrollOffset
-        val next = (current + deltaLines.toInt()).coerceIn(0, buffer.maxScrollOffset)
+        val combined = deltaLines + scrollFractionCarry
+        val wholeLines = combined.toInt() // truncates toward zero, same sign as combined
+        scrollFractionCarry = combined - wholeLines
+        val next = (current + wholeLines).coerceIn(0, buffer.maxScrollOffset)
         if (next != current) {
             _uiState.value = _uiState.value.copy(scrollOffset = next)
         }

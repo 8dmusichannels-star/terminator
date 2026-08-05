@@ -41,6 +41,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.foundation.layout.offset
+import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.asImageBitmap
@@ -72,7 +75,7 @@ class MainActivity : ComponentActivity() {
         viewModelFactory {
             initializer {
                 val app = application as TerminatorApp
-                MainViewModel(app.sessionRepository, filesDir, app.settingsRepository, app.terminfoDir)
+                MainViewModel(app, app.sessionRepository, filesDir, app.settingsRepository, app.terminfoDir)
             }
         }
     }
@@ -104,9 +107,19 @@ class MainActivity : ComponentActivity() {
             window.isNavigationBarContrastEnforced = false
         }
 
-        // Always launch with the default session, per spec - handled in
-        // MainViewModel.init by opening the flagged-default entry.
+        // Default session on a genuinely fresh launch (app icon, launcher) -
+        // handled in MainViewModel.init by opening the flagged-default
+        // entry. Notification taps carry their own target session and are
+        // handled below instead, via handleNotificationIntent - launchMode
+        // singleTask (see manifest) is what makes that distinction possible
+        // at all: without it, tapping the notification while the app was
+        // already running span up a brand new MainActivity/MainViewModel
+        // pair with an empty liveSessions map, so every notification tap
+        // looked like "open a new session" even when N others were already
+        // running and simply became unreachable from the UI (still alive in
+        // the old, now-orphaned ViewModel, but nothing pointed at it).
         SessionForegroundService.start(this)
+        handleNotificationIntent(intent)
 
         setContent {
             val app = application as TerminatorApp
@@ -350,6 +363,21 @@ class MainActivity : ComponentActivity() {
                             val coroutineScope = rememberCoroutineScope()
                             var resizeDebounceJob by remember { mutableStateOf<Job?>(null) }
                             var latestTerminalSize by remember { mutableStateOf<IntSize?>(null) }
+                            // Tracks device orientation so a rotation can skip the IME
+                            // debounce below and resize immediately instead. The 120ms
+                            // debounce exists to ignore transient mid-animation sizes
+                            // during an IME show/hide - but Compose's Canvas repaints
+                            // at the new pixel size the instant the container resizes,
+                            // which on rotation happens well before that debounce
+                            // fires. In that 120ms window the buffer still holds the
+                            // OLD row/column count while the canvas is already
+                            // painting at the NEW pixel dimensions, so text lands at
+                            // the wrong x/y (spaced for the old char grid, drawn into
+                            // the new canvas size) - this is what showed up as
+                            // corrupted-looking content on rotation, snapping back to
+                            // normal only once the debounce finally caught up.
+                            val currentOrientation = androidx.compose.ui.platform.LocalConfiguration.current.orientation
+                            var lastOrientation by remember { mutableStateOf(currentOrientation) }
 
                             // Same char-metric formula drawTerminal() uses. Real Android sp->px
                             // conversion is `px = sp * density * fontScale` (see Android's
@@ -415,12 +443,26 @@ class MainActivity : ComponentActivity() {
                                             // flicker. Debouncing so only the size that's still
                                             // current after the animation settles gets applied
                                             // fixes that without losing responsiveness for
-                                            // "real" size changes (rotation, split-screen, etc).
+                                            // "real" size changes (split-screen, etc).
                                             latestTerminalSize = size
                                             resizeDebounceJob?.cancel()
-                                            resizeDebounceJob = coroutineScope.launch {
-                                                delay(120)
+                                            // Rotation is a single, immediate, final size change -
+                                            // nothing animates through intermediate values the way
+                                            // the IME does - so it skips the debounce and applies
+                                            // right away. Waiting the usual 120ms here left a
+                                            // window where Canvas had already repainted at the new
+                                            // (post-rotation) pixel size while buffer.rows/columns
+                                            // still held the pre-rotation grid, which is what made
+                                            // content look corrupted immediately after rotating
+                                            // until the debounce finally caught up.
+                                            if (currentOrientation != lastOrientation) {
+                                                lastOrientation = currentOrientation
                                                 applyResize()
+                                            } else {
+                                                resizeDebounceJob = coroutineScope.launch {
+                                                    delay(120)
+                                                    applyResize()
+                                                }
                                             }
                                         }
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
@@ -603,6 +645,43 @@ class MainActivity : ComponentActivity() {
                                                                 selectionEnd = newRow to newCol
                                                             }
                                                         }
+                                                        // Edge auto-scroll: holding the finger near the
+                                                        // top/bottom of the terminal while selecting
+                                                        // scrolls scrollback into view in that direction,
+                                                        // same as native Android text selection does at
+                                                        // the edge of a scrollable text view. Without
+                                                        // this, a selection drag had no way to reach any
+                                                        // content above/below what happened to already be
+                                                        // on screen when the long-press started - the
+                                                        // `if (selecting) { ... continue }` branch here
+                                                        // returns before ever reaching the plain-drag
+                                                        // scroll logic further down, so selecting and
+                                                        // scrolling were mutually exclusive.
+                                                        val viewportHeight = latestTerminalSize?.height?.toFloat()
+                                                        if (viewportHeight != null && viewportHeight > 0f &&
+                                                            !viewModel.activeSessionInAlternateScreen()
+                                                        ) {
+                                                            val edgeZone = (viewportHeight * 0.15f).coerceAtMost(charHeight * 3f)
+                                                            val distanceFromTop = primary.position.y
+                                                            val distanceFromBottom = viewportHeight - primary.position.y
+                                                            val scrollLines = when {
+                                                                distanceFromTop < edgeZone && charHeight > 0f -> {
+                                                                    // Nearer the edge -> faster scroll, same
+                                                                    // proportional-speed idea as native
+                                                                    // Android edge-scroll-while-selecting.
+                                                                    val proximity = 1f - (distanceFromTop / edgeZone).coerceIn(0f, 1f)
+                                                                    -(0.3f + proximity * 0.9f)
+                                                                }
+                                                                distanceFromBottom < edgeZone && charHeight > 0f -> {
+                                                                    val proximity = 1f - (distanceFromBottom / edgeZone).coerceIn(0f, 1f)
+                                                                    0.3f + proximity * 0.9f
+                                                                }
+                                                                else -> 0f
+                                                            }
+                                                            if (scrollLines != 0f) {
+                                                                viewModel.adjustScrollOffset(scrollLines)
+                                                            }
+                                                        }
                                                         primary.consume()
                                                         lastPos = primary.position
                                                         continue
@@ -758,10 +837,38 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     if (selectionStart != null && selectionEnd != null) {
+                                        // Anchored near the selection itself - normally just
+                                        // above its topmost row - rather than always pinned to
+                                        // the very top of the screen regardless of where the
+                                        // selection actually is. A selection made low on screen
+                                        // (the common case: selecting recent output, which is
+                                        // near the bottom) used to put the toolbar far away from
+                                        // what was just selected. Falls back to below the
+                                        // selection when it starts too close to the top for the
+                                        // toolbar to fit above it.
+                                        val (charWidth, charHeight) = charMetrics
+                                        val localDensity = LocalDensity.current
+                                        val toolbarOffset = if (charHeight > 0f) {
+                                            val (r1, _) = selectionStart!!
+                                            val (r2, _) = selectionEnd!!
+                                            val topRow = minOf(r1, r2)
+                                            val toolbarHeightPx = with(localDensity) { 44.dp.toPx() }
+                                            val margin = with(localDensity) { 8.dp.toPx() }
+                                            val aboveY = topRow * charHeight - toolbarHeightPx - margin
+                                            val y = if (aboveY >= 0f) {
+                                                aboveY
+                                            } else {
+                                                val bottomRow = maxOf(r1, r2)
+                                                (bottomRow + 1) * charHeight + margin
+                                            }
+                                            IntOffset(0, y.roundToInt())
+                                        } else {
+                                            IntOffset.Zero
+                                        }
                                         SelectionToolbar(
                                             modifier = Modifier
-                                                .align(Alignment.TopCenter)
-                                                .padding(top = 8.dp),
+                                                .align(Alignment.TopStart)
+                                                .offset { toolbarOffset },
                                             onCopy = {
                                                 val (r1, c1) = selectionStart!!
                                                 val (r2, c2) = selectionEnd!!
@@ -771,17 +878,53 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 selectionStart = null
                                                 selectionEnd = null
+                                                // Tapping a toolbar button steals focus away from
+                                                // the hidden input field, which drops
+                                                // hiddenFieldFocused (and therefore keyboardOpen)
+                                                // to false - the soft keyboard would otherwise
+                                                // close itself right along with dismissing the
+                                                // selection, forcing the user to tap the terminal
+                                                // again just to keep typing after a Copy/Paste/
+                                                // Cancel. Re-requesting focus here (only when the
+                                                // keyboard was actually open before this) restores
+                                                // it immediately instead.
+                                                if (keyboardOpen) {
+                                                    focusRequester.requestFocus()
+                                                }
                                             },
                                             onPaste = {
                                                 clipboardManager.getText()?.text?.let { pasted ->
-                                                    if (pasted.isNotEmpty()) viewModel.sendInput(pasted)
+                                                    if (pasted.isNotEmpty()) {
+                                                        // Same CR/LF fixup applied to normal IME
+                                                        // typing above (see that comment): real
+                                                        // terminals send CR (\r, 0x0D) for a line
+                                                        // break, not the LF (\n, 0x0A) a copied
+                                                        // multi-line selection naturally contains.
+                                                        // Forwarding raw \n bytes meant every line
+                                                        // of a pasted multi-line selection got
+                                                        // interpreted by the shell as if Enter had
+                                                        // been pressed after it - i.e. each line
+                                                        // immediately executed as its own command
+                                                        // instead of the whole paste landing as
+                                                        // inert text the user could still edit
+                                                        // before running anything. A single-line
+                                                        // paste with no trailing newline is
+                                                        // unaffected either way.
+                                                        viewModel.sendInput(pasted.replace('\n', '\r'))
+                                                    }
                                                 }
                                                 selectionStart = null
                                                 selectionEnd = null
+                                                if (keyboardOpen) {
+                                                    focusRequester.requestFocus()
+                                                }
                                             },
                                             onCancel = {
                                                 selectionStart = null
                                                 selectionEnd = null
+                                                if (keyboardOpen) {
+                                                    focusRequester.requestFocus()
+                                                }
                                             }
                                         )
                                     }
@@ -869,9 +1012,12 @@ class MainActivity : ComponentActivity() {
                                                             finish()
                                                         }
                                                     } else if (toSend == "\u0004") {
-                                                        // Ctrl+D is a hard kill in this app, not a normal
-                                                        // EOF write to the pty - per spec it always sends
-                                                        // SIGKILL to the active session's process instead.
+                                                        // Ctrl+D: killActiveSessionHard() only
+                                                        // force-kills when the shell itself is in the
+                                                        // foreground (no other program running); it
+                                                        // sends a plain EOT into the pty instead when
+                                                        // something else has the foreground - see
+                                                        // TerminalSession.sendCtrlDOrKill.
                                                         viewModel.killActiveSessionHard()
                                                     } else {
                                                         viewModel.sendInput(toSend)
@@ -893,10 +1039,36 @@ class MainActivity : ComponentActivity() {
                                                     viewModel.sendInput(newText)
                                                 }
                                             }
-                                            hiddenInput = TextFieldValue(
-                                                inputPlaceholder,
-                                                selection = TextRange(inputPlaceholder.length)
-                                            )
+                                            // Resetting hiddenInput straight back to the bare
+                                            // placeholder on every single keystroke - regardless
+                                            // of what the IME itself thinks is still in progress -
+                                            // is what's needed for a hidden field whose only job is
+                                            // catching each committed character (the terminal's own
+                                            // screen is the real "display", not this field). But
+                                            // while the IME has an active composing region
+                                            // (new.composition != null - e.g. Gboard mid-way
+                                            // through a predictive-number sequence, or any
+                                            // composing CJK/accented input), forcing that reset
+                                            // makes the field's content jump back to the
+                                            // placeholder out from under the IME's own in-progress
+                                            // composition, which reads to the IME as if something
+                                            // external just edited the field - several keyboards
+                                            // respond to that by dropping whatever specialized
+                                            // input mode they were in (e.g. Gboard's numeric-entry
+                                            // suggestion strip silently falling back to the normal
+                                            // text layout). Only resetting once composition has
+                                            // actually finished (composition == null) keeps this
+                                            // field's "always just the placeholder" invariant while
+                                            // letting the IME's own composing state run to
+                                            // completion undisturbed first.
+                                            if (new.composition == null) {
+                                                hiddenInput = TextFieldValue(
+                                                    inputPlaceholder,
+                                                    selection = TextRange(inputPlaceholder.length)
+                                                )
+                                            } else {
+                                                hiddenInput = new
+                                            }
                                         },
                                         modifier = Modifier
                                             .size(1.dp)
@@ -1007,8 +1179,9 @@ class MainActivity : ComponentActivity() {
                                                         seq = "\u001B$seq"
                                                         altActive = false
                                                     }
-                                                    // Same Ctrl+D-is-a-kill rule as the real keyboard
-                                                    // path, in case a future key row maps to it too.
+                                                    // Same foreground-aware Ctrl+D rule as the real
+                                                    // keyboard path, in case a future key row maps to
+                                                    // it too.
                                                     if (seq == "\u0004") {
                                                         viewModel.killActiveSessionHard()
                                                     } else {
@@ -1067,6 +1240,29 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    // With launchMode="singleTask" (see manifest), tapping the notification
+    // while MainActivity is already running delivers here instead of
+    // spawning a new instance - this is what makes it possible to route to
+    // the specific session the notification named instead of always
+    // landing on a fresh default one.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    /** Reads EXTRA_RUNTIME_ID off a notification tap (main content tap or a
+     *  per-session "Open" action) and switches to that running session.
+     *  Absent/blank extra (a plain launcher-icon launch, or the very first
+     *  onCreate before any notification exists) is a no-op - MainViewModel's
+     *  own init already opens the default session for that case. */
+    private fun handleNotificationIntent(intent: Intent?) {
+        val runtimeId = intent?.getStringExtra(SessionForegroundService.EXTRA_RUNTIME_ID)
+        if (!runtimeId.isNullOrBlank()) {
+            viewModel.openRunningSession(runtimeId)
         }
     }
 }

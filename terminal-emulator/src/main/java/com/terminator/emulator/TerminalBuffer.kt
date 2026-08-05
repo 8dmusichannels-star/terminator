@@ -181,6 +181,14 @@ class TerminalBuffer(
         for (r in 0 until rows) clearRow(r, bg)
     }
 
+    /** Discards scrollback history entirely - used by CSI 3J ("clear
+     *  scrollback") and by plain CSI 2J when Settings > Terminal >
+     *  "Clear always purges scrollback" is on. Leaves the live grid alone;
+     *  callers that want a full clear call this alongside clearAll(). */
+    fun clearScrollback() {
+        scrollback.clear()
+    }
+
     /** Scrolls the grid up by one line, pushing the top line into scrollback
      *  (unless we're in the alternate screen, where scrolled-off content is
      *  throwaway rather than shell history). */
