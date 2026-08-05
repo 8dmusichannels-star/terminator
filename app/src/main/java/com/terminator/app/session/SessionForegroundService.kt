@@ -1,5 +1,6 @@
 package com.terminator.app.session
 
+
 import android.app.*
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -9,7 +10,6 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import com.terminator.app.NotificationSessionInfo
 import com.terminator.app.R
 import com.terminator.app.TerminatorApp
@@ -123,7 +123,7 @@ class SessionForegroundService : Service() {
         closeActionReceiver = receiver
         val filter = IntentFilter(ACTION_CLOSE_SESSION)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+           registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(receiver, filter)
