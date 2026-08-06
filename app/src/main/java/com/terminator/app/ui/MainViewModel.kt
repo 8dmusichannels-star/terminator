@@ -35,7 +35,11 @@ data class RunningSession(
     // starting point to derive from - see its doc for why applying it to
     // `label` directly caused the "(2) (3) (4)..." runaway suffix bug.
     val baseLabel: String = label,
-    val exited: Boolean = false
+    val exited: Boolean = false,
+    // User-requested wake-up state - see TerminatorApp.requestToggleWakeUp's
+    // doc. Purely a priority hint communicated to SessionForegroundService,
+    // not a guarantee the OS won't still reclaim the process.
+    val wakeUp: Boolean = false
 )
 
 data class MainUiState(
@@ -144,9 +148,16 @@ class MainViewModel(
                 .distinctUntilChanged()
                 .collect { running ->
                     app.updateRunningSessions(
-                        running.map { NotificationSessionInfo(it.runtimeId, it.label) }
+                        running.map { NotificationSessionInfo(it.runtimeId, it.label, it.wakeUp) }
                     )
                 }
+        }
+        // Wake-up toggle from either the notification's "..." menu or the
+        // in-app drawer control - see TerminatorApp.requestToggleWakeUp.
+        viewModelScope.launch {
+            app.wakeUpToggleRequests.collect { request ->
+                toggleWakeUp(request.runtimeId)
+            }
         }
         // "Close" tap on one of the notification's per-session rows -
         // SessionForegroundService can't kill a session itself (it has no
@@ -204,7 +215,31 @@ class MainViewModel(
     private fun newRuntimeId(entryId: String): String = "$entryId#${System.currentTimeMillis()}"
 
     private fun launchLiveSession(runtimeId: String, entry: SessionEntry) {
-        val historyFile = File(historyDir, "${runtimeId}.history")
+        // One history file per *session definition* (entryId), not per
+        // launch (runtimeId) - runtimeId is "$entryId#$timestamp" (see
+        // newRuntimeId), fresh every single time a session is opened, so
+        // keying the file by it meant relaunching the same session over and
+        // over left behind a new, never-cleaned-up .history file each time
+        // instead of resuming the one scrollback that session already had.
+        // TerminalSession opens this in append mode, so reusing the same
+        // path across relaunches naturally accumulates one continuous
+        // history rather than overwriting it.
+        // The one case entryId alone doesn't handle is Multiple Mode: two
+        // *simultaneously live* instances of the same entry writing to one
+        // path would interleave their output into a single file. Falling
+        // back to the old per-runtimeId name only for that concurrent case
+        // keeps the common "close and reopen this session later" path down
+        // to one file while still avoiding cross-talk between instances
+        // that are genuinely running at the same time.
+        val hasLiveSiblingInstance = liveEntries.any { (otherRuntimeId, otherEntry) ->
+            otherEntry.id == entry.id &&
+                liveSessions[otherRuntimeId]?.isAlive() == true
+        }
+        val historyFile = if (hasLiveSiblingInstance) {
+            File(historyDir, "${runtimeId}.history")
+        } else {
+            File(historyDir, "${entry.id}.history")
+        }
         val session = TerminalSession(
             id = runtimeId,
             spec = entry.toSpec(),
@@ -307,6 +342,21 @@ class MainViewModel(
         )
     }
 
+    /** Flips one session's wakeUp flag - see TerminatorApp.requestToggleWakeUp
+     *  for what "awake" actually changes. Symmetric: calling this again on
+     *  an already-awake session turns it back off, which is what lets both
+     *  the notification's "..." menu and the drawer's own control use the
+     *  exact same request for "wake up" and "let it sleep again". */
+    fun toggleWakeUp(runtimeId: String) {
+        val running = _uiState.value.runningSessions
+        val target = running.firstOrNull { it.runtimeId == runtimeId } ?: return
+        _uiState.value = _uiState.value.copy(
+            runningSessions = running.map {
+                if (it.runtimeId == runtimeId) it.copy(wakeUp = !target.wakeUp) else it
+            }
+        )
+    }
+
     /**
      * Ctrl+D inside the terminal. Delegates to TerminalSession.sendCtrlDOrKill -
      * SIGKILL only when the shell itself is in the foreground (nothing else
@@ -387,8 +437,15 @@ class MainViewModel(
      * of the gesture, it just spreads the actual scroll-offset changes out
      * more evenly instead of only firing on the frames with big jumps.
      */
-    fun adjustScrollOffset(deltaLines: Float) {
-        val buffer = activeBuffer() ?: return
+    /** Returns the actual whole-line change applied (post-clamp, post-
+     *  accumulator) - callers that track scroll-relative row coordinates
+     *  (selection start/end while edge-auto-scrolling) need this to shift
+     *  those coordinates by the same amount scrollOffset just moved, or
+     *  their on-screen row numbers silently point at different content
+     *  than the instant before the scroll happened. See the edge-auto-
+     *  scroll call site in MainActivity for why that matters. */
+    fun adjustScrollOffset(deltaLines: Float): Int {
+        val buffer = activeBuffer() ?: return 0
         val current = _uiState.value.scrollOffset
         val combined = deltaLines + scrollFractionCarry
         val wholeLines = combined.toInt() // truncates toward zero, same sign as combined
@@ -397,6 +454,7 @@ class MainViewModel(
         if (next != current) {
             _uiState.value = _uiState.value.copy(scrollOffset = next)
         }
+        return next - current
     }
 
     /** True only while the active session's program has actually enabled
@@ -467,6 +525,21 @@ class MainViewModel(
 
     override fun onCleared() {
         liveSessions.values.forEach { it.destroy() }
+        // Every session just got killed above, but nothing else will ever
+        // tell TerminatorApp that - the collector that normally calls
+        // updateRunningSessions on every session-list change (see the
+        // viewModelScope.launch near this class's init) dies right along
+        // with this ViewModel, since it's viewModelScope-bound. Without
+        // this, TerminatorApp.runningSessions stayed frozen at whatever it
+        // last was (usually non-empty), which meant SessionForegroundService
+        // never got the signal to stop - so its "A session is running"
+        // notification kept sitting there indefinitely with zero sessions
+        // actually left alive behind it. Clearing it explicitly here, at
+        // the one point that's guaranteed to run whenever this ViewModel
+        // (and therefore every session it owned) goes away, keeps the
+        // notification honest even though nothing else observes session
+        // state once the Activity is gone.
+        app.updateRunningSessions(emptyList())
         super.onCleared()
     }
 }

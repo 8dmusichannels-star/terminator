@@ -96,27 +96,94 @@ class TerminalEmulator(
     private val paramBuffer = StringBuilder()
     private val oscBuffer = StringBuilder()
 
+    companion object {
+        // U+200D ZERO WIDTH JOINER - glues two otherwise-independent emoji
+        // codepoints into one displayed glyph (family/couple/profession
+        // sequences etc: "man" + ZWJ + "woman" + ZWJ + "girl" + ZWJ + "boy"
+        // renders as a single family emoji, not four side-by-side ones).
+        private const val ZWJ = '\u200D'
+        // U+FE0E/FE0F variation selectors - pick the text-style vs
+        // emoji-style presentation of the preceding codepoint (e.g. "❤" as
+        // plain glyph vs "❤️" as a colored heart). No width of their own;
+        // they only modify what came right before them.
+        private const val VS15_TEXT = '\uFE0E'
+        private const val VS16_EMOJI = '\uFE0F'
+        // U+1F3FB..U+1F3FF EMOJI MODIFIER FITZPATRICK TYPE-1-2..TYPE-6 -
+        // skin-tone modifiers, astral-plane so they arrive as surrogate
+        // pairs like any other emoji codepoint.
+        private const val SKIN_TONE_MODIFIER_LOW = 0x1F3FB
+        private const val SKIN_TONE_MODIFIER_HIGH = 0x1F3FF
+
+        private fun isSkinToneModifier(codePoint: Int) =
+            codePoint in SKIN_TONE_MODIFIER_LOW..SKIN_TONE_MODIFIER_HIGH
+    }
+
     /** Feed a chunk of decoded output text from the child process into the emulator. */
     fun append(text: CharSequence) {
         var i = 0
         while (i < text.length) {
             val ch = text[i]
-            // Only NORMAL-state printable characters can ever be part of a
-            // surrogate pair - escape/CSI/OSC sequences are pure ASCII, so
-            // pairing is only attempted when we're about to hand a
+            // Only NORMAL-state printable characters can ever start a
+            // grapheme cluster - escape/CSI/OSC sequences are pure ASCII,
+            // so this is only attempted when we're about to hand a
             // printable character to writeChar (handleNormal's `else`
-            // branch). Char.isHighSurrogate()/isLowSurrogate() are the
-            // standard Kotlin/Java checks for "this code unit is one half
-            // of a UTF-16 surrogate pair".
+            // branch would otherwise take it one Char at a time).
             if (state == State.NORMAL && ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate()) {
-                writeChar("" + ch + text[i + 1])
-                i += 2
+                val end = scanGraphemeCluster(text, i)
+                writeChar(text.subSequence(i, end).toString())
+                i = end
                 continue
             }
             processChar(ch)
             i++
         }
         listener.onContentChanged()
+    }
+
+    /**
+     * Starting from a confirmed surrogate pair at [start], greedily extends
+     * the range forward to absorb whatever keeps it one visual glyph rather
+     * than several: a ZWJ followed by another codepoint (joins two emoji
+     * into a compound one - families, couples, profession sequences, the
+     * rainbow/trans/etc pride flags), a trailing variation selector, or a
+     * skin-tone modifier. Returns the exclusive end index of the whole
+     * cluster. Without this, TerminalBuffer.Cell (see its own doc) still
+     * only ever held a single codepoint's surrogate pair, so a ZWJ sequence
+     * rendered as several adjacent glyphs (e.g. an adult, a joiner glyph,
+     * and a child, instead of one family emoji) rather than the intended
+     * single grapheme - Cell.text being a String already made it capable of
+     * holding the rest once this scan feeds it in.
+     */
+    private fun scanGraphemeCluster(text: CharSequence, start: Int): Int {
+        var i = start + 2 // past the initial confirmed surrogate pair
+        while (i < text.length) {
+            val ch = text[i]
+            when {
+                // Variation selector: consumes just the one BMP char, then
+                // keep scanning - a ZWJ can still follow it.
+                ch == VS15_TEXT || ch == VS16_EMOJI -> i += 1
+                // ZWJ must be followed by another full codepoint (either a
+                // surrogate pair or a plain BMP one, e.g. some flag
+                // sequences join BMP regional-indicator-adjacent symbols)
+                // to mean anything - a trailing/dangling ZWJ with nothing
+                // after it isn't part of a cluster and is left for the
+                // normal per-char path to drop or render on its own.
+                ch == ZWJ && i + 1 < text.length -> {
+                    val next = text[i + 1]
+                    i += if (next.isHighSurrogate() && i + 2 < text.length && text[i + 2].isLowSurrogate()) {
+                        3 // ZWJ + surrogate pair
+                    } else {
+                        2 // ZWJ + one BMP codepoint
+                    }
+                }
+                // Skin-tone modifier directly following the base emoji (no
+                // ZWJ needed for this one per the Unicode emoji spec).
+                ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate() &&
+                    isSkinToneModifier(Character.toCodePoint(ch, text[i + 1])) -> i += 2
+                else -> return i
+            }
+        }
+        return i
     }
 
     private fun processChar(ch: Char) {

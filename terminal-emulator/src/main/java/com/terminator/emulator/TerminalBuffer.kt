@@ -304,6 +304,19 @@ class TerminalBuffer(
             }
         }
         grid = resized(grid)
+        // When alternate screen is active, `grid` above just became a
+        // freshly-resized array - but altGrid, which is meant to be the
+        // SAME array as grid while alternate screen is active (see
+        // enterAlternateScreen()), was never updated to match, so it kept
+        // pointing at the old pre-resize array instead. inAlternateScreen
+        // still read true (altGrid was non-null, just stale) and rendering
+        // itself was unaffected since TerminalView reads through grid/
+        // cellAt() rather than altGrid directly - but exitAlternateScreen()
+        // followed by another enterAlternateScreen() before this session
+        // resized again would have silently resumed writing into that
+        // stale, wrong-sized array. Re-pointing it here keeps the "altGrid
+        // is grid, while active" invariant intact across a resize.
+        if (altGrid != null) altGrid = grid
         savedGrid = savedGrid?.let { resized(it) }
         columns = newColumns
         rows = newRows

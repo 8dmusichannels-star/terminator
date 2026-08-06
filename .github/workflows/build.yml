@@ -89,12 +89,10 @@ jobs:
             "$BUILD_TOOLS/apksigner" verify --print-certs "$apk"
           done
 
-      # Only runs when a version tag (e.g. v0.1.0) is pushed: creates a
-      # permanent, versioned GitHub Release with the APKs attached.
       - name: Create GitHub Release with APKs
         uses: softprops/action-gh-release@v2
         with:
           files: app/build/outputs/apk/release/*.apk
-          generate_release_notes: true
+          body_path: CHANGELOG.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

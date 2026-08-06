@@ -118,7 +118,11 @@ class MainActivity : ComponentActivity() {
         // looked like "open a new session" even when N others were already
         // running and simply became unreachable from the UI (still alive in
         // the old, now-orphaned ViewModel, but nothing pointed at it).
-        SessionForegroundService.start(this)
+        //
+        // SessionForegroundService itself is no longer started from here -
+        // TerminatorApp.observeSessionServiceLifecycle now starts/stops it
+        // based on the actual running-session count, so it only exists
+        // (and only shows its notification) while a session genuinely is.
         handleNotificationIntent(intent)
 
         setContent {
@@ -247,6 +251,36 @@ class MainActivity : ComponentActivity() {
                         TextFieldValue(inputPlaceholder, selection = TextRange(inputPlaceholder.length))
                     )
                 }
+                // Tracks whatever text is *currently* sitting in hiddenInput
+                // that's already been consumed/forwarded - starts equal to
+                // inputPlaceholder and, on normal typing, is advanced to the
+                // IME's own newText instead of being collapsed back down to
+                // the bare placeholder. That distinction is the actual fix
+                // for numeric mode (and other composing-driven IME layouts)
+                // reverting after every keystroke: onValueChange used to
+                // rebuild hiddenInput as `TextFieldValue(inputPlaceholder,
+                // ...)` on every single keystroke, which changes the live
+                // *content* every time, not just the composition range -
+                // and per Compose's own TextField docs/IME behavior, a
+                // content change (as opposed to a pure selection change) is
+                // exactly what forces the platform to call
+                // InputConnection.restartInput. That's a full IME reset,
+                // and it's what a numeric-suggestion strip or number-row
+                // popup can't survive. Selection-only changes only need
+                // updateSelection(), which doesn't reset. Letting the field
+                // grow (newText becomes the new baseline) keeps every
+                // "normal typing" edit a pure append, so the IME sees a
+                // continuous, growing field instead of a value that snaps
+                // back to nothing after each character - the same way any
+                // ordinary text field behaves, which is why ordinary text
+                // fields don't have this problem. The field still can't be
+                // allowed to grow forever, so it's trimmed back down to the
+                // bare placeholder on focus loss/regain and once it crosses
+                // a generous length threshold - both real, infrequent
+                // content changes, not per-keystroke ones, so the odd
+                // IME flicker they can cause is a one-off instead of
+                // happening on every character.
+                var consumedBaseline by remember { mutableStateOf(inputPlaceholder) }
 
                 // Terminal colors now follow Settings > Theme > Terminal color
                 // scheme, instead of always rendering flatBlack() regardless
@@ -377,7 +411,11 @@ class MainActivity : ComponentActivity() {
                             // corrupted-looking content on rotation, snapping back to
                             // normal only once the debounce finally caught up.
                             val currentOrientation = androidx.compose.ui.platform.LocalConfiguration.current.orientation
-                            var lastOrientation by remember { mutableStateOf(currentOrientation) }
+                            // Guards applyResize() from running before latestTerminalSize has
+                            // ever been set (very first composition, before onSizeChanged has
+                            // fired even once) - the LaunchedEffect below fires on first
+                            // composition too, when there's nothing meaningful to resize yet.
+                            var hasSizedOnce by remember { mutableStateOf(false) }
 
                             // Same char-metric formula drawTerminal() uses. Real Android sp->px
                             // conversion is `px = sp * density * fontScale` (see Android's
@@ -424,6 +462,30 @@ class MainActivity : ComponentActivity() {
                                 viewModel.updateTerminalSize(cols, rws)
                             }
 
+                            // Forces an immediate (non-debounced) resize whenever orientation
+                            // actually changes. Previously this was attempted inline inside
+                            // onSizeChanged by comparing currentOrientation against a
+                            // lastOrientation var, but that comparison's reliability depends on
+                            // onSizeChanged firing only after LocalConfiguration.current has
+                            // already picked up the rotation - Compose gives no ordering
+                            // guarantee between a Configuration change propagating and a
+                            // layout's onSizeChanged callback for the resulting size change, so
+                            // that comparison could run while currentOrientation still read the
+                            // PRE-rotation value, silently falling through to the normal 120ms
+                            // debounce path instead. That debounce window is exactly where
+                            // Canvas repaints at the new (post-rotation) pixel size while
+                            // buffer.rows/columns still hold the pre-rotation grid, which is
+                            // what showed up as corrupted/reset-looking content after rotating.
+                            // A LaunchedEffect keyed on currentOrientation has no such ordering
+                            // ambiguity: Compose guarantees it re-runs exactly when the key's
+                            // value actually changes between compositions, decoupled entirely
+                            // from onSizeChanged's own firing order.
+                            LaunchedEffect(currentOrientation) {
+                                if (hasSizedOnce) {
+                                    applyResize()
+                                }
+                            }
+
                             Column(modifier = Modifier.fillMaxSize()) {
                                 Box(
                                     modifier = Modifier
@@ -445,24 +507,18 @@ class MainActivity : ComponentActivity() {
                                             // fixes that without losing responsiveness for
                                             // "real" size changes (split-screen, etc).
                                             latestTerminalSize = size
+                                            hasSizedOnce = true
                                             resizeDebounceJob?.cancel()
-                                            // Rotation is a single, immediate, final size change -
-                                            // nothing animates through intermediate values the way
-                                            // the IME does - so it skips the debounce and applies
-                                            // right away. Waiting the usual 120ms here left a
-                                            // window where Canvas had already repainted at the new
-                                            // (post-rotation) pixel size while buffer.rows/columns
-                                            // still held the pre-rotation grid, which is what made
-                                            // content look corrupted immediately after rotating
-                                            // until the debounce finally caught up.
-                                            if (currentOrientation != lastOrientation) {
-                                                lastOrientation = currentOrientation
+                                            // Orientation-triggered resizes are handled separately
+                                            // by the LaunchedEffect(currentOrientation) above, which
+                                            // fires immediately without this debounce - see its
+                                            // comment for why that's a more reliable way to detect
+                                            // "this size change is a rotation" than comparing
+                                            // orientation values inline here. This path now only
+                                            // has to handle the IME-animation case.
+                                            resizeDebounceJob = coroutineScope.launch {
+                                                delay(120)
                                                 applyResize()
-                                            } else {
-                                                resizeDebounceJob = coroutineScope.launch {
-                                                    delay(120)
-                                                    applyResize()
-                                                }
                                             }
                                         }
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
@@ -664,22 +720,70 @@ class MainActivity : ComponentActivity() {
                                                             val edgeZone = (viewportHeight * 0.15f).coerceAtMost(charHeight * 3f)
                                                             val distanceFromTop = primary.position.y
                                                             val distanceFromBottom = viewportHeight - primary.position.y
+                                                            // scrollOffset=0 is the live/newest screen;
+                                                            // scrollOffset>0 is N lines back into history
+                                                            // (see TerminalBuffer.lineAt's doc). Dragging
+                                                            // toward the TOP edge means "let me keep
+                                                            // selecting upward, past what's currently on
+                                                            // screen" - i.e. reveal OLDER content, which
+                                                            // means scrollOffset must INCREASE. Dragging
+                                                            // toward the BOTTOM edge is the opposite: reveal
+                                                            // content toward the live end, so scrollOffset
+                                                            // must DECREASE. This was backwards before (top
+                                                            // edge decreased it, bottom edge increased it),
+                                                            // which is what made the selection appear to
+                                                            // jump backward/upward while dragging down: the
+                                                            // view itself was scrolling toward history
+                                                            // instead of toward the live screen, opposite to
+                                                            // the finger's own direction.
                                                             val scrollLines = when {
                                                                 distanceFromTop < edgeZone && charHeight > 0f -> {
                                                                     // Nearer the edge -> faster scroll, same
                                                                     // proportional-speed idea as native
                                                                     // Android edge-scroll-while-selecting.
                                                                     val proximity = 1f - (distanceFromTop / edgeZone).coerceIn(0f, 1f)
-                                                                    -(0.3f + proximity * 0.9f)
+                                                                    0.3f + proximity * 0.9f
                                                                 }
                                                                 distanceFromBottom < edgeZone && charHeight > 0f -> {
                                                                     val proximity = 1f - (distanceFromBottom / edgeZone).coerceIn(0f, 1f)
-                                                                    0.3f + proximity * 0.9f
+                                                                    -(0.3f + proximity * 0.9f)
                                                                 }
                                                                 else -> 0f
                                                             }
                                                             if (scrollLines != 0f) {
-                                                                viewModel.adjustScrollOffset(scrollLines)
+                                                                // adjustScrollOffset returns the actual
+                                                                // applied delta (clamped to the buffer's
+                                                                // bounds, so it can be 0 even when
+                                                                // scrollLines isn't, e.g. already at the
+                                                                // top/bottom of scrollback). Without
+                                                                // shifting selectionStart/End's stored
+                                                                // rows by that same delta, this is
+                                                                // exactly what made the highlight appear
+                                                                // to jump backward while dragging toward
+                                                                // an edge: selectionStart/End are
+                                                                // screen-relative rows paired with
+                                                                // whatever scrollOffset was active when
+                                                                // they were captured (see their doc
+                                                                // comment above and TerminalBuffer.lineAt,
+                                                                // which both require row and scrollOffset
+                                                                // to be read together) - so the instant
+                                                                // scrollOffset moved out from under a
+                                                                // selection that had already anchored a
+                                                                // row, that stored row silently started
+                                                                // pointing at different buffer content,
+                                                                // even though the finger kept moving the
+                                                                // same direction. Shifting both endpoints
+                                                                // by the same applied delta keeps them
+                                                                // anchored to the actual text the user
+                                                                // was selecting, the same way scrolling a
+                                                                // native Android text view during
+                                                                // selection never changes what's selected,
+                                                                // only where it's drawn.
+                                                                val appliedDelta = viewModel.adjustScrollOffset(scrollLines)
+                                                                if (appliedDelta != 0) {
+                                                                    selectionStart = selectionStart?.let { (r, c) -> (r + appliedDelta) to c }
+                                                                    selectionEnd = selectionEnd?.let { (r, c) -> (r + appliedDelta) to c }
+                                                                }
                                                             }
                                                         }
                                                         primary.consume()
@@ -760,7 +864,21 @@ class MainActivity : ComponentActivity() {
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
                                                                 val (_, charHeight) = charMetrics
                                                                 if (charHeight > 0f) {
-                                                                    viewModel.adjustScrollOffset(dy / charHeight)
+                                                                    // Same reasoning as the selecting-drag
+                                                                    // edge-autoscroll case above: a finished
+                                                                    // selection (drag already lifted, still
+                                                                    // shown while the user decides whether to
+                                                                    // tap Copy) is a plain, unrelated scroll
+                                                                    // drag away from having its stored rows
+                                                                    // silently point at different content -
+                                                                    // nothing about this branch requires the
+                                                                    // selection to be gone, only that this
+                                                                    // particular drag isn't extending it.
+                                                                    val appliedDelta = viewModel.adjustScrollOffset(dy / charHeight)
+                                                                    if (appliedDelta != 0) {
+                                                                        selectionStart = selectionStart?.let { (r, c) -> (r + appliedDelta) to c }
+                                                                        selectionEnd = selectionEnd?.let { (r, c) -> (r + appliedDelta) to c }
+                                                                    }
                                                                 }
                                                             }
                                                             primary.consume()
@@ -959,7 +1077,27 @@ class MainActivity : ComponentActivity() {
                                                 capitalization = KeyboardCapitalization.None,
                                                 autoCorrect = false
                                             )
-                                            else -> KeyboardOptions(keyboardType = KeyboardType.Text)
+                                            // Default used to leave autoCorrect on here, which is
+                                            // exactly the ingredient "Legacy Workaround" above
+                                            // turns off to stop Samsung keyboards from double-
+                                            // emitting characters - the underlying collision
+                                            // (autocorrect/predictive-text machinery reacting to
+                                            // this field being hard-reset every keystroke) isn't
+                                            // Samsung-specific. On Gboard specifically it showed up
+                                            // as a different symptom instead of duplication: typing
+                                            // digits made Gboard's numeric-suggestion strip silently
+                                            // fall back to the normal text layout, since predictive
+                                            // text is what drives that strip and this field's resets
+                                            // were confusing its state. Turning autoCorrect off by
+                                            // default removes the same root cause for every IME
+                                            // rather than only being available as an opt-in
+                                            // workaround for the one symptom (duplication) that
+                                            // prompted "Legacy Workaround" to exist in the first
+                                            // place.
+                                            else -> KeyboardOptions(
+                                                keyboardType = KeyboardType.Text,
+                                                autoCorrect = false
+                                            )
                                         }
                                     }
                                     BasicTextField(
@@ -968,12 +1106,13 @@ class MainActivity : ComponentActivity() {
                                         onValueChange = { new ->
                                             val newText = new.text
                                             when {
-                                                newText.length > inputPlaceholder.length &&
-                                                    newText.startsWith(inputPlaceholder) -> {
-                                                    // Normal typing: everything after the placeholder
-                                                    // is what the IME just inserted. Apply any armed
-                                                    // CTRL/ALT modifier, then consume it (one-shot).
-                                                    val typed = newText.substring(inputPlaceholder.length)
+                                                newText.length > consumedBaseline.length &&
+                                                    newText.startsWith(consumedBaseline) -> {
+                                                    // Normal typing: everything after the already-
+                                                    // consumed baseline is what the IME just inserted.
+                                                    // Apply any armed CTRL/ALT modifier, then consume it
+                                                    // (one-shot).
+                                                    val typed = newText.substring(consumedBaseline.length)
                                                     var toSend = typed
                                                     // Real terminals send CR (\r, 0x0D) for the Enter
                                                     // key, not LF (\n, 0x0A) - the pty/shell's own line
@@ -1022,59 +1161,84 @@ class MainActivity : ComponentActivity() {
                                                     } else {
                                                         viewModel.sendInput(toSend)
                                                     }
+                                                    // Advance the baseline to the full text we just
+                                                    // consumed rather than collapsing back down to the
+                                                    // bare placeholder - see consumedBaseline's doc for
+                                                    // why this (a pure append) is what keeps the IME
+                                                    // from seeing a content change and calling
+                                                    // restartInput on every keystroke.
+                                                    consumedBaseline = newText
+                                                    // Growth cap: an unbounded append would still be a
+                                                    // real (if rare) memory/perf concern over a very
+                                                    // long typing burst. Only trims once genuinely
+                                                    // outside any composing region (new.composition ==
+                                                    // null) so this can't cut a word being actively
+                                                    // composed in half - it'll trim on the next
+                                                    // keystroke after composition ends instead, same as
+                                                    // it would after any other pure-append edit.
+                                                    if (newText.length > 256 && new.composition == null) {
+                                                        consumedBaseline = inputPlaceholder
+                                                    }
                                                 }
-                                                newText.length <= inputPlaceholder.length -> {
-                                                    // The placeholder itself got shortened/removed -
-                                                    // that's a real backspace, so forward DEL. Handles
+                                                newText.length <= consumedBaseline.length -> {
+                                                    // The baseline itself got shortened/removed - that's
+                                                    // a real backspace, so forward DEL. Handles
                                                     // multi-character deletes (e.g. predictive text
-                                                    // clearing a word) by sending one DEL per missing char.
+                                                    // clearing a word) by sending one DEL per missing
+                                                    // char. This is a genuine content shrink, so letting
+                                                    // it fall through to the real reset below (rather
+                                                    // than trying to preserve any of newText) is correct
+                                                    // here - there's nothing worth keeping past a
+                                                    // backspace.
                                                     val removedCount =
-                                                        (inputPlaceholder.length - newText.length).coerceAtLeast(1)
+                                                        (consumedBaseline.length - newText.length).coerceAtLeast(1)
                                                     viewModel.sendInput("\u007F".repeat(removedCount))
+                                                    consumedBaseline = inputPlaceholder
                                                 }
                                                 else -> {
                                                     // Unexpected replacement (e.g. autocorrect swapped
                                                     // the whole field) - forward it as-is rather than
                                                     // silently dropping it.
                                                     viewModel.sendInput(newText)
+                                                    consumedBaseline = inputPlaceholder
                                                 }
                                             }
-                                            // Resetting hiddenInput straight back to the bare
-                                            // placeholder on every single keystroke - regardless
-                                            // of what the IME itself thinks is still in progress -
-                                            // is what's needed for a hidden field whose only job is
-                                            // catching each committed character (the terminal's own
-                                            // screen is the real "display", not this field). But
-                                            // while the IME has an active composing region
-                                            // (new.composition != null - e.g. Gboard mid-way
-                                            // through a predictive-number sequence, or any
-                                            // composing CJK/accented input), forcing that reset
-                                            // makes the field's content jump back to the
-                                            // placeholder out from under the IME's own in-progress
-                                            // composition, which reads to the IME as if something
-                                            // external just edited the field - several keyboards
-                                            // respond to that by dropping whatever specialized
-                                            // input mode they were in (e.g. Gboard's numeric-entry
-                                            // suggestion strip silently falling back to the normal
-                                            // text layout). Only resetting once composition has
-                                            // actually finished (composition == null) keeps this
-                                            // field's "always just the placeholder" invariant while
-                                            // letting the IME's own composing state run to
-                                            // completion undisturbed first.
-                                            if (new.composition == null) {
-                                                hiddenInput = TextFieldValue(
-                                                    inputPlaceholder,
-                                                    selection = TextRange(inputPlaceholder.length)
-                                                )
-                                            } else {
-                                                hiddenInput = new
-                                            }
+                                            // Only the backspace-to-nothing and unexpected-replacement
+                                            // branches above reset consumedBaseline back down to the
+                                            // bare placeholder - both are already genuine content
+                                            // changes forced by the IME itself, so resetting alongside
+                                            // them doesn't cost an *extra* restartInput beyond the one
+                                            // that edit was already going to cause. Normal typing
+                                            // (the common case, and the one numeric mode/composing
+                                            // state actually depends on staying alive) no longer
+                                            // resets at all here - see the growth-cap effect below for
+                                            // the only other place a reset can happen.
+                                            hiddenInput = new.copy(
+                                                text = if (consumedBaseline == inputPlaceholder) inputPlaceholder else newText,
+                                                selection = if (consumedBaseline == inputPlaceholder)
+                                                    TextRange(inputPlaceholder.length) else new.selection
+                                            )
                                         },
                                         modifier = Modifier
                                             .size(1.dp)
                                             .alpha(0f)
                                             .focusRequester(focusRequester)
-                                            .onFocusChanged { hiddenFieldFocused = it.isFocused }
+                                            .onFocusChanged {
+                                                hiddenFieldFocused = it.isFocused
+                                                // Collapsing back to the bare placeholder on focus
+                                                // regain (rather than after every keystroke) is a
+                                                // natural, infrequent point for the one content reset
+                                                // this field still needs periodically - the field was
+                                                // just unfocused, so there's no in-progress composition
+                                                // to disrupt.
+                                                if (it.isFocused && consumedBaseline != inputPlaceholder) {
+                                                    consumedBaseline = inputPlaceholder
+                                                    hiddenInput = TextFieldValue(
+                                                        inputPlaceholder,
+                                                        selection = TextRange(inputPlaceholder.length)
+                                                    )
+                                                }
+                                            }
                                     )
                                 }
 
@@ -1229,6 +1393,7 @@ class MainActivity : ComponentActivity() {
                                 onSessionSelected = { viewModel.openSession(it) },
                                 onRunningSessionSelected = { viewModel.openRunningSession(it) },
                                 onKillRunningSession = { viewModel.killSession(it) },
+                                onToggleWakeUpRunningSession = { viewModel.toggleWakeUp(it) },
                                 onSettingsClicked = {
                                     startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                                 },
@@ -1254,15 +1419,22 @@ class MainActivity : ComponentActivity() {
         handleNotificationIntent(intent)
     }
 
-    /** Reads EXTRA_RUNTIME_ID off a notification tap (main content tap or a
-     *  per-session "Open" action) and switches to that running session.
-     *  Absent/blank extra (a plain launcher-icon launch, or the very first
-     *  onCreate before any notification exists) is a no-op - MainViewModel's
-     *  own init already opens the default session for that case. */
+    /** Reads EXTRA_RUNTIME_ID off a notification tap (main content tap or
+     *  the single-session Close/body action) and switches to that running
+     *  session, or reads EXTRA_OPEN_DRAWER (the "Manage sessions" action
+     *  shown once 2+ sessions are running, since the notification can no
+     *  longer say which one a tap means) and opens the session drawer
+     *  instead so the user can pick. Neither extra present (a plain
+     *  launcher-icon launch, or the very first onCreate before any
+     *  notification exists) is a no-op - MainViewModel's own init already
+     *  opens the default session for that case. */
     private fun handleNotificationIntent(intent: Intent?) {
         val runtimeId = intent?.getStringExtra(SessionForegroundService.EXTRA_RUNTIME_ID)
         if (!runtimeId.isNullOrBlank()) {
             viewModel.openRunningSession(runtimeId)
+        }
+        if (intent?.getBooleanExtra(SessionForegroundService.EXTRA_OPEN_DRAWER, false) == true) {
+            viewModel.setDrawerOpen(true)
         }
     }
 }
