@@ -18,6 +18,7 @@ import com.terminator.app.TerminatorApp
 import com.terminator.app.session.SessionEntry
 import com.terminator.app.session.SessionRepository
 import com.terminator.app.session.SessionType
+import com.terminator.app.settings.SettingsKeys
 import kotlinx.coroutines.launch
 
 /** Grabs the app-wide SessionRepository the same way MainViewModel does. */
@@ -37,10 +38,12 @@ private fun rememberSessionRepository(): SessionRepository {
 @Composable
 fun SessionsSettingsScreen(onBack: () -> Unit) {
     val repo = rememberSessionRepository()
+    val settingsRepo = rememberSettingsRepository()
     val scope = rememberCoroutineScope()
     var showAddDialog by remember { mutableStateOf(false) }
     var editingSession by remember { mutableStateOf<SessionEntry?>(null) }
     val sessions by repo.sessions.collectAsState(initial = emptyList())
+    val clearAlwaysPty by settingsRepo.flow(SettingsKeys.CLEAR_ALWAYS_PTY, false).collectAsState(initial = false)
 
     Scaffold(
         topBar = {
@@ -60,6 +63,28 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Text("Terminal Behaviour", style = MaterialTheme.typography.labelLarge)
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Clear always purges scrollback", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Off: `clear` behaves like a normal terminal - old " +
+                                "output just scrolls out of view, still reachable by " +
+                                "scrolling up. On: `clear` also wipes scrollback " +
+                                "history, so nothing is left above the screen.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = clearAlwaysPty,
+                        onCheckedChange = { scope.launch { settingsRepo.set(SettingsKeys.CLEAR_ALWAYS_PTY, it) } }
+                    )
+                }
+            }
+            HorizontalDivider()
+
             Text(
                 "Multiple Mode allows opening the same session as more than one simultaneous instance.",
                 modifier = Modifier.padding(16.dp),

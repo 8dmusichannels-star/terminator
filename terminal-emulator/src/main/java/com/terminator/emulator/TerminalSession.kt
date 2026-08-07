@@ -5,6 +5,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.LinkedBlockingQueue
 
 /**
  * Defines what a session executes.
@@ -58,7 +59,34 @@ class TerminalSession(
     private var masterPfd: ParcelFileDescriptor? = null
 
     private var reader: Thread? = null
+    // All writes to the pty - user keystrokes, mouse events, and (critically)
+    // DSR/CPR auto-replies from TerminalEmulator.Listener.onRespond - go
+    // through this queue instead of a direct outputStream.write() call. The
+    // reader thread invokes onRespond() synchronously from inside
+    // emulator.append() (it has to: the reply has to reflect the cursor
+    // position at that exact point in the stream), so if write() itself did
+    // the blocking I/O, a write that stalls - e.g. the pty's write buffer is
+    // full because the remote/ssh side hasn't drained it yet - freezes the
+    // *reader* thread right along with it. Nothing else can then read
+    // incoming output either, which is exactly the "connects, then freezes
+    // until Ctrl+C" symptom: Ctrl+C's SIGINT is what unblocks the write (by
+    // interrupting whatever the far end was doing), not any real recovery.
+    // A dedicated writer thread means the reader only ever does a cheap,
+    // non-blocking queue.put() and immediately continues reading, no matter
+    // how long the actual write() ends up taking.
+    private val writeQueue = LinkedBlockingQueue<ByteArray>()
+    private var writer: Thread? = null
     @Volatile private var alive = false
+    // Guards masterPfd.close() so it only ever actually runs once. destroy(),
+    // kill(), and the reader thread's EOF path (finally -> markExited()) can
+    // all race to tear the fd down for the same exit; without this guard two
+    // of them can each call ParcelFileDescriptor.close() on the same fd,
+    // and the second close hits an fd fdsan has already marked closed/
+    // unowned - "attempted to close file descriptor X, expected to be
+    // unowned, actually owned by unique_fd/Parcel". This is a compare-and-set
+    // rather than a plain boolean check so two threads calling close() at
+    // the same instant can't both pass the check before either sets it.
+    private val pfdClosed = java.util.concurrent.atomic.AtomicBoolean(false)
     // True once the child process is confirmed gone (EOF on the pty read
     // side, or an explicit kill/destroy). Exposed so the UI can render an
     // "exited" state on the session that just went away.
@@ -135,6 +163,29 @@ class TerminalSession(
         }
         reader!!.isDaemon = true
         reader!!.start()
+
+        // Dedicated writer thread - see writeQueue's doc comment above for
+        // why this can't just be outputStream.write() called inline from
+        // wherever write() is invoked (the reader thread, for DSR replies;
+        // the UI thread, for keystrokes). take() blocks only this thread
+        // when the queue is empty, and the actual write() blocking on slow
+        // I/O only ever stalls this thread too - never the reader, never
+        // the UI.
+        writer = Thread {
+            try {
+                while (true) {
+                    val data = writeQueue.take()
+                    outputStream?.write(data)
+                    outputStream?.flush()
+                }
+            } catch (_: InterruptedException) {
+                // destroy()/kill() interrupting this thread to shut it down
+            } catch (_: IOException) {
+                // pty closed underneath us; nothing more to write
+            }
+        }
+        writer!!.isDaemon = true
+        writer!!.start()
     }
 
     /**
@@ -161,11 +212,19 @@ class TerminalSession(
     }
 
     fun write(data: String) {
+        // Non-blocking: hands the bytes to writeQueue and returns
+        // immediately. The writer thread (started in start()) does the
+        // actual, potentially-blocking outputStream.write() - see
+        // writeQueue's doc comment for why that separation matters.
+        // put() only ever blocks on a *bounded* queue when full; this one
+        // is unbounded, so it can't stall the caller (reader or UI thread)
+        // waiting for space - but it still declares InterruptedException,
+        // so a caller thread that's mid-interrupt (e.g. during app
+        // teardown) doesn't crash on an uncaught exception here.
         try {
-            outputStream?.write(data.toByteArray(Charsets.UTF_8))
-            outputStream?.flush()
-        } catch (_: IOException) {
-            // pty closed underneath us; nothing to do
+            writeQueue.put(data.toByteArray(Charsets.UTF_8))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         }
     }
 
@@ -202,37 +261,78 @@ class TerminalSession(
     /** Graceful teardown - used when a session profile is deleted, or the
      *  app itself is going away. Gives the child a chance to clean up. */
     fun destroy() {
-        if (pid > 0) {
+        // Guard against sending a signal to a pid that has already exited
+        // and been reused by an unrelated process (destroy()/kill() can be
+        // called after the reader thread's EOF path already tore this
+        // session down, e.g. Enter on an already-exited session).
+        if (pid > 0 && alive) {
             NativePty.sendSignal(pid, SIGTERM)
         }
         reader?.interrupt()
-        try {
-            masterPfd?.close()
-        } catch (_: IOException) {
-            // already closed
-        }
+        writer?.interrupt()
+        closePfdOnce()
         alive = false
         markExited()
     }
 
     /**
      * Hard kill, unconditionally - used by the trash-can icon in the
-     * session drawer and by Ctrl+D inside the terminal (per spec, Ctrl+D
-     * always sends SIGKILL rather than a graceful EOF). SIGKILL can't be
-     * caught or ignored by the child, so this is immediate.
+     * session drawer, which always means "get rid of this session now"
+     * regardless of what's running in it. SIGKILL can't be caught or
+     * ignored by the child, so this is immediate. Ctrl+D inside the
+     * terminal goes through [sendCtrlDOrKill] instead - see its doc for why
+     * this method isn't the right one for that anymore.
      */
     fun kill() {
-        if (pid > 0) {
+        if (pid > 0 && alive) {
             NativePty.sendSignal(pid, SIGKILL)
         }
         reader?.interrupt()
+        writer?.interrupt()
+        closePfdOnce()
+        alive = false
+        markExited()
+    }
+
+    /**
+     * Ctrl+D from the terminal keyboard. Only force-kills (SIGKILL) when
+     * the shell itself is what's currently in the foreground - i.e. no
+     * other program has been launched and taken over. When something else
+     * (vim, a build, top, ...) is in the foreground, this sends a plain
+     * EOT (0x04) into the pty instead, exactly like a real terminal does,
+     * so Ctrl+D behaves as "let the foreground program handle EOF its own
+     * way" rather than killing it and any unsaved work out from under the
+     * user. Previously this always SIGKILLed unconditionally, which is
+     * what made Ctrl+D nuke vim/foreground jobs instead of just, say,
+     * closing vim's own EOF-triggered dialog or exiting a REPL cleanly.
+     *
+     * "Shell is in the foreground" is detected as tcgetpgrp(masterFd)
+     * matching this session's own pid: a freshly-spawned shell is its own
+     * process group leader (pgid == pid), and job control hands foreground
+     * status to a *different* pgid the moment the shell launches anything
+     * else. If the pgrp can't be determined (getForegroundPgrp returns -1),
+     * this conservatively treats that as "something's running" and just
+     * sends EOT rather than risking a kill of unknown work.
+     */
+    fun sendCtrlDOrKill() {
+        if (masterFd < 0 || pid <= 0) return
+        val fgPgrp = NativePty.getForegroundPgrp(masterFd)
+        if (fgPgrp == pid) {
+            kill()
+        } else {
+            write("\u0004")
+        }
+    }
+
+    /** Closes [masterPfd] at most once across destroy()/kill()/any future
+     *  caller, no matter how many of them race to tear this session down. */
+    private fun closePfdOnce() {
+        if (!pfdClosed.compareAndSet(false, true)) return
         try {
             masterPfd?.close()
         } catch (_: IOException) {
             // already closed
         }
-        alive = false
-        markExited()
     }
 
     fun isAlive(): Boolean = alive

@@ -21,6 +21,11 @@ class TerminalEmulator(
         fun onTitleChanged(title: String)
         fun onCursorMoved(row: Int, col: Int)
         fun onContentChanged()
+        // Fired when the emulator itself needs to write bytes back to the
+        // pty in response to something the running program asked for -
+        // currently just DSR/CPR (CSI 6n, "where's the cursor?"). The
+        // caller (TerminalSession) wires this straight to its own write().
+        fun onRespond(data: String)
     }
 
     // Mirrored onto buffer.cursorRow/cursorCol on every write so the
@@ -91,12 +96,94 @@ class TerminalEmulator(
     private val paramBuffer = StringBuilder()
     private val oscBuffer = StringBuilder()
 
+    companion object {
+        // U+200D ZERO WIDTH JOINER - glues two otherwise-independent emoji
+        // codepoints into one displayed glyph (family/couple/profession
+        // sequences etc: "man" + ZWJ + "woman" + ZWJ + "girl" + ZWJ + "boy"
+        // renders as a single family emoji, not four side-by-side ones).
+        private const val ZWJ = '\u200D'
+        // U+FE0E/FE0F variation selectors - pick the text-style vs
+        // emoji-style presentation of the preceding codepoint (e.g. "❤" as
+        // plain glyph vs "❤️" as a colored heart). No width of their own;
+        // they only modify what came right before them.
+        private const val VS15_TEXT = '\uFE0E'
+        private const val VS16_EMOJI = '\uFE0F'
+        // U+1F3FB..U+1F3FF EMOJI MODIFIER FITZPATRICK TYPE-1-2..TYPE-6 -
+        // skin-tone modifiers, astral-plane so they arrive as surrogate
+        // pairs like any other emoji codepoint.
+        private const val SKIN_TONE_MODIFIER_LOW = 0x1F3FB
+        private const val SKIN_TONE_MODIFIER_HIGH = 0x1F3FF
+
+        private fun isSkinToneModifier(codePoint: Int) =
+            codePoint in SKIN_TONE_MODIFIER_LOW..SKIN_TONE_MODIFIER_HIGH
+    }
+
     /** Feed a chunk of decoded output text from the child process into the emulator. */
     fun append(text: CharSequence) {
-        for (ch in text) {
+        var i = 0
+        while (i < text.length) {
+            val ch = text[i]
+            // Only NORMAL-state printable characters can ever start a
+            // grapheme cluster - escape/CSI/OSC sequences are pure ASCII,
+            // so this is only attempted when we're about to hand a
+            // printable character to writeChar (handleNormal's `else`
+            // branch would otherwise take it one Char at a time).
+            if (state == State.NORMAL && ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate()) {
+                val end = scanGraphemeCluster(text, i)
+                writeChar(text.subSequence(i, end).toString())
+                i = end
+                continue
+            }
             processChar(ch)
+            i++
         }
         listener.onContentChanged()
+    }
+
+    /**
+     * Starting from a confirmed surrogate pair at [start], greedily extends
+     * the range forward to absorb whatever keeps it one visual glyph rather
+     * than several: a ZWJ followed by another codepoint (joins two emoji
+     * into a compound one - families, couples, profession sequences, the
+     * rainbow/trans/etc pride flags), a trailing variation selector, or a
+     * skin-tone modifier. Returns the exclusive end index of the whole
+     * cluster. Without this, TerminalBuffer.Cell (see its own doc) still
+     * only ever held a single codepoint's surrogate pair, so a ZWJ sequence
+     * rendered as several adjacent glyphs (e.g. an adult, a joiner glyph,
+     * and a child, instead of one family emoji) rather than the intended
+     * single grapheme - Cell.text being a String already made it capable of
+     * holding the rest once this scan feeds it in.
+     */
+    private fun scanGraphemeCluster(text: CharSequence, start: Int): Int {
+        var i = start + 2 // past the initial confirmed surrogate pair
+        while (i < text.length) {
+            val ch = text[i]
+            when {
+                // Variation selector: consumes just the one BMP char, then
+                // keep scanning - a ZWJ can still follow it.
+                ch == VS15_TEXT || ch == VS16_EMOJI -> i += 1
+                // ZWJ must be followed by another full codepoint (either a
+                // surrogate pair or a plain BMP one, e.g. some flag
+                // sequences join BMP regional-indicator-adjacent symbols)
+                // to mean anything - a trailing/dangling ZWJ with nothing
+                // after it isn't part of a cluster and is left for the
+                // normal per-char path to drop or render on its own.
+                ch == ZWJ && i + 1 < text.length -> {
+                    val next = text[i + 1]
+                    i += if (next.isHighSurrogate() && i + 2 < text.length && text[i + 2].isLowSurrogate()) {
+                        3 // ZWJ + surrogate pair
+                    } else {
+                        2 // ZWJ + one BMP codepoint
+                    }
+                }
+                // Skin-tone modifier directly following the base emoji (no
+                // ZWJ needed for this one per the Unicode emoji spec).
+                ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate() &&
+                    isSkinToneModifier(Character.toCodePoint(ch, text[i + 1])) -> i += 2
+                else -> return i
+            }
+        }
+        return i
     }
 
     private fun processChar(ch: Char) {
@@ -117,7 +204,17 @@ class TerminalEmulator(
             '\r' -> cursorCol = 0
             '\b' -> if (cursorCol > 0) cursorCol--
             '\t' -> cursorCol = ((cursorCol / 8) + 1) * 8
-            else -> writeChar(ch)
+            // A lone surrogate (the pairing check in append() didn't fire -
+            // e.g. a high surrogate arrived as literally the last char of
+            // one append() call, with its low-surrogate other half not yet
+            // read off the pty) has no valid single-Char rendering. Rather
+            // than writeChar-ing an invalid half-codepoint into a cell,
+            // drop it silently; the common real-world case (split across a
+            // pty read boundary) is naturally rare since pty reads are
+            // usually larger than a handful of bytes, and even when it
+            // happens this just costs one glyph rather than corrupting the
+            // grid with an unpaired surrogate.
+            else -> if (!ch.isSurrogate()) writeChar(ch.toString())
         }
     }
 
@@ -168,16 +265,73 @@ class TerminalEmulator(
     }
 
     private fun handleCsi(ch: Char) {
-        if (ch.isDigit() || ch == ';' || ch == '?') {
+        if (ch.isDigit() || ch == ';' || ch == '?' || ch == '>' || ch == '=') {
+            // '?' is the DEC-private-mode prefix (CSI ? Ps h/l, handled by
+            // handlePrivateMode). '>' and '=' are two more CSI prefix bytes
+            // real programs send - '>' for secondary-DA/xterm queries like
+            // XTVERSION ("CSI > 0 q", "CSI > c") and kitty's keyboard-
+            // protocol sequences ("CSI > 1 u"), '=' for tertiary-DA. Before
+            // this, neither was recognized here, so the prefix byte itself
+            // fell straight through to the "final byte reached" dispatch
+            // below with an empty paramBuffer: it got treated AS the final
+            // byte, silently matched no case, and state reset to NORMAL -
+            // right as the sequence's *real* parameters and final byte
+            // (e.g. the "0", " ", "q" of "CSI > 0 q") were still incoming.
+            // Those then arrived one at a time in NORMAL state and got
+            // printed as literal text - exactly the "0q" garbage seen on
+            // fish/starship startup (both send "CSI > 0 q" as a terminal-
+            // capability probe). Folding the prefix into paramBuffer here,
+            // same as '?', keeps the parser in CSI state until the actual
+            // final byte shows up, so the whole sequence dispatches (and
+            // gets silently ignored, correctly) instead of leaking half of
+            // itself onto the screen.
+            if (paramBuffer.length >= 64) {
+                state = State.NORMAL
+                return
+            }
             paramBuffer.append(ch)
+            return
+        }
+        if (ch.code in 0x20..0x2F) {
+            // Intermediate byte (e.g. the '$' in DECRQM's "CSI ? Ps $ p",
+            // or ' ' in some DECSCUSR cursor-style sequences) - part of the
+            // sequence but not itself the final byte. Previously this fell
+            // straight through to the dispatch logic below, which treated
+            // it AS the final byte: the sequence got dispatched early on
+            // the wrong byte (silently ignored, since '$'/' ' etc. don't
+            // match any known final byte), state reset to NORMAL, and the
+            // *real* final byte that followed (e.g. 'p') then arrived as
+            // plain text in NORMAL state and got printed literally. That's
+            // the garbled-character pattern seen with prompts/programs that
+            // use two-byte-final CSI sequences. Consuming it here and
+            // continuing to wait for the actual final byte fixes that.
             return
         }
         // Final byte reached - dispatch
         val raw = paramBuffer.toString()
         val private = raw.startsWith("?")
-        val params = raw.removePrefix("?")
+        // '>' (secondary-DA/XTVERSION/kitty-keyboard queries, e.g. the
+        // "CSI > 0 q" fish/starship send on startup) and '=' (tertiary-DA)
+        // sequences aren't otherwise handled below - stripping the prefix
+        // the same way '?' is stripped means they still hit a real case
+        // (none) and fall through to the unsupported-final-byte `else`,
+        // silently and completely ignored, instead of the leftover prefix
+        // character corrupting the parsed param list.
+        val params = raw.removePrefix("?").removePrefix(">").removePrefix("=")
             .split(';')
             .mapNotNull { it.toIntOrNull() }
+            // Numeric CSI params (repeat counts for 'L'/'M'/'P'/'@'/'X'/'S'/'T',
+            // cursor-move distances, etc.) are meant to be small - real
+            // terminals send counts in the tens at most. But nothing here
+            // stopped a huge or malformed count (e.g. a truncated/garbled
+            // sequence whose digits ran into the next chunk) from reaching
+            // repeat()/coerceAtLeast() and looping millions of times before
+            // returning control to the UI thread, which is exactly what an
+            // app hang looks like from the outside even though the loop
+            // does eventually terminate. Clamping here caps every dispatch
+            // below at a bounded amount of work regardless of what a
+            // misbehaving/garbled sequence claims.
+            .map { it.coerceIn(-4096, 4096) }
 
         if (private) {
             handlePrivateMode(params, ch)
@@ -197,10 +351,15 @@ class TerminalEmulator(
             }
             'J' -> eraseInDisplay(params.getOrElse(0) { 0 })
             'K' -> eraseInLine(params.getOrElse(0) { 0 })
-            'L' -> insertLines(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            'M' -> deleteLines(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            'P' -> deleteChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
-            '@' -> insertChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
+            // Repeat counts additionally clamped to the buffer's own
+            // dimensions - inserting/deleting more lines or chars than the
+            // screen actually has is never meaningful, so there's no reason
+            // to let a large-but-under-4096 count do that much pointless
+            // work on every keystroke's worth of output.
+            'L' -> insertLines(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows))
+            'M' -> deleteLines(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows))
+            'P' -> deleteChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
+            '@' -> insertChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
             // CHA/HPA - absolute column. VPA - absolute row. ECH - erase N
             // chars in place without shifting anything (unlike 'P'/'@').
             // These three are used constantly by nano and other ncurses
@@ -209,7 +368,7 @@ class TerminalEmulator(
             // what made those screens look garbled/misaligned.
             'G', '`' -> cursorCol = ((params.getOrElse(0) { 1 }) - 1).coerceIn(0, buffer.columns - 1)
             'd' -> cursorRow = ((params.getOrElse(0) { 1 }) - 1).coerceIn(0, buffer.rows - 1)
-            'X' -> eraseChars(params.getOrElse(0) { 1 }.coerceAtLeast(1))
+            'X' -> eraseChars(params.getOrElse(0) { 1 }.coerceIn(1, buffer.columns))
             // ANSI.SYS-style save/restore cursor (distinct escape form of
             // the same DECSC/DECRC behavior handled in handleEscape).
             's' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol }
@@ -240,16 +399,30 @@ class TerminalEmulator(
             'S' -> {
                 val savedRow = cursorRow
                 cursorRow = scrollBottom // so each lineFeed() call actually scrolls
-                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { lineFeed() }
+                repeat(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows)) { lineFeed() }
                 cursorRow = savedRow
             }
             'T' -> {
                 val savedRow = cursorRow
                 cursorRow = scrollTop // so each reverseLineFeed() call actually scrolls
-                repeat(params.getOrElse(0) { 1 }.coerceAtLeast(1)) { reverseLineFeed() }
+                repeat(params.getOrElse(0) { 1 }.coerceIn(1, buffer.rows)) { reverseLineFeed() }
                 cursorRow = savedRow
             }
             'm' -> applySgr(params)
+            // DSR (Device Status Report). Ps=6 is CPR - "where's the
+            // cursor?" - and the caller is expected to block waiting for
+            // an answer on the pty. starship (and other prompts/programs
+            // that probe terminal state on startup) send this and will
+            // hang indefinitely - exactly the "connects but then freezes
+            // until Ctrl+C" symptom - if nothing ever answers it. Reply
+            // with CSI row;col R, 1-indexed per the spec, using the
+            // emulator's own cursor position. Ps=5 ("are you OK?") is
+            // answered with a fixed "OK" status report; some scripts probe
+            // it before deciding whether to enable fancier prompt features.
+            'n' -> when (params.getOrElse(0) { 0 }) {
+                6 -> listener.onRespond("\u001B[${cursorRow + 1};${cursorCol + 1}R")
+                5 -> listener.onRespond("\u001B[0n")
+            }
             'h', 'l' -> { /* non-private mode set/reset we don't track - ignore */ }
             else -> { /* unsupported final byte - ignore */ }
         }
@@ -351,24 +524,72 @@ class TerminalEmulator(
         }
     }
 
+    // Set when the OSC terminator's ESC byte has been seen but its
+    // required follow-up '\' (forming the two-byte ST, ESC \) hasn't
+    // arrived yet.
+    private var oscPendingSt = false
+
     private fun handleOsc(ch: Char) {
-        if (ch == '\u0007' || ch == '\u001B') {
-            // OSC terminator (BEL or ST). Format we care about: "0;title" or "2;title"
-            val content = oscBuffer.toString()
-            val sepIdx = content.indexOf(';')
-            if (sepIdx >= 0) {
-                val code = content.substring(0, sepIdx)
-                if (code == "0" || code == "2") {
-                    listener.onTitleChanged(content.substring(sepIdx + 1))
-                }
-            }
+        if (oscPendingSt) {
+            oscPendingSt = false
             state = State.NORMAL
+            finishOsc()
+            if (ch == '\\') {
+                // The expected second byte of ST (ESC \\) - consumed as
+                // part of the terminator, nothing left to do with it.
+                return
+            }
+            // Not actually ST - the ESC we saw was the start of a *new*
+            // escape sequence butting up against this OSC with no proper
+            // terminator (very common with prompts like starship, which
+            // chain an OSC 133 marker straight into an SGR sequence with
+            // no ST in between). ch here is the byte *after* that second
+            // ESC, e.g. '[' in "...ESC \\ ESC [ 4;1m" - not the ESC itself,
+            // which was already consumed when oscPendingSt was set. Route
+            // through handleEscape (not processChar/handleNormal) so that
+            // byte is interpreted as the start of the new sequence instead
+            // of being printed literally - which is exactly what produced
+            // the "4;1m" garbage with the leading ESC and '[' missing.
+            state = State.ESCAPE
+            handleEscape(ch)
+            return
+        }
+        if (ch == '\u0007') {
+            state = State.NORMAL
+            finishOsc()
+        } else if (ch == '\u001B') {
+            // Could be the start of ST (ESC \\) - wait for the next byte
+            // before finishing, instead of ending the OSC right here and
+            // leaking the '\\' into NORMAL state as printable text.
+            oscPendingSt = true
         } else {
+            // Same runaway-growth guard as paramBuffer above, sized larger
+            // since real OSC payloads (window titles, OSC 8 hyperlink URLs)
+            // are legitimately longer than a CSI parameter list. A
+            // terminator/BEL that never arrives (garbled stream, torn
+            // chunk) would otherwise grow this without bound instead of
+            // ever reaching handleOsc's terminator branch.
+            if (oscBuffer.length >= 8192) {
+                state = State.NORMAL
+                return
+            }
             oscBuffer.append(ch)
         }
     }
 
-    private fun writeChar(ch: Char) {
+    private fun finishOsc() {
+        // Format we care about: "0;title" or "2;title"
+        val content = oscBuffer.toString()
+        val sepIdx = content.indexOf(';')
+        if (sepIdx >= 0) {
+            val code = content.substring(0, sepIdx)
+            if (code == "0" || code == "2") {
+                listener.onTitleChanged(content.substring(sepIdx + 1))
+            }
+        }
+    }
+
+    private fun writeChar(text: String) {
         if (cursorCol >= buffer.columns) {
             cursorCol = 0
             lineFeed()
@@ -376,7 +597,7 @@ class TerminalEmulator(
         buffer.setCell(
             cursorRow, cursorCol,
             TerminalBuffer.Cell(
-                char = ch, fg = curFg, bg = curBg,
+                text = text, fg = curFg, bg = curBg,
                 bold = curBold, underline = curUnderline,
                 inverse = curInverse, italic = curItalic
             )
@@ -436,6 +657,18 @@ class TerminalEmulator(
         }
     }
 
+    // Settings > Terminal > "Clear always purges scrollback" (CLEAR_ALWAYS_PTY).
+    // Off by default: `clear`/CSI 2J behaves like a normal terminal (content
+    // just scrolls out of view, still reachable by scrolling up). On: CSI 2J
+    // also wipes scrollback, so `clear` leaves truly nothing above the
+    // screen - this is what "pty kalintilari" (leftover scrollback residue
+    // still visible above a `clear`) was actually asking for: not a bug in
+    // the erase logic itself, but `clear`'s CSI 2J never being wired to
+    // scrollback at all. CSI 3J (explicit "clear scrollback", e.g. from
+    // `clear -x` / tmux's clear-history) always purges scrollback regardless
+    // of this setting, since that sequence's whole purpose is exactly that.
+    var clearAlwaysPurgesScrollback: Boolean = false
+
     private fun eraseInDisplay(mode: Int) {
         when (mode) {
             0 -> { // cursor to end of screen
@@ -446,7 +679,18 @@ class TerminalEmulator(
                 for (r in 0 until cursorRow) buffer.clearRow(r, curBg)
                 eraseInLine(1)
             }
-            2, 3 -> buffer.clearAll(curBg)
+            2 -> {
+                buffer.clearAll(curBg)
+                if (clearAlwaysPurgesScrollback) buffer.clearScrollback()
+            }
+            3 -> {
+                // Real xterm semantics: 3J clears scrollback ONLY, leaving
+                // the live screen's content untouched. Previously grouped
+                // with mode 2 (full clearAll), which meant a `clear -x`/
+                // tmux clear-history erased visible on-screen content it
+                // has no business touching.
+                buffer.clearScrollback()
+            }
         }
     }
 
@@ -512,6 +756,7 @@ class TerminalEmulator(
         scrollBottom = buffer.rows - 1
         cursorVisible = true
         applicationCursorKeys = false
+        oscPendingSt = false
         state = State.NORMAL
     }
 

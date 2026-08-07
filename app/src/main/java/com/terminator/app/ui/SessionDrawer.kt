@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -53,6 +54,7 @@ fun SessionDrawer(
     onSessionSelected: (SessionEntry) -> Unit,
     onRunningSessionSelected: (String) -> Unit = {},
     onKillRunningSession: (String) -> Unit = {},
+    onToggleWakeUpRunningSession: (String) -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -142,7 +144,8 @@ fun SessionDrawer(
                                 running = running,
                                 isActive = running.runtimeId == activeSessionId,
                                 onClick = { onRunningSessionSelected(running.runtimeId) },
-                                onKillClick = { onKillRunningSession(running.runtimeId) }
+                                onKillClick = { onKillRunningSession(running.runtimeId) },
+                                onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) }
                             )
                         }
                         item(key = "running-divider") {
@@ -201,7 +204,8 @@ private fun RunningSessionRow(
     running: RunningSession,
     isActive: Boolean,
     onClick: () -> Unit,
-    onKillClick: () -> Unit = {}
+    onKillClick: () -> Unit = {},
+    onWakeUpClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -228,6 +232,18 @@ private fun RunningSessionRow(
                     color = Color(0xFFBF616A)
                 )
             }
+        }
+        // Wake-up toggle: raises this session's background-survival
+        // priority (see TerminatorApp.requestToggleWakeUp) without opening
+        // the notification - tapping an already-awake session's icon here
+        // undoes it, same as tapping it again from the notification's
+        // "..." menu would.
+        IconButton(onClick = onWakeUpClick) {
+            Icon(
+                if (running.wakeUp) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                contentDescription = if (running.wakeUp) "Let session sleep" else "Keep session awake",
+                tint = if (running.wakeUp) Color(0xFFEBCB8B) else Color.White.copy(alpha = 0.35f)
+            )
         }
         // Kill button: always available here, independent of Ctrl+D inside
         // the terminal - the two methods the spec asked for. Both send an

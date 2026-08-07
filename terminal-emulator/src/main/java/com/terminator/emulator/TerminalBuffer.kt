@@ -22,7 +22,19 @@ class TerminalBuffer(
     }
 
     data class Cell(
-        var char: Char = ' ',
+        // A cell's on-screen content as a String rather than a single Char.
+        // Most cells are exactly one UTF-16 code unit ("a", "1", " "), but
+        // astral-plane characters - emoji among them, e.g. U+1F310 GLOBE
+        // WITH MERIDIANS - encode as a UTF-16 *surrogate pair*: two Chars
+        // that only mean something together. Iterating a CharSequence one
+        // Char at a time (as TerminalEmulator.append did) split that pair
+        // across two separate cells, each holding one half of the pair on
+        // its own - neither of which is a valid character - so the emoji
+        // rendered as two adjacent bogus glyphs instead of one. Storing the
+        // full grapheme as a String lets TerminalEmulator hand over both
+        // surrogates already joined, so a single Cell always holds one
+        // complete, renderable unit.
+        var text: String = " ",
         var fg: Int = DEFAULT_FOREGROUND,
         var bg: Int = DEFAULT_BACKGROUND,
         var bold: Boolean = false,
@@ -114,7 +126,7 @@ class TerminalBuffer(
      * text instead of silently selecting/copying nothing.
      */
     fun lastNonBlankColumn(row: Int, scrollOffset: Int): Int? =
-        (0 until columns).lastOrNull { col -> lineAt(row, col, scrollOffset).char != ' ' }
+        (0 until columns).lastOrNull { col -> lineAt(row, col, scrollOffset).text != " " }
 
     /** How many lines are available to scroll back through right now. */
     val maxScrollOffset: Int get() = scrollback.size
@@ -145,7 +157,7 @@ class TerminalBuffer(
             val toCol = (if (row == r2) c2 else columns - 1).coerceIn(0, columns - 1)
             val sb = StringBuilder()
             for (col in fromCol..toCol) {
-                sb.append(lineAt(row, col, scrollOffset).char)
+                sb.append(lineAt(row, col, scrollOffset).text)
             }
             lines.add(sb.toString().trimEnd(' '))
         }
@@ -167,6 +179,14 @@ class TerminalBuffer(
 
     fun clearAll(bg: Int = DEFAULT_BACKGROUND) {
         for (r in 0 until rows) clearRow(r, bg)
+    }
+
+    /** Discards scrollback history entirely - used by CSI 3J ("clear
+     *  scrollback") and by plain CSI 2J when Settings > Terminal >
+     *  "Clear always purges scrollback" is on. Leaves the live grid alone;
+     *  callers that want a full clear call this alongside clearAll(). */
+    fun clearScrollback() {
+        scrollback.clear()
     }
 
     /** Scrolls the grid up by one line, pushing the top line into scrollback
@@ -284,6 +304,19 @@ class TerminalBuffer(
             }
         }
         grid = resized(grid)
+        // When alternate screen is active, `grid` above just became a
+        // freshly-resized array - but altGrid, which is meant to be the
+        // SAME array as grid while alternate screen is active (see
+        // enterAlternateScreen()), was never updated to match, so it kept
+        // pointing at the old pre-resize array instead. inAlternateScreen
+        // still read true (altGrid was non-null, just stale) and rendering
+        // itself was unaffected since TerminalView reads through grid/
+        // cellAt() rather than altGrid directly - but exitAlternateScreen()
+        // followed by another enterAlternateScreen() before this session
+        // resized again would have silently resumed writing into that
+        // stale, wrong-sized array. Re-pointing it here keeps the "altGrid
+        // is grid, while active" invariant intact across a resize.
+        if (altGrid != null) altGrid = grid
         savedGrid = savedGrid?.let { resized(it) }
         columns = newColumns
         rows = newRows
@@ -293,6 +326,6 @@ class TerminalBuffer(
 
     fun rowText(row: Int): String {
         if (row !in 0 until rows) return ""
-        return grid[row].joinToString(separator = "") { it.char.toString() }
+        return grid[row].joinToString(separator = "") { it.text }
     }
 }

@@ -234,8 +234,8 @@ private fun DrawScope.drawTerminal(
                 // a meaningful fraction of the ~1920 drawText calls a full
                 // 80x24 redraw would otherwise make. Underlined spaces
                 // still need to draw (the underline itself is visible).
-                if (cell.char != ' ' || cell.underline) {
-                    canvas.nativeCanvas.drawText(cell.char.toString(), x, y, paint)
+                if (cell.text != " " || cell.underline) {
+                    canvas.nativeCanvas.drawText(cell.text, x, y, paint)
                 }
             }
         }
@@ -255,7 +255,7 @@ private fun DrawScope.drawTerminal(
             val cursorCell = buffer.cellAt(buffer.cursorRow, buffer.cursorCol)
             paint.color = android.graphics.Color.BLACK
             paint.isFakeBoldText = cursorCell.bold
-            canvas.nativeCanvas.drawText(cursorCell.char.toString(), cursorX, cursorY, paint)
+            canvas.nativeCanvas.drawText(cursorCell.text, cursorX, cursorY, paint)
         }
     }
 }

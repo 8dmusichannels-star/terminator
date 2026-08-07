@@ -4,4 +4,16 @@
     <string name="settings_title">Settings</string>
     <string name="notification_channel_name">Terminal Sessions</string>
     <string name="notification_session_running">A session is running</string>
+    <!-- Single-session notification: no name repetition needed, the content
+         text already shows the session's own label. -->
+    <string name="notification_action_close_generic">Close</string>
+    <string name="notification_action_wakeup_on">Keep awake</string>
+    <string name="notification_action_wakeup_off">Allow sleep</string>
+    <!-- Shown once 2+ sessions are running, in place of per-session
+         actions - opens the in-app session drawer to pick one. -->
+    <string name="notification_action_manage_sessions">Manage sessions</string>
+    <plurals name="notification_session_count">
+        <item quantity="one">%d session running</item>
+        <item quantity="other">%d sessions running</item>
+    </plurals>
 </resources>

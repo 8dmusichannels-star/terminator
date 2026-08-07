@@ -8,9 +8,9 @@ android {
     defaultConfig {
         applicationId = "com.terminator.app"
         minSdk = 33
-        targetSdk = 35
-        versionCode = 6
-        versionName = "0.2.2"
+        targetSdk = 37
+        versionCode = 7
+        versionName = "0.3.0"
     }
     buildFeatures {
         compose = true
@@ -45,6 +45,20 @@ android {
             if (keystorePath != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
+        }
+        // Side-by-side dev builds: separate applicationId means this
+        // installs alongside the release APK on the same device instead of
+        // overwriting it (same applicationId would just replace whatever's
+        // currently installed). versionNameSuffix appends "-dev" to
+        // whatever defaultConfig.versionName is, so that string doesn't
+        // need to be hand-maintained separately from the release version.
+        // Applied directly to "debug" (not a separate build type) so CI's
+        // existing `gradle assembleDebug` step - and any local
+        // `./gradlew assembleDebug` / Android Studio "Debug" run config -
+        // already produces this, with nothing else needing to change.
+        getByName("debug") {
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
         }
     }
     packaging {

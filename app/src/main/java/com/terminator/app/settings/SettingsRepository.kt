@@ -59,6 +59,13 @@ object SettingsKeys {
     // "vt100"/"ansi" remain available since ncurses ships hardcoded
     // fallback definitions for those very common names too.
     val TERM_TYPE = stringPreferencesKey("term_type") // "xterm-256color" | "vt100" | "ansi"
+
+    // Terminal > Behaviour
+    // When true: `clear` (CSI 2J + cursor-home) also discards the entire
+    // scrollback buffer, so there's truly nothing left above the screen.
+    // When false (default): `clear` just moves existing content off-screen
+    // the way a normal terminal does - you can still scroll up to see it.
+    val CLEAR_ALWAYS_PTY = booleanPreferencesKey("clear_always_pty")
 }
 
 /**
