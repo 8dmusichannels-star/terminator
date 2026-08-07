@@ -91,8 +91,9 @@ androidComponents {
             )
 
             if (abi != null) {
+                val baseVersionCode = output.versionCode.orNull ?: 0
                 output.versionCode.set(
-                    (variant.versionCode.orNull ?: 0) * 10 + (abiCodes[abi] ?: 0)
+                    baseVersionCode * 10 + (abiCodes[abi] ?: 0)
                 )
             }
         }
