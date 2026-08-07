@@ -76,6 +76,25 @@ android {
         }
     }
 }
+applicationVariants.all {
+    outputs.forEach { output ->
+        val abiCodes = mapOf(
+            "armeabi-v7a" to 0,
+            "arm64-v8a" to 1,
+            "x86" to 2,
+            "x86_64" to 3
+        )
+
+        val abi = output.filters
+            .find { it.filterType == "ABI" }
+            ?.identifier
+
+        if (abi != null) {
+            output.versionCodeOverride =
+                defaultConfig.versionCode * 10 + abiCodes[abi]!!
+        }
+    }
+}
 // Reproducible/third-party build support (e.g. F-Droid): when no keystore
 // secrets are present, we build an UNSIGNED release APK instead of failing.
 // CI (.github/workflows/build.yml) always provides KEYSTORE_PATH and
