@@ -24,6 +24,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
+import androidx.compose.animation.core.animateIntOffsetAsState
+import androidx.compose.animation.core.tween
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -59,6 +62,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.IntOffset
@@ -214,18 +218,94 @@ class MainActivity : ComponentActivity() {
             TerminatorTheme(amoledBlack = amoledBlack) {
                 val state by viewModel.uiState.collectAsState()
                 val keyboardController = LocalSoftwareKeyboardController.current
+                // keyboardController.show()/hide() (LocalSoftwareKeyboardController) turned
+                // out unreliable specifically for the toolbar Copy/Paste/Cancel restore path -
+                // logcat confirmed keyboardWasOpenBeforeSelection was being captured and
+                // branched on correctly every time, but the on-screen result still came out
+                // backwards (open keyboard closing, closed keyboard opening) after calling
+                // keyboardController's show()/hide(). WindowInsetsControllerCompat talks to
+                // the same platform IME control surface this file already uses successfully
+                // for the status bar above, and is a lower-level, more direct call than the
+                // Compose IME abstraction - using it here for the keyboard too removes
+                // whatever layer between "we decided show" and "IME actually shows" was
+                // flipping the result.
+                val insetsController = remember {
+                    WindowInsetsControllerCompat(window, window.decorView)
+                }
+                // Used to defer insetsController.show(ime()) to a post-frame
+                // callback in the Copy/Paste/Cancel/text-page-close restore
+                // paths below - see those call sites' comments for why a
+                // synchronous show() right after requestFocus() races the
+                // focus-driven show request the platform already fires on
+                // its own, instead of reinforcing it.
+                val currentView = LocalView.current
                 val focusManager = LocalFocusManager.current
                 val focusRequester = remember { FocusRequester() }
                 var keyboardOpen by remember { mutableStateOf(false) }
-                // Two independent focus sources feed keyboardOpen: the
-                // always-present hidden terminal input, and (only while the
-                // virtual key bar's text-entry page is open) its own
-                // OutlinedTextField. Either one having focus counts as "the
-                // keyboard is open" - see the VirtualKeyBar param doc for
-                // why this can't just be the hidden field's focus alone.
+                // hiddenFieldFocused / textPageFieldFocused still exist
+                // because VirtualKeyBar and the toolbar callbacks use them
+                // to decide WHERE to send focus back to - but they are no
+                // longer what keyboardOpen itself is computed from. They
+                // used to be: keyboardOpen = hiddenFieldFocused ||
+                // textPageFieldFocused. Focus is Compose's own bookkeeping
+                // about which composable *would* receive input, not a
+                // report from the system about whether the IME is
+                // actually on screen - the two can and did desync:
+                // requestFocus() succeeding is not a guarantee the system
+                // decides to (re)show the IME for it (a well-documented
+                // Compose/platform gap once the IME has already fully
+                // hidden), and conversely a field can hold focus with the
+                // IME never having been told to show. That gap is what
+                // kept surfacing as "kapaliyken aciliyor ama acikken
+                // kapaniyor" no matter how the two focus booleans were
+                // combined or debounced - the inputs themselves weren't
+                // the right signal.
+                //
+                // WindowInsets.ime is the system's own report of the IME's
+                // current inset (>0 while any portion of the keyboard is
+                // occupying screen space), so it can never disagree with
+                // what the user is actually looking at. It's snapshot-
+                // state-backed, so reading it directly into keyboardOpen
+                // (no LaunchedEffect indirection - that would cost an
+                // extra recomposition frame of lag on every show/hide)
+                // recomposes this exact frame whenever the real keyboard
+                // shows/hides/animates - including the platform-driven
+                // cases (back button, switching apps, an IME the user
+                // closed with its own dismiss control) that focus-only
+                // tracking could never see happen at all.
+                keyboardOpen = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+                // keyboardOpen (above) is a live, per-frame read of an
+                // ANIMATING inset - while the IME is actually in the
+                // middle of showing or hiding, it can read a transient
+                // value that doesn't match what's about to be on screen
+                // a moment later (e.g. still 0 a frame or two into a
+                // show animation). That's harmless for keyboardOpen's
+                // main use (driving this frame's UI, which is supposed
+                // to track the animation live), but it's exactly what
+                // was breaking keyboardWasOpenBeforeSelection below:
+                // that field takes ONE snapshot of keyboardOpen at the
+                // moment a long-press is recognized, and if that
+                // snapshot lands mid-animation it captures the opposite
+                // of what the user actually left on screen - the
+                // toolbar then faithfully restores/dismisses the wrong
+                // thing on Copy/Paste/Cancel ("kapaliyken açılıyor,
+                // açikken kapaniyor"). settledKeyboardOpen only updates
+                // once the inset has stopped moving for a short debounce
+                // window, so anything that needs "was the keyboard
+                // really open" rather than "what is the inset doing
+                // right now this frame" reads this instead.
+                var settledKeyboardOpen by remember { mutableStateOf(false) }
+                LaunchedEffect(keyboardOpen) {
+                    delay(120)
+                    settledKeyboardOpen = keyboardOpen
+                }
                 var hiddenFieldFocused by remember { mutableStateOf(false) }
                 var textPageFieldFocused by remember { mutableStateOf(false) }
-                keyboardOpen = hiddenFieldFocused || textPageFieldFocused
+                // Titlebar "+" button state: whether the running-session
+                // picker popup (QuickAddSessionPickerDialog) is showing.
+                // See onQuickAddClicked below for why "+" opens this instead
+                // of calling viewModel.duplicateActiveSession() directly.
+                var showQuickAddPicker by remember { mutableStateOf(false) }
                 // CTRL/ALT on the virtual key bar were pure no-ops before -
                 // sendSequence was "" and nothing ever consumed them. They're
                 // one-shot modifiers: tap CTRL/ALT, then type a regular
@@ -331,7 +411,26 @@ class MainActivity : ComponentActivity() {
                             if (showTitlebar) {
                                 TerminatorTitleBar(
                                     onMenuClicked = { viewModel.setDrawerOpen(true) },
-                                    onQuickAddClicked = { viewModel.duplicateActiveSession() }
+                                    // "+" used to call duplicateActiveSession()
+                                    // straight away, silently cloning whatever
+                                    // session happened to be active with no
+                                    // confirmation - with several sessions
+                                    // open, that's often not the one the user
+                                    // actually meant to clone. Now it opens
+                                    // QuickAddSessionPickerDialog so the user
+                                    // picks which running session to clone.
+                                    // If nothing is running yet there's
+                                    // nothing to choose between, so it falls
+                                    // straight through to the old
+                                    // spawn-the-default-session behavior
+                                    // instead of popping up an empty list.
+                                    onQuickAddClicked = {
+                                        if (state.runningSessions.isNotEmpty()) {
+                                            showQuickAddPicker = true
+                                        } else {
+                                            viewModel.duplicateActiveSession()
+                                        }
+                                    }
                                 )
                             }
                         }
@@ -386,6 +485,29 @@ class MainActivity : ComponentActivity() {
                             // selection from a different session's screen can never linger.
                             var selectionStart by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
                             var selectionEnd by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
+                            // Snapshot of keyboardOpen taken the instant the
+                            // long-press selection starts (see that gesture
+                            // below), NOT read live inside the toolbar's
+                            // Copy/Paste/Cancel callbacks. Those buttons are
+                            // themselves focusable/clickable, so tapping any
+                            // one of them steals Compose focus away from the
+                            // hidden input field first - which flips
+                            // hiddenFieldFocused, and therefore keyboardOpen,
+                            // to false before (or racing with) the button's
+                            // own onClick actually running. Reading the live
+                            // keyboardOpen from inside onCopy/onPaste/onCancel
+                            // meant "was the keyboard open" was answered with
+                            // whatever that race happened to leave behind -
+                            // sometimes still true (falsely re-opening a
+                            // keyboard the user had left closed), sometimes
+                            // already flipped to false (failing to restore a
+                            // keyboard the user had open), rather than
+                            // reliably reflecting the state the user actually
+                            // left things in. This field is set once, before
+                            // the toolbar (and thus its focus-stealing
+                            // buttons) even exists, so it's immune to that
+                            // race.
+                            var keyboardWasOpenBeforeSelection by remember(activeSessionId) { mutableStateOf(false) }
                             val clipboardManager = LocalClipboardManager.current
 
                             // selectionStart/End are absolute (row, col) screen positions, not
@@ -399,8 +521,26 @@ class MainActivity : ComponentActivity() {
                             // where the user left it (nothing more prints once they've stopped
                             // and are just about to tap Copy), while a genuinely live-updating
                             // screen can't leave a stale, now-wrong highlight sitting around.
+                            //
+                            // Only clears while scrollOffset == 0 (looking at the live screen),
+                            // though - the original version cleared on every bufferVersion bump
+                            // regardless of scroll position, which meant a selection made in
+                            // scrollback (history that has already scrolled off and is frozen -
+                            // scrollOffset > 0) got wiped the instant the *live* screen at the
+                            // bottom changed at all, e.g. a background process printing a line or
+                            // the shell prompt's cursor moving, even though nothing about the
+                            // scrolled-back rows the user actually highlighted had moved. That's
+                            // what made the highlight disappear the moment the user started
+                            // scrolling to look at what they'd selected - ordinary background
+                            // terminal activity kept bumping bufferVersion out from under them.
+                            // Content changes on the live row range genuinely can still invalidate
+                            // a scrollback selection (e.g. the buffer growing enough to push
+                            // scrollback content off the top), but that shows up as scrollOffset
+                            // itself changing/clamping, which selectionStart/End tracking elsewhere
+                            // already accounts for - it doesn't need this effect to also react to
+                            // every bufferVersion bump while scrolled back.
                             LaunchedEffect(state.bufferVersion, activeSessionId) {
-                                if (selectionStart != null || selectionEnd != null) {
+                                if (state.scrollOffset == 0 && (selectionStart != null || selectionEnd != null)) {
                                     selectionStart = null
                                     selectionEnd = null
                                 }
@@ -479,6 +619,7 @@ class MainActivity : ComponentActivity() {
                                     columnsSetting.toInt().coerceAtLeast(1)
                                 }
                                 val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                Log.d("SelDebug", "applyResize: finalSize=$finalSize charWidth=$charWidth charHeight=$charHeight zoomActive=$zoomActive -> cols=$cols rws=$rws")
                                 viewModel.updateTerminalSize(cols, rws)
                             }
 
@@ -627,10 +768,28 @@ class MainActivity : ComponentActivity() {
                                                         // keeps typing available immediately after
                                                         // Copy/Paste/Cancel without the user having to
                                                         // tap the terminal again to bring it back.
-                                                        if (keyboardOpen) {
+                                                        //
+                                                        // This is also the one reliable place to record
+                                                        // whether the keyboard was open BEFORE the
+                                                        // selection toolbar appears - see
+                                                        // keyboardWasOpenBeforeSelection's own doc for
+                                                        // why the toolbar's Copy/Paste/Cancel callbacks
+                                                        // can't just read live keyboardOpen themselves.
+                                                        // Reads settledKeyboardOpen rather than the raw
+                                                        // live keyboardOpen: keyboardOpen can be mid-
+                                                        // animation at the exact instant the long-press
+                                                        // timer fires and briefly disagree with what's
+                                                        // actually on screen, which is what caused the
+                                                        // toolbar to occasionally restore/dismiss the
+                                                        // wrong keyboard state - see settledKeyboardOpen's
+                                                        // own doc above.
+                                                        keyboardWasOpenBeforeSelection = settledKeyboardOpen
+                                                        Log.d("KbDebug", "SELECTION START: keyboardOpen=$keyboardOpen settledKeyboardOpen=$settledKeyboardOpen hiddenFieldFocused=$hiddenFieldFocused -> captured keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
+                                                        if (settledKeyboardOpen) {
                                                             focusRequester.requestFocus()
                                                         }
                                                         val (charWidth, charHeight) = charMetrics
+                                                        Log.d("SelDebug", "SELECTION START: touch=(${lastPos.x},${lastPos.y}) charWidth=$charWidth charHeight=$charHeight liveZoomSize=$liveZoomSize sessionTextSize=$sessionTextSize effectiveTextSize=$effectiveTextSize bufferCols=${viewModel.activeBuffer()?.columns} bufferRows=${viewModel.activeBuffer()?.rows}")
                                                         if (charWidth > 0f && charHeight > 0f) {
                                                             val touchedRow = (lastPos.y / charHeight).toInt()
                                                             val touchedCol = (lastPos.x / charWidth).toInt()
@@ -855,6 +1014,7 @@ class MainActivity : ComponentActivity() {
                                                                         if (charWidth > 0f && charHeight > 0f && finalSize != null) {
                                                                             val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                                                             val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                                                            Log.d("SelDebug", "zoom-commit resize: finalSize=$finalSize charWidth=$charWidth charHeight=$charHeight newSize=$newSize -> cols=$cols rws=$rws")
                                                                             viewModel.updateTerminalSize(cols, rws)
                                                                         }
                                                                     }
@@ -984,6 +1144,23 @@ class MainActivity : ComponentActivity() {
                                         // what was just selected. Falls back to below the
                                         // selection when it starts too close to the top for the
                                         // toolbar to fit above it.
+                                        //
+                                        // Neither branch used to be clamped against this Box's
+                                        // own bounds, only computed from the selection's row -
+                                        // so a selection near row 0 (aboveY negative, falling
+                                        // through to the below-selection branch right at the
+                                        // top) could still land close enough to 0 to read as
+                                        // sitting under the titlebar above this Box, and a
+                                        // selection near the bottom of a tall/scrolled buffer
+                                        // could compute a y taller than the Box itself, pushing
+                                        // the toolbar down into the VirtualKeyBar/soft-keyboard
+                                        // area below - there was no barrier keeping either edge
+                                        // in bounds. Clamping y into
+                                        // [0, boxHeight - toolbarHeight - margin] using the same
+                                        // measured size the resize logic above already tracks
+                                        // (latestTerminalSize) keeps the toolbar fully inside
+                                        // the terminal's own area no matter where the selection
+                                        // sits.
                                         val (charWidth, charHeight) = charMetrics
                                         val localDensity = LocalDensity.current
                                         val toolbarOffset = if (charHeight > 0f) {
@@ -993,24 +1170,53 @@ class MainActivity : ComponentActivity() {
                                             val toolbarHeightPx = with(localDensity) { 44.dp.toPx() }
                                             val margin = with(localDensity) { 8.dp.toPx() }
                                             val aboveY = topRow * charHeight - toolbarHeightPx - margin
-                                            val y = if (aboveY >= 0f) {
+                                            val rawY = if (aboveY >= 0f) {
                                                 aboveY
                                             } else {
                                                 val bottomRow = maxOf(r1, r2)
                                                 (bottomRow + 1) * charHeight + margin
                                             }
+                                            val boxHeightPx = latestTerminalSize?.height?.toFloat()
+                                            val y = if (boxHeightPx != null && boxHeightPx > 0f) {
+                                                rawY.coerceIn(0f, (boxHeightPx - toolbarHeightPx - margin).coerceAtLeast(0f))
+                                            } else {
+                                                rawY.coerceAtLeast(0f)
+                                            }
                                             IntOffset(0, y.roundToInt())
                                         } else {
                                             IntOffset.Zero
                                         }
+                                        // Animates toward the target position instead of
+                                        // snapping there instantly - a selection dragged
+                                        // upward (bottom-to-top) moves topRow every frame,
+                                        // which used to move the toolbar in an instant jump
+                                        // each time rather than a smooth follow. Explicit short
+                                        // tween (not the ~300ms spring default) because the
+                                        // default duration was itself the problem reported
+                                        // after adding this: the toolbar visibly lagged behind
+                                        // and sat in its old (lower) position for a beat right
+                                        // as an upward drag finished, before catching up to
+                                        // where the selection actually ended. 80ms is fast
+                                        // enough to read as "keeping up with your finger"
+                                        // rather than "animating to a static target" while
+                                        // still smoothing out the per-frame jumps that made the
+                                        // original instant-snap version feel jerky.
+                                        val animatedToolbarOffset by animateIntOffsetAsState(
+                                            targetValue = toolbarOffset,
+                                            animationSpec = tween(durationMillis = 80),
+                                            label = "selectionToolbarOffset"
+                                        )
                                         SelectionToolbar(
                                             modifier = Modifier
                                                 .align(Alignment.TopStart)
-                                                .offset { toolbarOffset },
+                                                .offset { animatedToolbarOffset },
                                             onCopy = {
+                                                Log.d("KbDebug", "onCopy fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 val (r1, c1) = selectionStart!!
                                                 val (r2, c2) = selectionEnd!!
+                                                Log.d("SelDebug", "onCopy: raw selectionStart=($r1,$c1) selectionEnd=($r2,$c2) scrollOffset=${state.scrollOffset}")
                                                 val text = buffer?.selectedText(r1, c1, r2, c2, state.scrollOffset).orEmpty()
+                                                Log.d("SelDebug", "onCopy: copied text=[$text] length=${text.length}")
                                                 if (text.isNotEmpty()) {
                                                     clipboardManager.setText(AnnotatedString(text))
                                                 }
@@ -1023,14 +1229,77 @@ class MainActivity : ComponentActivity() {
                                                 // close itself right along with dismissing the
                                                 // selection, forcing the user to tap the terminal
                                                 // again just to keep typing after a Copy/Paste/
-                                                // Cancel. Re-requesting focus here (only when the
-                                                // keyboard was actually open before this) restores
-                                                // it immediately instead.
-                                                if (keyboardOpen) {
+                                                // Cancel. Restoring it here (only when the keyboard
+                                                // was actually open BEFORE the toolbar appeared -
+                                                // keyboardWasOpenBeforeSelection, not the live
+                                                // keyboardOpen this button's own tap just raced
+                                                // against and possibly already flipped) brings it
+                                                // back immediately instead, and - just as
+                                                // importantly - does nothing when the keyboard was
+                                                // already closed, so tapping Copy/Paste/Cancel can't
+                                                // spuriously pop the keyboard open on its own.
+                                                //
+                                                // requestFocus() alone is not reliable here: once
+                                                // the IME has genuinely finished hiding (which the
+                                                // toolbar's own focus-stealing tap can trigger),
+                                                // Compose focus moving back to a field does not
+                                                // reliably resurface it again - this is a
+                                                // well-documented Compose/IME gap, not specific to
+                                                // this field. Pairing the focus request with an
+                                                // explicit keyboardController.show() call is the
+                                                // documented workaround, and pairing hide() with a
+                                                // clearFocus() on the "was already closed" branch
+                                                // closes the other half of the same gap: without
+                                                // it, this field could still end up focused (it's
+                                                // the only focusable target once the toolbar's own
+                                                // buttons are gone) with nothing having told the
+                                                // system to actually show its keyboard - a state
+                                                // Android can resolve either way depending on
+                                                // what still holds an active input connection,
+                                                // which is what made "closed -> tap Copy/Paste/
+                                                // Cancel -> opens anyway" intermittent instead of
+                                                // consistently one behavior or the other.
+                                                //
+                                                // requestFocus() itself already fires its own IME
+                                                // show request the instant focus lands (visible in
+                                                // logcat as onRequestShow ... SHOW_SOFT_INPUT_BY_
+                                                // INSETS_API). Calling keyboardController.show()
+                                                // synchronously right after, in the same callback,
+                                                // fires a SECOND, independent show request
+                                                // (SHOW_SOFT_INPUT) before the first one has been
+                                                // dispatched - the platform then has two competing
+                                                // in-flight IME animation requests and cancels one
+                                                // against the other (onCancelled at
+                                                // PHASE_CLIENT_APPLY_ANIMATION / PHASE_CLIENT_
+                                                // ANIMATION_CANCEL), which is what actually produced
+                                                // the "sometimes shows, sometimes doesn't" behavior -
+                                                // not stale focus state. Moving the show() into its
+                                                // own post-frame callback lets the first (focus-
+                                                // driven) request be dispatched and let the
+                                                // animation system settle before the explicit show()
+                                                // fires, so the second call reinforces the first
+                                                // instead of racing it.
+                                                if (keyboardWasOpenBeforeSelection) {
                                                     focusRequester.requestFocus()
+                                                    // Deferred via view.post: requestFocus() above
+                                                    // already fires its own IME show request the
+                                                    // instant focus lands. Calling show() here
+                                                    // synchronously in the same callback used to fire
+                                                    // a second, independent show request before the
+                                                    // first was dispatched, and the platform would
+                                                    // cancel one against the other - see this
+                                                    // function's own doc above for the full story.
+                                                    // Posting this call lets the focus-driven request
+                                                    // be dispatched and the animation settle first, so
+                                                    // this one reinforces it instead of racing it.
+                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                } else {
+                                                    focusManager.clearFocus()
+                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
                                                 }
                                             },
                                             onPaste = {
+                                                Log.d("KbDebug", "onPaste fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 clipboardManager.getText()?.text?.let { pasted ->
                                                     if (pasted.isNotEmpty()) {
                                                         // Same CR/LF fixup applied to normal IME
@@ -1053,15 +1322,38 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 selectionStart = null
                                                 selectionEnd = null
-                                                if (keyboardOpen) {
+                                                // See onCopy's comment above for why this reads
+                                                // keyboardWasOpenBeforeSelection rather than the
+                                                // live keyboardOpen, and defers show() to the next
+                                                // frame rather than calling it synchronously right
+                                                // after requestFocus().
+                                                if (keyboardWasOpenBeforeSelection) {
                                                     focusRequester.requestFocus()
+                                                    // See onCopy's comment above for why this is
+                                                    // posted rather than called synchronously here.
+                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                } else {
+                                                    focusManager.clearFocus()
+                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
                                                 }
                                             },
                                             onCancel = {
+                                                Log.d("KbDebug", "onCancel fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 selectionStart = null
                                                 selectionEnd = null
-                                                if (keyboardOpen) {
+                                                // See onCopy's comment above for why this reads
+                                                // keyboardWasOpenBeforeSelection rather than the
+                                                // live keyboardOpen, and defers show() to the next
+                                                // frame rather than calling it synchronously right
+                                                // after requestFocus().
+                                                if (keyboardWasOpenBeforeSelection) {
                                                     focusRequester.requestFocus()
+                                                    // See onCopy's comment above for why this is
+                                                    // posted rather than called synchronously here.
+                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                } else {
+                                                    focusManager.clearFocus()
+                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
                                                 }
                                             }
                                         )
@@ -1245,6 +1537,7 @@ class MainActivity : ComponentActivity() {
                                             .focusRequester(focusRequester)
                                             .onFocusChanged {
                                                 hiddenFieldFocused = it.isFocused
+                                                Log.d("KbDebug", "hiddenField onFocusChanged: isFocused=${it.isFocused}")
                                                 // Collapsing back to the bare placeholder on focus
                                                 // regain (rather than after every keystroke) is a
                                                 // natural, infrequent point for the one content reset
@@ -1330,6 +1623,20 @@ class MainActivity : ComponentActivity() {
                                         },
                                         onTextSubmitted = { text -> viewModel.sendInput(text) },
                                         onTextFieldFocusChanged = { focused -> textPageFieldFocused = focused },
+                                        // See VirtualKeyBar's onTextEntryClosed doc for why this is
+                                        // needed - without it, swiping back to the key-rows page
+                                        // leaves no field focused and the real IME closes on its
+                                        // own, then flickers back open once focus lands here. Only
+                                        // restores when the keyboard was actually up before the
+                                        // swipe (settledKeyboardOpen, same reasoning as
+                                        // keyboardWasOpenBeforeSelection above), and defers the
+                                        // explicit show() the same way onCopy/onPaste/onCancel do.
+                                        onTextEntryClosed = {
+                                            if (settledKeyboardOpen) {
+                                                focusRequester.requestFocus()
+                                                currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                            }
+                                        },
                                         onKeyPressed = { key ->
                                             when (key) {
                                                 VirtualKey.CTRL -> ctrlActive = !ctrlActive
@@ -1421,6 +1728,22 @@ class MainActivity : ComponentActivity() {
                                 onSetDefault = { viewModel.setDefault(it) },
                                 onDismissRequest = { viewModel.setDrawerOpen(false) }
                             )
+
+                            // Titlebar "+" popup - see onQuickAddClicked
+                            // above. AlertDialog already renders as a
+                            // centered popup with its own scrim, so this
+                            // needs no extra positioning/backdrop of its
+                            // own, unlike SessionDrawer's slide-in panel.
+                            if (showQuickAddPicker) {
+                                QuickAddSessionPickerDialog(
+                                    runningSessions = state.runningSessions,
+                                    onSessionPicked = { runtimeId ->
+                                        viewModel.duplicateSession(runtimeId)
+                                        showQuickAddPicker = false
+                                    },
+                                    onDismissRequest = { showQuickAddPicker = false }
+                                )
+                            }
                         }
                     }
                 }

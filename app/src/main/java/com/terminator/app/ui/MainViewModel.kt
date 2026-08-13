@@ -225,6 +225,24 @@ class MainViewModel(
         launchLiveSession(runtimeId = newRuntimeId(activeEntry.id), entry = activeEntry)
     }
 
+    /**
+     * Backs QuickAddSessionPickerDialog: spawns a fresh copy of whichever
+     * *specific* running session the user picked from that popup (by
+     * runtimeId), rather than always whatever happens to be active - see
+     * duplicateActiveSession's doc for the silent-clone-the-wrong-one bug
+     * this replaces "+" with. Falls back to duplicateActiveSession's normal
+     * default-session behavior if the given runtimeId isn't a live session
+     * anymore (e.g. it exited between the popup opening and the tap).
+     */
+    fun duplicateSession(runtimeId: String) {
+        val entry = liveEntries[runtimeId]
+        if (entry == null) {
+            duplicateActiveSession()
+            return
+        }
+        launchLiveSession(runtimeId = newRuntimeId(entry.id), entry = entry)
+    }
+
     /** Switches to an already-running instance without spawning anything new. */
     fun openRunningSession(runtimeId: String) {
         if (liveSessions[runtimeId]?.isAlive() == true) {

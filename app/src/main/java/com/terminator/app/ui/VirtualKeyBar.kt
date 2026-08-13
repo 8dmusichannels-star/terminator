@@ -45,12 +45,14 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -105,12 +107,23 @@ fun VirtualKeyBar(
     altActive: Boolean = false,
     // The hidden terminal input field loses focus the moment the user taps
     // into this bar's own long-text OutlinedTextField (a different IME
-    // connection takes over). MainActivity's "is the keyboard open" state
-    // was previously driven only by that hidden field's focus, so this
-    // exact tap made it flip to false and hid this entire bar mid-typing -
-    // the "basınca kayboluyor" bug. This callback lets the parent also
-    // treat focus on the text-entry page's own field as "keyboard open".
+    // connection takes over). Focus here doesn't drive MainActivity's "is
+    // the keyboard open" state directly anymore (that's WindowInsets.ime
+    // now - see its doc), but the toolbar's Copy/Paste/Cancel callbacks
+    // still need to know which field to send focus back to, so this
+    // callback keeps MainActivity informed of this field's focus for that
+    // purpose.
     onTextFieldFocusChanged: (Boolean) -> Unit = {},
+    // Mirrors the open-path's textFieldFocusRequester.requestFocus() call
+    // below, for the close path. Swiping back to the key-rows page removes
+    // the long-text OutlinedTextField (the only focused element) from
+    // composition without anything else claiming focus, so the real IME
+    // starts hiding on its own with no field to reopen it for - which is
+    // what surfaced as the keyboard flickering shut and reopening by
+    // itself right after a swipe-back ("kendi kendine kaybolup geri
+    // geliyor"). The caller uses this to hand focus straight back to the
+    // hidden terminal input field instead of leaving it unclaimed.
+    onTextEntryClosed: () -> Unit = {},
     // Settings > Keyboard > "Keyboard shortcuts & keymapper" entries. Each
     // one was previously saved to disk and never surfaced anywhere - tapping
     // its chip here is what actually sends its key combo to the terminal.
@@ -122,6 +135,27 @@ fun VirtualKeyBar(
     var textEntryValue by remember { mutableStateOf("") }
     val scrollState = rememberScrollState()
     val revealThresholdPx = with(androidx.compose.ui.platform.LocalDensity.current) { 56.dp.toPx() }
+    // Requests focus on the text-entry field every time the page opens -
+    // see the LaunchedEffect below for why this exists.
+    val textFieldFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+    // Opening the text page via swipe never itself focused the field it
+    // just revealed - only an explicit tap on the OutlinedTextField did.
+    // Without an input connection, the system has no reason to show the
+    // IME, so MainActivity's keyboardOpen (now driven by the real
+    // WindowInsets.ime inset rather than focus tracking - see its own doc)
+    // correctly read false right after a swipe-reopen, and this whole
+    // bar's visibility (keyed on keyboardOpen) hid the page it had just
+    // shown - the "sola cevirib tekrar geri dondugunde keyboard kendi
+    // kendine kayboluyor" bug. Explicitly requesting focus on every open
+    // gives the field an input connection immediately, so the system
+    // actually has something to show a keyboard for.
+    LaunchedEffect(textEntryOpen) {
+        if (textEntryOpen) {
+            textFieldFocusRequester.requestFocus()
+        } else {
+            onTextEntryClosed()
+        }
+    }
 
     Column(
         modifier = modifier
@@ -170,9 +204,39 @@ fun VirtualKeyBar(
                                 onDragStart = { overscroll = 0f },
                                 onHorizontalDrag = { change, delta ->
                                     change.consume()
+                                    // dispatchRawDelta(-delta) is what makes a
+                                    // right-finger-drag (delta > 0) reveal keys
+                                    // further to the LEFT of the row and a
+                                    // left-finger-drag (delta < 0) reveal keys
+                                    // further to the RIGHT - the normal
+                                    // "drag content under your finger" mapping
+                                    // any horizontalScroll-backed row uses. Once
+                                    // already scrolled all the way to that right
+                                    // edge (atEnd), continuing to drag further in
+                                    // that same reveal-more-to-the-right
+                                    // direction - i.e. still dragging LEFT,
+                                    // delta < 0 - has nothing left to scroll to,
+                                    // so that's the natural point to treat it as
+                                    // "swipe past the end" and accumulate
+                                    // overscroll toward opening the text page.
+                                    // This used to check delta > 0 (a
+                                    // right-finger-drag) instead, which is the
+                                    // opposite direction from the one that
+                                    // actually runs out of row to scroll -
+                                    // dragging right at atEnd just re-scrolls
+                                    // back toward the start (always available,
+                                    // so overscroll could never accumulate),
+                                    // while the genuine "nothing left to scroll"
+                                    // drag (left) fell into the plain-scroll
+                                    // else branch and silently did nothing. It
+                                    // also made the open gesture point the
+                                    // opposite way from the text page's own
+                                    // close gesture below (drag < 0 to close),
+                                    // which is the inconsistent-feeling half of
+                                    // this bug.
                                     val atEnd = scrollState.value >= scrollState.maxValue
-                                    if (atEnd && delta > 0) {
-                                        overscroll += delta
+                                    if (atEnd && delta < 0) {
+                                        overscroll += -delta
                                     } else {
                                         overscroll = 0f
                                         scrollState.dispatchRawDelta(-delta)
@@ -260,6 +324,7 @@ fun VirtualKeyBar(
                         onValueChange = { textEntryValue = it },
                         modifier = Modifier
                             .weight(1f)
+                            .focusRequester(textFieldFocusRequester)
                             .onFocusChanged { onTextFieldFocusChanged(it.isFocused) },
                         placeholder = { Text("Type or paste text…") },
                         singleLine = true,

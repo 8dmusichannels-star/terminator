@@ -185,7 +185,19 @@ private fun DrawScope.drawTerminal(
         }
         val highlightColor = Color(0xFF4A90D9).copy(alpha = 0.45f)
         for (row in r1..r2) {
-            if (row !in 0 until buffer.rows) continue
+            // NOT `if (row !in 0 until buffer.rows) continue`. Same reason
+            // as TerminalBuffer.selectedText()'s matching loop (see its
+            // own doc): r1/r2 are screen-space rows meant to be resolved
+            // together with scrollOffset via buffer.lineAt(), and a
+            // selection's stationary endpoint can legitimately sit outside
+            // [0, buffer.rows) once auto-scroll-while-dragging has shifted
+            // scrollOffset underneath it. Filtering those rows out here
+            // used to truncate the highlight at the top/bottom edge of the
+            // visible screen even though selectedText() - once it also
+            // stopped filtering them - kept including that same text in
+            // what Copy actually produced, so the blue highlight and what
+            // got copied silently disagreed. buffer.lineAt() already
+            // bounds-checks internally, so there's nothing to guard here.
             val fromCol = (if (row == r1) c1 else 0).coerceIn(0, buffer.columns - 1)
             val rawToCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
 
