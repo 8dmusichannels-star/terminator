@@ -222,7 +222,30 @@ class TerminalBuffer(
         }
         val lines = mutableListOf<String>()
         for (row in r1..r2) {
-            if (row !in 0 until rows) continue
+            // NOT `if (row !in 0 until rows) continue`. r1/r2 are
+            // screen-space rows meant to be resolved together with
+            // scrollOffset via lineAt() - same contract lineAt's own doc
+            // describes. A selection's stationary endpoint can end up
+            // outside [0, rows) by design: MainActivity shifts it by the
+            // scroll delta every time auto-scroll-while-dragging changes
+            // scrollOffset underneath it, specifically so the selection
+            // keeps tracking the same *text* rather than silently
+            // relabeling itself to whatever now sits at the old row
+            // number - see that call site's own doc for why. A row
+            // outside [0, rows) here isn't invalid, it means "further
+            // into scrollback than the current viewport's top" (negative)
+            // or "further toward live output than the viewport's bottom"
+            // (>= rows) - both real, resolvable positions. Skipping them
+            // silently dropped exactly those rows from both what got
+            // highlighted AND what Copy actually produced, which is why
+            // dragging a selection past the top or bottom of the visible
+            // screen truncated the copied text at the edge instead of
+            // continuing to follow the finger. lineAt (and the cellAt it
+            // falls back to) already bounds-check internally and return a
+            // blank Cell for anything before scrollback's start or after
+            // the live grid's end, so calling it with an out-of-window
+            // row is always safe - there was never a need for this loop
+            // to pre-filter what lineAt can already handle.
             val fromCol = (if (row == r1) c1 else 0).coerceIn(0, columns - 1)
             val toCol = (if (row == r2) c2 else columns - 1).coerceIn(0, columns - 1)
             val sb = StringBuilder()

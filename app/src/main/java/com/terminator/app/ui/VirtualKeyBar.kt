@@ -114,6 +114,16 @@ fun VirtualKeyBar(
     // callback keeps MainActivity informed of this field's focus for that
     // purpose.
     onTextFieldFocusChanged: (Boolean) -> Unit = {},
+    // Mirrors the open-path's textFieldFocusRequester.requestFocus() call
+    // below, for the close path. Swiping back to the key-rows page removes
+    // the long-text OutlinedTextField (the only focused element) from
+    // composition without anything else claiming focus, so the real IME
+    // starts hiding on its own with no field to reopen it for - which is
+    // what surfaced as the keyboard flickering shut and reopening by
+    // itself right after a swipe-back ("kendi kendine kaybolup geri
+    // geliyor"). The caller uses this to hand focus straight back to the
+    // hidden terminal input field instead of leaving it unclaimed.
+    onTextEntryClosed: () -> Unit = {},
     // Settings > Keyboard > "Keyboard shortcuts & keymapper" entries. Each
     // one was previously saved to disk and never surfaced anywhere - tapping
     // its chip here is what actually sends its key combo to the terminal.
@@ -142,6 +152,8 @@ fun VirtualKeyBar(
     LaunchedEffect(textEntryOpen) {
         if (textEntryOpen) {
             textFieldFocusRequester.requestFocus()
+        } else {
+            onTextEntryClosed()
         }
     }
 
