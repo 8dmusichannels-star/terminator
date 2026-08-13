@@ -5,6 +5,12 @@ plugins {
 android {
     namespace = "com.terminator.app"
     compileSdk = 35
+
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
     defaultConfig {
         applicationId = "com.terminator.app"
         minSdk = 33
@@ -41,28 +47,17 @@ android {
     }
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             if (keystorePath != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
-        // Side-by-side dev builds: separate applicationId means this
-        // installs alongside the release APK on the same device instead of
-        // overwriting it (same applicationId would just replace whatever's
-        // currently installed). versionNameSuffix appends "-dev" to
-        // whatever defaultConfig.versionName is, so that string doesn't
-        // need to be hand-maintained separately from the release version.
-        // Applied directly to "debug" (not a separate build type) so CI's
-        // existing `gradle assembleDebug` step - and any local
-        // `./gradlew assembleDebug` / Android Studio "Debug" run config -
-        // already produces this, with nothing else needing to change.
         getByName("debug") {
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
         }
     }
     packaging {
-        // Universal + per-ABI splits handled in CI (see .github/workflows/build.yml)
         jniLibs {
             useLegacyPackaging = false
         }
@@ -76,12 +71,29 @@ android {
         }
     }
 }
-// Reproducible/third-party build support (e.g. F-Droid): when no keystore
-// secrets are present, we build an UNSIGNED release APK instead of failing.
-// CI (.github/workflows/build.yml) always provides KEYSTORE_PATH and
-// produces a signed release; this branch only triggers for builds run
-// outside that pipeline (F-Droid build server, local reproducibility
-// checks, third-party builders).
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            val abi = output.filters
+                .find { it.filterType.name == "ABI" }
+                ?.identifier
+
+            val abiCodes = mapOf(
+                "armeabi-v7a" to 1,
+                "arm64-v8a" to 2,
+                "x86" to 3,
+                "x86_64" to 4
+            )
+
+            if (abi != null) {
+                val baseVersionCode = output.versionCode.orNull ?: 0
+                output.versionCode.set(
+                    baseVersionCode * 10 + (abiCodes[abi] ?: 0)
+                )
+            }
+        }
+    }
+}
 tasks.matching { it.name == "assembleRelease" || it.name == "bundleRelease" }.configureEach {
     doFirst {
         if (System.getenv("KEYSTORE_PATH") == null) {
