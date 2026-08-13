@@ -20,17 +20,40 @@
 
 package com.terminator.emulator
 
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
 /**
  * TERMINATOR terminal-emulator module.
  *
  * Screen buffer holding characters, foreground/background color indices and
- * text attributes (bold, underline, inverse) for a fixed-size grid, plus an
- * unlimited scrollback log persisted by TerminalSession to a .history file.
+ * text attributes (bold, underline, inverse) for a fixed-size grid, plus a
+ * capped in-memory scrollback log (see MAX_SCROLLBACK_LINES) that's also
+ * persisted, uncapped, by TerminalSession to a .history file.
  *
  * Architecture is inspired by the VT100 model used by TermOne Plus
  * (Apache-2.0, gitlab.com/termapps/termoneplus), itself derived from
  * jackpal/Android-Terminal-Emulator. This is an independent Kotlin
  * implementation written for TERMINATOR, not a copy of that source.
+ *
+ * Thread safety: TerminalEmulator.append() mutates this buffer from the
+ * pty's dedicated reader thread (see TerminalSession.start), while
+ * TerminalView/Compose reads it from the UI thread on every recomposition
+ * (draw pass, selection, copy). Both sides go through this class's public
+ * methods, so a single lock here - rather than in either caller - is the
+ * one place that can cover every access. Without it, a fast-producing
+ * command (the classic repro is the `yes` command, which floods the pty
+ * with output as quickly as the shell can write it) drives the reader
+ * thread to mutate `grid`/`scrollback` many times a second while the UI
+ * thread is concurrently iterating those same arrays/deque to draw a
+ * frame - a race that surfaces as ArrayIndexOutOfBoundsException or
+ * ConcurrentModificationException and crashes the app. Ordinary keyboard
+ * typing almost never produces output fast enough to hit this window,
+ * which is why it reads as a `yes`-specific crash rather than a general
+ * one. The lock is a plain (non-fair) ReentrantLock: contention is brief
+ * (each method call is O(rows*columns) at worst, no I/O), and reentrancy
+ * matters because some of these methods call each other (e.g. lineAt ->
+ * cellAt, selectedText -> lineAt).
  */
 class TerminalBuffer(
     var columns: Int,
@@ -39,7 +62,30 @@ class TerminalBuffer(
     companion object {
         const val DEFAULT_FOREGROUND = 15 // ANSI bright white
         const val DEFAULT_BACKGROUND = 0  // ANSI black
+
+        // In-memory scrollback cap, in lines. The full history still lands
+        // on disk uncapped via TerminalSession's .history file - this only
+        // bounds what's kept live as Cell objects here. Without a cap, a
+        // fast-producing command (`yes` is the textbook repro: it floods
+        // the pty with a line at a time as fast as the shell can write,
+        // easily thousands of lines a second) pushes one more
+        // Array(columns){Cell()} onto `scrollback` per line, forever, for
+        // as long as the command keeps running - each ArrayDeque add is
+        // O(1) and the ReentrantLock below keeps it thread-safe, so
+        // nothing ever throws or blocks on that side, but the heap grows
+        // without bound until the process is OOM-killed. That's what
+        // actually crashes the app on `yes` even with the reader/UI race
+        // fixed: the race produced an exception on the spot, this produces
+        // an OutOfMemoryError a few seconds to a couple minutes in
+        // (depending on device memory) - long enough to read as "the
+        // terminal just crashes" rather than obviously being a leak.
+        // 10,000 lines is generous scrollback (Termux and most desktop
+        // terminals default in the low thousands) while keeping worst-case
+        // memory bounded regardless of how long a flooding command runs.
+        const val MAX_SCROLLBACK_LINES = 10_000
     }
+
+    private val lock = ReentrantLock()
 
     data class Cell(
         // A cell's on-screen content as a String rather than a single Char.
@@ -84,10 +130,10 @@ class TerminalBuffer(
     private var savedGrid: Array<Array<Cell>>? = null
     private var savedCursorRow = 0
     private var savedCursorCol = 0
-    val inAlternateScreen: Boolean get() = altGrid != null
+    val inAlternateScreen: Boolean get() = lock.withLock { altGrid != null }
 
-    fun enterAlternateScreen() {
-        if (altGrid != null) return
+    fun enterAlternateScreen() = lock.withLock {
+        if (altGrid != null) return@withLock
         savedGrid = grid
         savedCursorRow = cursorRow
         savedCursorCol = cursorCol
@@ -95,8 +141,8 @@ class TerminalBuffer(
         altGrid = grid
     }
 
-    fun exitAlternateScreen() {
-        val original = savedGrid ?: return
+    fun exitAlternateScreen() = lock.withLock {
+        val original = savedGrid ?: return@withLock
         grid = original
         cursorRow = savedCursorRow
         cursorCol = savedCursorCol
@@ -104,12 +150,15 @@ class TerminalBuffer(
         savedGrid = null
     }
 
-    // Unlimited scrollback - lines pushed off the top of the visible grid.
-    // Persisted incrementally to disk by TerminalSession (.history file).
+    // Scrollback, capped at MAX_SCROLLBACK_LINES - lines pushed off the top
+    // of the visible grid. Persisted incrementally and *without* this cap
+    // to disk by TerminalSession (.history file), so nothing is actually
+    // lost - only how much of it this class keeps as live objects.
     val scrollback: ArrayDeque<Array<Cell>> = ArrayDeque()
 
-    fun cellAt(row: Int, col: Int): Cell =
+    fun cellAt(row: Int, col: Int): Cell = lock.withLock {
         if (row in grid.indices && col in 0 until columns) grid[row][col] else Cell()
+    }
 
     /**
      * Reads a cell at a given scroll offset above the live grid - offset 0
@@ -122,14 +171,14 @@ class TerminalBuffer(
      * below), so "N lines back from the bottom of scrollback" is
      * `scrollback[scrollback.size - offset]`.
      */
-    fun lineAt(row: Int, col: Int, scrollOffset: Int): Cell {
-        if (scrollOffset <= 0) return cellAt(row, col)
+    fun lineAt(row: Int, col: Int, scrollOffset: Int): Cell = lock.withLock {
+        if (scrollOffset <= 0) return@withLock cellAt(row, col)
         val totalScrollback = scrollback.size
         // The visible window is `rows` lines tall. At scrollOffset, the
         // first `scrollOffset` visible rows come from the tail of
         // scrollback and the rest from the top of the live grid.
         val scrollbackRowsShown = scrollOffset.coerceAtMost(totalScrollback)
-        return if (row < scrollbackRowsShown) {
+        if (row < scrollbackRowsShown) {
             val idx = totalScrollback - scrollbackRowsShown + row
             scrollback.getOrNull(idx)?.getOrNull(col) ?: Cell()
         } else {
@@ -145,11 +194,12 @@ class TerminalBuffer(
      * most of the screen below the prompt is blank) onto the nearest real
      * text instead of silently selecting/copying nothing.
      */
-    fun lastNonBlankColumn(row: Int, scrollOffset: Int): Int? =
+    fun lastNonBlankColumn(row: Int, scrollOffset: Int): Int? = lock.withLock {
         (0 until columns).lastOrNull { col -> lineAt(row, col, scrollOffset).text != " " }
+    }
 
     /** How many lines are available to scroll back through right now. */
-    val maxScrollOffset: Int get() = scrollback.size
+    val maxScrollOffset: Int get() = lock.withLock { scrollback.size }
 
     /**
      * Plain text between two screen positions (row, col), as currently
@@ -162,7 +212,7 @@ class TerminalBuffer(
      * padding, not real content) but a run of spaces in the *middle* of a
      * line is preserved untouched. Multi-row selections are newline-joined.
      */
-    fun selectedText(startRow: Int, startCol: Int, endRow: Int, endCol: Int, scrollOffset: Int): String {
+    fun selectedText(startRow: Int, startCol: Int, endRow: Int, endCol: Int, scrollOffset: Int): String = lock.withLock {
         var r1 = startRow; var c1 = startCol
         var r2 = endRow; var c2 = endCol
         if (r1 > r2 || (r1 == r2 && c1 > c2)) {
@@ -181,23 +231,23 @@ class TerminalBuffer(
             }
             lines.add(sb.toString().trimEnd(' '))
         }
-        return lines.joinToString("\n")
+        lines.joinToString("\n")
     }
 
-    fun setCell(row: Int, col: Int, cell: Cell) {
+    fun setCell(row: Int, col: Int, cell: Cell) = lock.withLock {
         if (row in 0 until rows && col in 0 until columns) {
             grid[row][col] = cell
         }
     }
 
-    fun clearRow(row: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (row !in 0 until rows) return
+    fun clearRow(row: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (row !in 0 until rows) return@withLock
         for (c in 0 until columns) {
             grid[row][c] = Cell(bg = bg)
         }
     }
 
-    fun clearAll(bg: Int = DEFAULT_BACKGROUND) {
+    fun clearAll(bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
         for (r in 0 until rows) clearRow(r, bg)
     }
 
@@ -205,16 +255,24 @@ class TerminalBuffer(
      *  scrollback") and by plain CSI 2J when Settings > Terminal >
      *  "Clear always purges scrollback" is on. Leaves the live grid alone;
      *  callers that want a full clear call this alongside clearAll(). */
-    fun clearScrollback() {
+    fun clearScrollback() = lock.withLock {
         scrollback.clear()
     }
 
     /** Scrolls the grid up by one line, pushing the top line into scrollback
      *  (unless we're in the alternate screen, where scrolled-off content is
      *  throwaway rather than shell history). */
-    fun scrollUp() {
+    fun scrollUp() = lock.withLock {
         if (altGrid == null) {
             scrollback.addLast(grid[0])
+            // Drop from the front (oldest) once over the cap, same as any
+            // ring-buffer-style scrollback - see MAX_SCROLLBACK_LINES doc
+            // for why this exists at all. removeFirst() is O(1) on
+            // ArrayDeque, so this stays cheap even called once per line
+            // under a flooding command like `yes`.
+            while (scrollback.size > MAX_SCROLLBACK_LINES) {
+                scrollback.removeFirst()
+            }
         }
         for (r in 0 until rows - 1) {
             grid[r] = grid[r + 1]
@@ -224,8 +282,8 @@ class TerminalBuffer(
 
     /** Scrolls the region [top, bottom] (inclusive) up by one line without
      *  touching scrollback - used for scrolling-region-aware line feeds. */
-    fun scrollRegionUp(top: Int, bottom: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (top >= bottom || top !in 0 until rows || bottom !in 0 until rows) return
+    fun scrollRegionUp(top: Int, bottom: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (top >= bottom || top !in 0 until rows || bottom !in 0 until rows) return@withLock
         for (r in top until bottom) {
             grid[r] = grid[r + 1]
         }
@@ -236,7 +294,7 @@ class TerminalBuffer(
      *  margin) - bottom line is dropped, a blank line appears at the top.
      *  Never touches scrollback: RI only re-reveals a blank row, never
      *  "new" content, so there's nothing worth persisting. */
-    fun scrollDown(bg: Int = DEFAULT_BACKGROUND) {
+    fun scrollDown(bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
         for (r in rows - 1 downTo 1) {
             grid[r] = grid[r - 1]
         }
@@ -246,8 +304,8 @@ class TerminalBuffer(
     /** Scrolls the region [top, bottom] (inclusive) down by one line -
      *  the scrolling-region-aware counterpart of [scrollRegionUp], used for
      *  Reverse Index when a custom scroll region (DECSTBM) is active. */
-    fun scrollRegionDown(top: Int, bottom: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (top >= bottom || top !in 0 until rows || bottom !in 0 until rows) return
+    fun scrollRegionDown(top: Int, bottom: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (top >= bottom || top !in 0 until rows || bottom !in 0 until rows) return@withLock
         for (r in bottom downTo top + 1) {
             grid[r] = grid[r - 1]
         }
@@ -256,8 +314,8 @@ class TerminalBuffer(
 
     /** Inserts `count` blank lines at `row`, pushing lines down within
      *  [row, bottom] and dropping any that fall off the bottom. */
-    fun insertLines(row: Int, bottom: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (row !in 0 until rows || bottom !in row until rows) return
+    fun insertLines(row: Int, bottom: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (row !in 0 until rows || bottom !in row until rows) return@withLock
         var r = bottom
         while (r - count >= row) {
             grid[r] = grid[r - count]
@@ -271,8 +329,8 @@ class TerminalBuffer(
 
     /** Deletes `count` lines at `row`, pulling lines up within [row, bottom]
      *  and filling the vacated bottom rows with blanks. */
-    fun deleteLines(row: Int, bottom: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (row !in 0 until rows || bottom !in row until rows) return
+    fun deleteLines(row: Int, bottom: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (row !in 0 until rows || bottom !in row until rows) return@withLock
         var r = row
         while (r + count <= bottom) {
             grid[r] = grid[r + count]
@@ -286,8 +344,8 @@ class TerminalBuffer(
 
     /** Deletes `count` cells at (row, col), shifting the rest of the line
      *  left and filling the vacated right edge with blanks. */
-    fun deleteChars(row: Int, col: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (row !in 0 until rows) return
+    fun deleteChars(row: Int, col: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (row !in 0 until rows) return@withLock
         val line = grid[row]
         var c = col
         while (c + count < columns) {
@@ -302,8 +360,8 @@ class TerminalBuffer(
 
     /** Inserts `count` blank cells at (row, col), shifting the rest of the
      *  line right and dropping any that fall off the right edge. */
-    fun insertChars(row: Int, col: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) {
-        if (row !in 0 until rows) return
+    fun insertChars(row: Int, col: Int, count: Int, bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
+        if (row !in 0 until rows) return@withLock
         val line = grid[row]
         var c = columns - 1
         while (c - count >= col) {
@@ -317,7 +375,7 @@ class TerminalBuffer(
     }
 
     /** Resizes the grid, preserving existing content where possible. */
-    fun resize(newColumns: Int, newRows: Int) {
+    fun resize(newColumns: Int, newRows: Int) = lock.withLock {
         fun resized(g: Array<Array<Cell>>): Array<Array<Cell>> = Array(newRows) { r ->
             Array(newColumns) { c ->
                 if (r < rows && c < columns) g[r][c] else Cell()
@@ -344,8 +402,8 @@ class TerminalBuffer(
         cursorCol = cursorCol.coerceIn(0, columns - 1)
     }
 
-    fun rowText(row: Int): String {
-        if (row !in 0 until rows) return ""
-        return grid[row].joinToString(separator = "") { it.text }
+    fun rowText(row: Int): String = lock.withLock {
+        if (row !in 0 until rows) return@withLock ""
+        grid[row].joinToString(separator = "") { it.text }
     }
 }
