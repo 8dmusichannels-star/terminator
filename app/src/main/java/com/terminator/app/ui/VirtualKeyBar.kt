@@ -420,12 +420,17 @@ private fun FirstKeyRowWithMenuButton(
             }
             // Inserted right after ESC (before SLASH), matching the
             // TextButton keys around it in padding/size so it reads as
-            // "one of the keys" rather than a bolted-on extra. Previously
-            // this was a fixed-size IconButton (40dp/32dp touch target),
-            // which made it visibly bigger/more cramped than the
-            // TextButton keys sitting right next to it in the same
-            // SpaceEvenly row - swapped to a TextButton with the same
-            // content padding so it actually matches their footprint.
+            // "one of the keys" rather than a bolted-on extra. Was a
+            // fixed-size IconButton (40dp/32dp touch target) before, which
+            // was bigger than the TextButton keys around it. First attempt
+            // swapped to TextButton but sized the icon off fontSize.value
+            // treated as dp instead of sp - that's a much bigger number
+            // than intended (fontSize is ~14-16sp, but .value.dp reads that
+            // number as dp instead), so the icon came out oversized again,
+            // just via a different mistake. Sizing it as a plain fixed dp
+            // close to the surrounding text's actual rendered height (not
+            // derived from a unit mismatch) is what actually matches their
+            // footprint.
             if (key == VirtualKey.ESC) {
                 TextButton(
                     onClick = onMenuClicked,
@@ -437,7 +442,7 @@ private fun FirstKeyRowWithMenuButton(
                         Icons.Filled.Menu,
                         contentDescription = "Open sessions",
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(if (isLandscape) 14.sp.value.dp else fontSize.value.dp)
+                        modifier = Modifier.size(if (isLandscape) 14.dp else 18.dp)
                     )
                 }
             }

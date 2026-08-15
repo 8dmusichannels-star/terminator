@@ -62,7 +62,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntSize
@@ -249,18 +248,17 @@ class MainActivity : ComponentActivity() {
 
             TerminatorTheme(amoledBlack = amoledBlack) {
                 val state by viewModel.uiState.collectAsState()
-                val keyboardController = LocalSoftwareKeyboardController.current
-                // keyboardController.show()/hide() (LocalSoftwareKeyboardController) turned
-                // out unreliable specifically for the toolbar Copy/Paste/Cancel restore path -
-                // logcat confirmed keyboardWasOpenBeforeSelection was being captured and
-                // branched on correctly every time, but the on-screen result still came out
-                // backwards (open keyboard closing, closed keyboard opening) after calling
-                // keyboardController's show()/hide(). WindowInsetsControllerCompat talks to
-                // the same platform IME control surface this file already uses successfully
-                // for the status bar above, and is a lower-level, more direct call than the
-                // Compose IME abstraction - using it here for the keyboard too removes
-                // whatever layer between "we decided show" and "IME actually shows" was
-                // flipping the result.
+                // LocalSoftwareKeyboardController (Compose's IME abstraction) used to be
+                // read here and called from a couple of spots below, but it turned out
+                // unreliable for driving the keyboard specifically around the toolbar
+                // Copy/Paste/Cancel restore path and the plain tap-to-toggle path -
+                // logcat confirmed the *decision* of when to show/hide was always
+                // correct, but the on-screen result still came out backwards (open
+                // keyboard closing, closed keyboard opening, or flipping back a moment
+                // later). WindowInsetsControllerCompat (insetsController below) talks to
+                // the same platform IME control surface this file already uses
+                // successfully for the status bar, and is what every keyboard show/hide
+                // in this file now goes through instead - see insetsController's own doc.
                 val insetsController = remember {
                     WindowInsetsControllerCompat(window, window.decorView)
                 }
@@ -331,6 +329,28 @@ class MainActivity : ComponentActivity() {
                     delay(120)
                     settledKeyboardOpen = keyboardOpen
                 }
+                // Ground truth for "did WE just tell the keyboard to open or
+                // close", updated synchronously at every one of this file's
+                // own show()/hide() call sites (tap-to-toggle, Copy/Paste/
+                // Cancel, text-page close). settledKeyboardOpen above is a
+                // debounced *observation* of the animating IME inset - it's
+                // still needed for the very first long-press (nothing has
+                // told the keyboard to do anything yet, so there's no
+                // intent to read), but relying on it alone for every
+                // Copy/Paste/Cancel/tap-toggle in a row meant a long-press
+                // that landed while the previous debounce hadn't caught up
+                // yet (e.g. two Cancel taps close together, or a fast
+                // Cancel-then-reselect) could capture a stale snapshot from
+                // before the app's own most recent show()/hide() call -
+                // that's what made Cancel/Copy/Paste occasionally close the
+                // keyboard completely on a second press instead of
+                // restoring it. Reading this flag first, falling back to
+                // settledKeyboardOpen only when it's never been set, closes
+                // that gap: it can never be stale relative to this file's
+                // own actions because it's written in the same call that
+                // performs the action.
+                var lastKeyboardIntentOpen by remember { mutableStateOf<Boolean?>(null) }
+                fun effectiveKeyboardWasOpen(): Boolean = lastKeyboardIntentOpen ?: settledKeyboardOpen
                 var hiddenFieldFocused by remember { mutableStateOf(false) }
                 var textPageFieldFocused by remember { mutableStateOf(false) }
                 // Titlebar "+" button state: whether the running-session
@@ -874,9 +894,9 @@ class MainActivity : ComponentActivity() {
                                                         // toolbar to occasionally restore/dismiss the
                                                         // wrong keyboard state - see settledKeyboardOpen's
                                                         // own doc above.
-                                                        keyboardWasOpenBeforeSelection = settledKeyboardOpen
-                                                        Log.d("KbDebug", "SELECTION START: keyboardOpen=$keyboardOpen settledKeyboardOpen=$settledKeyboardOpen hiddenFieldFocused=$hiddenFieldFocused -> captured keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
-                                                        if (settledKeyboardOpen) {
+                                                        keyboardWasOpenBeforeSelection = effectiveKeyboardWasOpen()
+                                                        Log.d("KbDebug", "SELECTION START: keyboardOpen=$keyboardOpen settledKeyboardOpen=$settledKeyboardOpen lastKeyboardIntentOpen=$lastKeyboardIntentOpen hiddenFieldFocused=$hiddenFieldFocused -> captured keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
+                                                        if (keyboardWasOpenBeforeSelection) {
                                                             focusRequester.requestFocus()
                                                         }
                                                         val (charWidth, charHeight) = charMetrics
@@ -1025,34 +1045,32 @@ class MainActivity : ComponentActivity() {
                                                                 // applied delta (clamped to the buffer's
                                                                 // bounds, so it can be 0 even when
                                                                 // scrollLines isn't, e.g. already at the
-                                                                // top/bottom of scrollback). Without
-                                                                // shifting selectionStart/End's stored
-                                                                // rows by that same delta, this is
-                                                                // exactly what made the highlight appear
-                                                                // to jump backward while dragging toward
-                                                                // an edge: selectionStart/End are
-                                                                // screen-relative rows paired with
-                                                                // whatever scrollOffset was active when
-                                                                // they were captured (see their doc
-                                                                // comment above and TerminalBuffer.lineAt,
-                                                                // which both require row and scrollOffset
-                                                                // to be read together) - so the instant
-                                                                // scrollOffset moved out from under a
-                                                                // selection that had already anchored a
-                                                                // row, that stored row silently started
-                                                                // pointing at different buffer content,
-                                                                // even though the finger kept moving the
-                                                                // same direction. Shifting both endpoints
-                                                                // by the same applied delta keeps them
-                                                                // anchored to the actual text the user
-                                                                // was selecting, the same way scrolling a
-                                                                // native Android text view during
-                                                                // selection never changes what's selected,
-                                                                // only where it's drawn.
+                                                                // top/bottom of scrollback).
+                                                                //
+                                                                // Only selectionStart gets shifted here,
+                                                                // not selectionEnd. selectionStart was
+                                                                // anchored in an earlier frame (when the
+                                                                // long-press first landed) against
+                                                                // whatever scrollOffset was active then,
+                                                                // so it does need correcting when
+                                                                // scrollOffset moves out from under it -
+                                                                // same reasoning as the plain-scroll
+                                                                // branch below. selectionEnd is different:
+                                                                // it's freshly recomputed THIS SAME frame,
+                                                                // just above, straight from the finger's
+                                                                // raw position divided by the current
+                                                                // charHeight - it's already correct for
+                                                                // the current scrollOffset. Shifting it
+                                                                // again on top of that double-counted the
+                                                                // scroll, so every frame the edge-scroll
+                                                                // fired while the finger held still near
+                                                                // the edge, the highlight's far end kept
+                                                                // climbing away on its own - the finger
+                                                                // wasn't moving, but the stored row kept
+                                                                // incrementing anyway.
                                                                 val appliedDelta = viewModel.adjustScrollOffset(scrollLines)
                                                                 if (appliedDelta != 0) {
                                                                     selectionStart = selectionStart?.let { (r, c) -> (r + appliedDelta) to c }
-                                                                    selectionEnd = selectionEnd?.let { (r, c) -> (r + appliedDelta) to c }
                                                                 }
                                                             }
                                                         }
@@ -1167,12 +1185,32 @@ class MainActivity : ComponentActivity() {
                                                         selectionStart = null
                                                         selectionEnd = null
                                                     } else if (!moved && softKeyboardEnabled) {
+                                                        // Was keyboardController?.hide()/show() (the
+                                                        // Compose IME abstraction) - left over from
+                                                        // before the toolbar's Copy/Paste/Cancel
+                                                        // handlers were switched to
+                                                        // WindowInsetsControllerCompat below, for
+                                                        // exactly the same reason documented at their
+                                                        // call sites: keyboardController's show()/
+                                                        // hide() is unreliable here specifically,
+                                                        // producing the open-keyboard-closes/closed-
+                                                        // keyboard-opens-then-a-moment-later-flips-back
+                                                        // behavior. This plain tap-to-toggle path never
+                                                        // got migrated when the toolbar paths were, so
+                                                        // a tap on the terminal right after a Copy/
+                                                        // Paste/Cancel restore could still hit this
+                                                        // unreliable API and re-trigger the same bug a
+                                                        // moment later. Using insetsController here too
+                                                        // makes every keyboard show/hide in this file go
+                                                        // through the one API that's actually reliable.
                                                         if (keyboardOpen) {
-                                                            keyboardController?.hide()
                                                             focusManager.clearFocus()
+                                                            insetsController.hide(WindowInsetsCompat.Type.ime())
+                                                            lastKeyboardIntentOpen = false
                                                         } else {
                                                             focusRequester.requestFocus()
-                                                            keyboardController?.show()
+                                                            currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                            lastKeyboardIntentOpen = true
                                                         }
                                                     }
                                                 }
@@ -1280,14 +1318,50 @@ class MainActivity : ComponentActivity() {
                                             val topRow = minOf(r1, r2)
                                             val toolbarHeightPx = with(localDensity) { 44.dp.toPx() }
                                             val margin = with(localDensity) { 8.dp.toPx() }
+                                            val boxHeightPx = latestTerminalSize?.height?.toFloat()
                                             val aboveY = topRow * charHeight - toolbarHeightPx - margin
-                                            val rawY = if (aboveY >= 0f) {
-                                                aboveY
-                                            } else {
+                                            // Was: aboveY < 0 (not enough room above the
+                                            // selection's top row) always fell through to
+                                            // placing the toolbar BELOW the selection instead.
+                                            // That's fine while dragging top-to-bottom (topRow
+                                            // only grows, so this branch is only ever hit once,
+                                            // right at the very start), but dragging
+                                            // bottom-to-top makes topRow shrink every frame as
+                                            // the selection grows upward - and topRow can't go
+                                            // negative, so once it hit the screen's first
+                                            // visible row it stayed there while the drag kept
+                                            // going, meaning aboveY stayed negative and the
+                                            // toolbar kept re-committing to the below-selection
+                                            // branch every single frame instead of ever
+                                            // switching back above. That's what read as the
+                                            // toolbar "refusing" to move up and sitting stuck
+                                            // below. Clamping aboveY to 0 (pinning the toolbar
+                                            // to the very top of the terminal's own area) rather
+                                            // than falling back below fixes that: with less than
+                                            // a full toolbar's height of room above the
+                                            // selection, sitting flush against the top edge is
+                                            // still "above" in the way that matters (out of the
+                                            // way of the text being selected), and keeps
+                                            // tracking topRow the same way the below-selection
+                                            // branch already did before this fix, instead of
+                                            // jumping to a different anchor (the selection's
+                                            // bottom) that isn't moving the same way the drag is.
+                                            val rawY = if (boxHeightPx != null && boxHeightPx > 0f &&
+                                                aboveY < 0f && (topRow * charHeight) > boxHeightPx / 2f
+                                            ) {
+                                                // Selection's top row is in the LOWER half of the
+                                                // screen but still too close to some other edge
+                                                // for the toolbar to fit above it (e.g. a very
+                                                // short selection right under the titlebar isn't
+                                                // this case - topRow*charHeight here is checked
+                                                // against the box's own vertical center, not 0,
+                                                // specifically so a selection near row 0 doesn't
+                                                // land here) - genuinely better placed below.
                                                 val bottomRow = maxOf(r1, r2)
                                                 (bottomRow + 1) * charHeight + margin
+                                            } else {
+                                                aboveY.coerceAtLeast(0f)
                                             }
-                                            val boxHeightPx = latestTerminalSize?.height?.toFloat()
                                             val y = if (boxHeightPx != null && boxHeightPx > 0f) {
                                                 rawY.coerceIn(0f, (boxHeightPx - toolbarHeightPx - margin).coerceAtLeast(0f))
                                             } else {
@@ -1404,9 +1478,11 @@ class MainActivity : ComponentActivity() {
                                                     // be dispatched and the animation settle first, so
                                                     // this one reinforces it instead of racing it.
                                                     currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                    lastKeyboardIntentOpen = true
                                                 } else {
                                                     focusManager.clearFocus()
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
+                                                    lastKeyboardIntentOpen = false
                                                 }
                                             },
                                             onPaste = {
@@ -1443,9 +1519,11 @@ class MainActivity : ComponentActivity() {
                                                     // See onCopy's comment above for why this is
                                                     // posted rather than called synchronously here.
                                                     currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                    lastKeyboardIntentOpen = true
                                                 } else {
                                                     focusManager.clearFocus()
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
+                                                    lastKeyboardIntentOpen = false
                                                 }
                                             },
                                             onCancel = {
@@ -1462,9 +1540,11 @@ class MainActivity : ComponentActivity() {
                                                     // See onCopy's comment above for why this is
                                                     // posted rather than called synchronously here.
                                                     currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                    lastKeyboardIntentOpen = true
                                                 } else {
                                                     focusManager.clearFocus()
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
+                                                    lastKeyboardIntentOpen = false
                                                 }
                                             },
                                             // Fast clone: no popup, unlike the titlebar "+"
@@ -1750,6 +1830,7 @@ class MainActivity : ComponentActivity() {
                                             if (settledKeyboardOpen) {
                                                 focusRequester.requestFocus()
                                                 currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                lastKeyboardIntentOpen = true
                                             }
                                         },
                                         onKeyPressed = { key ->
