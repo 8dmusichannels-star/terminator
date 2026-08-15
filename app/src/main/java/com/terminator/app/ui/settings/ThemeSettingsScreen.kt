@@ -25,6 +25,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
@@ -127,14 +129,31 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
+        // Custom Palette mode alone renders 16 ANSI color rows plus presets
+        // and fg/bg fields - taller than the screen on most phones. The
+        // Column here previously had no scroll modifier at all, so once
+        // Custom Palette was selected the bottom of the list (Green and
+        // everything after it) was simply unreachable - fillMaxSize() just
+        // clipped it instead of allowing a scroll.
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
             SwitchRow("AMOLED Black", amoledBlack) {
                 scope.launch { repo.set(SettingsKeys.AMOLED_BLACK, it) }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
             Text("Terminal color scheme", style = MaterialTheme.typography.labelLarge)
-            listOf("Material", "No color", "Custom fg/bg", "Custom Palette", "Nord", "Import theme file").forEach { option ->
+            // "Nord" used to also be a standalone radio option here, but
+            // it had no dedicated behavior of its own - selecting it did
+            // nothing beyond the radio button changing, since it's really
+            // just one of the presets inside Custom Palette (see
+            // PaletteThemes.kt) and belongs there.
+            listOf("Material", "No color", "Custom fg/bg", "Custom Palette", "Import theme file").forEach { option ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = androidx.compose.ui.Alignment.CenterVertically

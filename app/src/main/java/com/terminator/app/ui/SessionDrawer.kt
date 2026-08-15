@@ -38,6 +38,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -81,6 +82,7 @@ fun SessionDrawer(
     onRunningSessionSelected: (String) -> Unit = {},
     onKillRunningSession: (String) -> Unit = {},
     onToggleWakeUpRunningSession: (String) -> Unit = {},
+    onCloneRunningSession: (String) -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -176,7 +178,8 @@ fun SessionDrawer(
                                 isActive = running.runtimeId == activeSessionId,
                                 onClick = { onRunningSessionSelected(running.runtimeId) },
                                 onKillClick = { onKillRunningSession(running.runtimeId) },
-                                onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) }
+                                onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) },
+                                onCloneClick = { onCloneRunningSession(running.runtimeId) }
                             )
                         }
                         item(key = "running-divider") {
@@ -237,7 +240,8 @@ private fun RunningSessionRow(
     isActive: Boolean,
     onClick: () -> Unit,
     onKillClick: () -> Unit = {},
-    onWakeUpClick: () -> Unit = {}
+    onWakeUpClick: () -> Unit = {},
+    onCloneClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -284,6 +288,17 @@ private fun RunningSessionRow(
                     color = Color(0xFFBF616A)
                 )
             }
+        }
+        // Clones this exact running session directly - no picker popup,
+        // unlike the titlebar "+" (QuickAddSessionPickerDialog) which asks
+        // which running session to duplicate. This one already knows: it's
+        // this row's own session.
+        IconButton(onClick = onCloneClick) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = "Clone session",
+                tint = Color.White.copy(alpha = 0.6f)
+            )
         }
         // Wake-up toggle: raises this session's background-survival
         // priority (see TerminatorApp.requestToggleWakeUp) without opening

@@ -420,17 +420,24 @@ private fun FirstKeyRowWithMenuButton(
             }
             // Inserted right after ESC (before SLASH), matching the
             // TextButton keys around it in padding/size so it reads as
-            // "one of the keys" rather than a bolted-on extra.
+            // "one of the keys" rather than a bolted-on extra. Previously
+            // this was a fixed-size IconButton (40dp/32dp touch target),
+            // which made it visibly bigger/more cramped than the
+            // TextButton keys sitting right next to it in the same
+            // SpaceEvenly row - swapped to a TextButton with the same
+            // content padding so it actually matches their footprint.
             if (key == VirtualKey.ESC) {
-                IconButton(
+                TextButton(
                     onClick = onMenuClicked,
-                    modifier = Modifier.size(if (isLandscape) 32.dp else 40.dp)
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        horizontal = 10.dp, vertical = verticalPadding
+                    )
                 ) {
                     Icon(
                         Icons.Filled.Menu,
                         contentDescription = "Open sessions",
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(if (isLandscape) 16.dp else 20.dp)
+                        modifier = Modifier.size(if (isLandscape) 14.sp.value.dp else fontSize.value.dp)
                     )
                 }
             }

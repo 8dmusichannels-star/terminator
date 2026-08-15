@@ -30,6 +30,8 @@ import androidx.compose.ui.platform.LocalContext
 
 // TERMINATOR base palette: flat black, no gradients/tint. A thin accent
 // color is used for selection/highlights only - everything else is black.
+// Used only as the pre-Android-12 fallback, where there's no Material You
+// wallpaper-derived palette to AMOLED-ify (see TerminatorTheme below).
 private val AccentBlue = Color(0xFF7EC8FF)
 private val FlatBlack = Color(0xFF000000)
 private val FlatBlackSurface = Color(0xFF0A0A0A) // barely-there separation for rows/dividers
@@ -55,15 +57,36 @@ fun TerminatorTheme(
     amoledBlack: Boolean = false,
     content: @Composable () -> Unit
 ) {
-    // Previously both branches were identical flat black, so this toggle
-    // did nothing regardless of what Settings > Theme > AMOLED Black was
-    // set to. Now: ON keeps the pure-black AMOLED scheme; OFF follows the
-    // device's Material You wallpaper-derived colors (Android 12+), with a
-    // plain dark scheme as the fallback on older versions.
+    // AMOLED Black is an *override* on top of Material You, not a
+    // replacement for it: it was previously a completely separate
+    // hardcoded palette (TerminatorFlatScheme), so turning it on threw
+    // away the device's wallpaper-derived colors entirely - accents,
+    // tints, everything went flat blue-on-black regardless of wallpaper.
+    // Now: on API 31+, AMOLED Black takes the real dynamic scheme and
+    // only pushes the neutrals (background/surface) to pure black,
+    // keeping every Material You hue (primary/secondary/tertiary/accents)
+    // intact - true "AMOLED-ified Material You" instead of a separate
+    // theme. OFF just uses the dynamic scheme untouched, exactly as the
+    // system provides it. Pre-Android-12 has no dynamic palette to work
+    // from, so both states fall back to the old hardcoded schemes there.
     val context = LocalContext.current
     val colorScheme = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val dynamic = dynamicDarkColorScheme(context)
+            if (amoledBlack) {
+                dynamic.copy(
+                    background = FlatBlack,
+                    onBackground = dynamic.onBackground,
+                    surface = FlatBlack,
+                    onSurface = dynamic.onSurface,
+                    surfaceVariant = FlatBlackSurface,
+                    onSurfaceVariant = dynamic.onSurfaceVariant
+                )
+            } else {
+                dynamic
+            }
+        }
         amoledBlack -> TerminatorFlatScheme
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicDarkColorScheme(context)
         else -> TerminatorDarkFallbackScheme
     }
     MaterialTheme(

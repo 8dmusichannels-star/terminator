@@ -1837,6 +1837,7 @@ class MainActivity : ComponentActivity() {
                                 onRunningSessionSelected = { viewModel.openRunningSession(it) },
                                 onKillRunningSession = { viewModel.killSession(it) },
                                 onToggleWakeUpRunningSession = { viewModel.toggleWakeUp(it) },
+                                onCloneRunningSession = { viewModel.duplicateSession(it) },
                                 onSettingsClicked = {
                                     startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                                 },
