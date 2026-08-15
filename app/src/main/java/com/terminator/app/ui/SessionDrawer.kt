@@ -27,6 +27,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -35,6 +36,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
@@ -44,8 +46,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -162,6 +168,11 @@ fun SessionDrawer(
                         ) { running ->
                             RunningSessionRow(
                                 running = running,
+                                // Session pictures are stored on the saved SessionEntry
+                                // (Settings > Sessions), not the RunningSession itself -
+                                // look it up by entryId so a running row shows the same
+                                // picture as its profile, if one was set.
+                                imageUri = sessions.firstOrNull { it.id == running.entryId }?.imageUri,
                                 isActive = running.runtimeId == activeSessionId,
                                 onClick = { onRunningSessionSelected(running.runtimeId) },
                                 onKillClick = { onKillRunningSession(running.runtimeId) },
@@ -222,6 +233,7 @@ fun SessionDrawer(
 @Composable
 private fun RunningSessionRow(
     running: RunningSession,
+    imageUri: String? = null,
     isActive: Boolean,
     onClick: () -> Unit,
     onKillClick: () -> Unit = {},
@@ -235,6 +247,26 @@ private fun RunningSessionRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (!imageUri.isNullOrBlank()) {
+            val context = LocalContext.current
+            val bitmap = remember(imageUri) {
+                runCatching {
+                    context.contentResolver.openInputStream(android.net.Uri.parse(imageUri))
+                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                }.getOrNull()
+            }
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+            }
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 running.label,

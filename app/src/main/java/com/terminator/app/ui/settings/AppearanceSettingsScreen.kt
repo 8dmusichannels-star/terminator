@@ -69,6 +69,7 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
     }
     val textSize by repo.flow(SettingsKeys.TEXT_SIZE, 14f).collectAsState(initial = 14f)
     val columns by repo.flow(SettingsKeys.COLUMNS, 80f).collectAsState(initial = 80f)
+    val zoomEnabled by repo.flow(SettingsKeys.ZOOM_ENABLED, true).collectAsState(initial = true)
     val blurAlpha by repo.flow(SettingsKeys.BLUR_ALPHA, 0.3f).collectAsState(initial = 0.3f)
     val wallpaperUri by repo.flow(SettingsKeys.WALLPAPER_URI, "").collectAsState(initial = "")
 
@@ -159,6 +160,22 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
                 onValueChange = { scope.launch { repo.set(SettingsKeys.COLUMNS, it) } },
                 valueRange = 40f..200f
             )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Pinch to zoom", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Two-finger pinch resizes the terminal text live. " +
+                            "Turn off to only change size via the slider above.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = zoomEnabled,
+                    onCheckedChange = { scope.launch { repo.set(SettingsKeys.ZOOM_ENABLED, it) } }
+                )
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
             Text("Background blur + alpha: ${(blurAlpha * 100).toInt()}%")

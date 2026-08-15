@@ -20,10 +20,15 @@
 
 package com.terminator.app.ui.settings
 
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
@@ -32,6 +37,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.terminator.app.TerminatorApp
@@ -173,6 +181,26 @@ private fun SessionSettingsRow(
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (!session.imageUri.isNullOrBlank()) {
+            val context = LocalContext.current
+            val bitmap = remember(session.imageUri) {
+                runCatching {
+                    context.contentResolver.openInputStream(android.net.Uri.parse(session.imageUri))
+                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                }.getOrNull()
+            }
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+            }
+        }
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -228,6 +256,28 @@ private fun AddSessionDialog(
     // the session's own history directory, same as before this existed.
     var workingDirectory by remember { mutableStateOf(existing?.workingDirectory ?: "") }
     var useRoot by remember { mutableStateOf(existing?.useRoot ?: false) }
+    // Optional session picture - see SessionEntry.imageUri's doc. Purely
+    // cosmetic, never required to save a session.
+    var imageUri by remember { mutableStateOf(existing?.imageUri ?: "") }
+    val context = LocalContext.current
+
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Same as AppearanceSettingsScreen's wallpaper picker - some
+                // providers don't support persistable permissions, the Uri
+                // still works for this session, just won't survive reboot.
+            }
+            imageUri = uri.toString()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -240,6 +290,36 @@ private fun AddSessionDialog(
                     label = { Text("Session name") },
                     modifier = Modifier.fillMaxWidth()
                 )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text("Session picture (optional)", style = MaterialTheme.typography.labelLarge)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (imageUri.isNotBlank()) {
+                        val bitmap = remember(imageUri) {
+                            runCatching {
+                                context.contentResolver.openInputStream(android.net.Uri.parse(imageUri))
+                                    ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                            }.getOrNull()
+                        }
+                        bitmap?.let {
+                            Image(
+                                bitmap = it.asImageBitmap(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(CircleShape)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                    }
+                    TextButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) {
+                        Text(if (imageUri.isBlank()) "Choose picture" else "Change")
+                    }
+                    if (imageUri.isNotBlank()) {
+                        TextButton(onClick = { imageUri = "" }) { Text("Remove") }
+                    }
+                }
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text("Session type", style = MaterialTheme.typography.labelLarge)
@@ -305,7 +385,8 @@ private fun AddSessionDialog(
                     filePath = filePath.ifBlank { null },
                     fileName = fileName.ifBlank { null },
                     workingDirectory = workingDirectory.ifBlank { null },
-                    useRoot = useRoot
+                    useRoot = useRoot,
+                    imageUri = imageUri.ifBlank { null }
                 )
                 onSave(entry)
             }) { Text("Save") }

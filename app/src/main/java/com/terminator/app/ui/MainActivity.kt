@@ -164,6 +164,24 @@ class MainActivity : ComponentActivity() {
                 .collectAsState(initial = "Material")
             val customFg by repo.flow(SettingsKeys.CUSTOM_FG, DEFAULT_CUSTOM_FG).collectAsState(initial = DEFAULT_CUSTOM_FG)
             val customBg by repo.flow(SettingsKeys.CUSTOM_BG, DEFAULT_CUSTOM_BG).collectAsState(initial = DEFAULT_CUSTOM_BG)
+            // Settings > Theme > "Override ANSI colors too" and "Separate
+            // error/status colors" - see TerminalPalette.materialOverride()/
+            // withStatusColors() for what each actually changes.
+            val materialColorOverride by repo.flow(SettingsKeys.MATERIAL_COLOR_OVERRIDE, false)
+                .collectAsState(initial = false)
+            val statusColorsEnabled by repo.flow(SettingsKeys.STATUS_COLORS_ENABLED, false)
+                .collectAsState(initial = false)
+            val statusErrorColor by repo.flow(
+                SettingsKeys.STATUS_ERROR_COLOR,
+                com.terminator.app.ui.settings.DEFAULT_STATUS_ERROR
+            ).collectAsState(initial = com.terminator.app.ui.settings.DEFAULT_STATUS_ERROR)
+            val statusWarningColor by repo.flow(
+                SettingsKeys.STATUS_WARNING_COLOR,
+                com.terminator.app.ui.settings.DEFAULT_STATUS_WARNING
+            ).collectAsState(initial = com.terminator.app.ui.settings.DEFAULT_STATUS_WARNING)
+            // Settings > Appearance > "Pinch to zoom". On by default -
+            // matches the gesture's previous always-on behaviour.
+            val zoomEnabled by repo.flow(SettingsKeys.ZOOM_ENABLED, true).collectAsState(initial = true)
             val fontFamilySetting by repo.flow(SettingsKeys.FONT_FAMILY, "Monospace").collectAsState(initial = "Monospace")
             val bellEnabled by repo.flow(SettingsKeys.BELL_ENABLED, true).collectAsState(initial = true)
             val useCustomSound by repo.flow(SettingsKeys.USE_CUSTOM_SOUND, false).collectAsState(initial = false)
@@ -386,18 +404,49 @@ class MainActivity : ComponentActivity() {
                 // scheme, instead of always rendering flatBlack() regardless
                 // of what was picked there.
                 val materialColors = MaterialTheme.colorScheme
-                val terminalPalette = remember(colorSchemeMode, customFg, customBg, materialColors) {
-                    when (colorSchemeMode) {
+                val terminalPalette = remember(
+                    colorSchemeMode, customFg, customBg, materialColors,
+                    materialColorOverride, statusColorsEnabled, statusErrorColor, statusWarningColor
+                ) {
+                    val basePalette = when (colorSchemeMode) {
                         "Nord" -> TerminalPalette.nord()
                         // Imported theme files are parsed straight into CUSTOM_FG/CUSTOM_BG
                         // (see ThemeSettingsScreen), so this now actually reflects what was
                         // imported instead of silently falling back to flatBlack().
                         "Custom RGB", "Import theme file" ->
                             TerminalPalette.custom(foreground = customFg, background = customBg)
-                        else -> TerminalPalette.custom(
-                            foreground = materialColors.onBackground.toArgb(),
-                            background = materialColors.background.toArgb()
-                        )
+                        // "Material" mode: normally just fills fg/bg from the Material
+                        // scheme (custom()), leaving the 16 ANSI accent colors fixed.
+                        // With materialColorOverride on, the ANSI slots themselves are
+                        // also derived from Material - see materialOverride()'s doc for
+                        // why LS_COLORS/program-set colors are only touched in that case.
+                        else -> if (materialColorOverride) {
+                            TerminalPalette.materialOverride(
+                                primary = materialColors.primary.toArgb(),
+                                error = materialColors.error.toArgb(),
+                                tertiary = materialColors.tertiary.toArgb(),
+                                secondary = materialColors.secondary.toArgb(),
+                                onBackground = materialColors.onBackground.toArgb(),
+                                background = materialColors.background.toArgb(),
+                                primaryContainer = materialColors.primaryContainer.toArgb(),
+                                errorContainer = materialColors.errorContainer.toArgb(),
+                                tertiaryContainer = materialColors.tertiaryContainer.toArgb(),
+                                secondaryContainer = materialColors.secondaryContainer.toArgb()
+                            )
+                        } else {
+                            TerminalPalette.custom(
+                                foreground = materialColors.onBackground.toArgb(),
+                                background = materialColors.background.toArgb()
+                            )
+                        }
+                    }
+                    // Layered on top of whichever base palette was just picked - see
+                    // Settings > Theme > "Separate error/status colors". Independent
+                    // of colorSchemeMode/materialColorOverride by design.
+                    if (statusColorsEnabled) {
+                        basePalette.withStatusColors(statusErrorColor, statusWarningColor)
+                    } else {
+                        basePalette
                     }
                 }
 
@@ -411,6 +460,14 @@ class MainActivity : ComponentActivity() {
                             if (showTitlebar) {
                                 TerminatorTitleBar(
                                     onMenuClicked = { viewModel.setDrawerOpen(true) },
+                                    // Purely cosmetic - see SessionEntry.imageUri's doc.
+                                    // activeSessionId here is a runtimeId, so resolve it
+                                    // to the RunningSession's entryId first, then look up
+                                    // that entry's own picture (if any) from state.sessions.
+                                    activeSessionImageUri = state.runningSessions
+                                        .firstOrNull { it.runtimeId == state.activeSessionId }
+                                        ?.let { running -> state.sessions.firstOrNull { it.id == running.entryId } }
+                                        ?.imageUri,
                                     // "+" used to call duplicateActiveSession()
                                     // straight away, silently cloning whatever
                                     // session happened to be active with no
@@ -970,11 +1027,15 @@ class MainActivity : ComponentActivity() {
                                                         continue
                                                     }
 
-                                                    if (pointerCount >= 2) {
+                                                    if (pointerCount >= 2 && zoomEnabled) {
                                                         // Pinch: two (or more) fingers down -
                                                         // compute zoom from the ratio of current
                                                         // to previous distance between the first
-                                                        // two pointers.
+                                                        // two pointers. Gated on Settings >
+                                                        // Appearance > "Pinch to zoom" - when off,
+                                                        // this whole branch is skipped so a second
+                                                        // finger touching down doesn't resize text,
+                                                        // it just falls through untouched.
                                                         val p1 = changes.getOrNull(0)
                                                         val p2 = changes.getOrNull(1)
                                                         if (p1 != null && p2 != null) {
@@ -1680,7 +1741,8 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                             }
-                                        }
+                                        },
+                                        onMenuClicked = { viewModel.setDrawerOpen(true) }
                                     )
                                 }
                             }

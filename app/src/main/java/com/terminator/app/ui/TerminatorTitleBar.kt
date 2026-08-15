@@ -20,6 +20,9 @@
 
 package com.terminator.app.ui
 
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Menu
@@ -30,7 +33,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 
 /**
  * Typical titlebar: hamburger (opens the session drawer, same as swipe
@@ -41,10 +51,45 @@ import androidx.compose.ui.graphics.Color
 @Composable
 fun TerminatorTitleBar(
     onMenuClicked: () -> Unit,
-    onQuickAddClicked: () -> Unit
+    onQuickAddClicked: () -> Unit,
+    // Optional picture from the active session's SessionEntry.imageUri -
+    // see that field's doc. Purely cosmetic: when null/blank, the titlebar
+    // renders exactly as before (just the hamburger + centered title).
+    // Reflecting it here is opt-in in the sense that it only shows up at
+    // all if the user bothered to set a picture on the session in
+    // Settings > Sessions - nothing forces every session to have one.
+    activeSessionImageUri: String? = null
 ) {
     TopAppBar(
-        title = { Text("TERMINATOR") },
+        title = {
+            if (!activeSessionImageUri.isNullOrBlank()) {
+                val context = LocalContext.current
+                val bitmap = remember(activeSessionImageUri) {
+                    runCatching {
+                        context.contentResolver.openInputStream(android.net.Uri.parse(activeSessionImageUri))
+                            ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                    }.getOrNull()
+                }
+                if (bitmap != null) {
+                    androidx.compose.foundation.layout.Row(
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.size(28.dp).clip(CircleShape)
+                        )
+                        androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
+                        Text("TERMINATOR")
+                    }
+                } else {
+                    Text("TERMINATOR")
+                }
+            } else {
+                Text("TERMINATOR")
+            }
+        },
         navigationIcon = {
             IconButton(onClick = onMenuClicked) {
                 Icon(Icons.Filled.Menu, contentDescription = "Open sessions")

@@ -57,6 +57,22 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
     var importError by remember { mutableStateOf<String?>(null) }
     var importedFileName by remember { mutableStateOf<String?>(null) }
 
+    // "Material color override" - see TerminalPalette.materialOverride()'s
+    // doc. Only meaningful while colorSchemeMode == "Material"; shown
+    // regardless so the setting isn't silently lost if the user switches
+    // modes and back.
+    val materialColorOverride by repo.flow(SettingsKeys.MATERIAL_COLOR_OVERRIDE, false)
+        .collectAsState(initial = false)
+
+    // Separate error/status colors - independent of colorSchemeMode /
+    // materialColorOverride, see TerminalPalette.withStatusColors()'s doc.
+    val statusColorsEnabled by repo.flow(SettingsKeys.STATUS_COLORS_ENABLED, false)
+        .collectAsState(initial = false)
+    val statusErrorColor by repo.flow(SettingsKeys.STATUS_ERROR_COLOR, DEFAULT_STATUS_ERROR)
+        .collectAsState(initial = DEFAULT_STATUS_ERROR)
+    val statusWarningColor by repo.flow(SettingsKeys.STATUS_WARNING_COLOR, DEFAULT_STATUS_WARNING)
+        .collectAsState(initial = DEFAULT_STATUS_WARNING)
+
     // Accepts either:
     //  - simple "key=value" lines, e.g. foreground=#E6E6E6 / background=#000000
     //  - or a small JSON object, e.g. {"foreground":"#E6E6E6","background":"#000000"}
@@ -149,9 +165,105 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
             }
+
+            if (colorSchemeMode == "Material") {
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Override ANSI colors too", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Off: Material only fills in text/background for " +
+                                "colorless output - a program's own red/green/blue " +
+                                "etc. still render as-is. On: Material's palette is " +
+                                "also mapped onto every ANSI color, so program output " +
+                                "picks up Material's hues too.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = materialColorOverride,
+                        onCheckedChange = { scope.launch { repo.set(SettingsKeys.MATERIAL_COLOR_OVERRIDE, it) } }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Separate error/status colors", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Independent of the color scheme above. When on, ANSI " +
+                            "red is pinned to the error color and ANSI yellow to " +
+                            "the status color below, no matter which theme is active.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = statusColorsEnabled,
+                    onCheckedChange = { scope.launch { repo.set(SettingsKeys.STATUS_COLORS_ENABLED, it) } }
+                )
+            }
+            if (statusColorsEnabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                StatusColorEditor(
+                    errorHex = "#%06X".format(statusErrorColor and 0xFFFFFF),
+                    warningHex = "#%06X".format(statusWarningColor and 0xFFFFFF),
+                    onErrorChange = { hex ->
+                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_ERROR_COLOR, it) } }
+                    },
+                    onWarningChange = { hex ->
+                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_WARNING_COLOR, it) } }
+                    }
+                )
+            }
         }
     }
 }
+
+@Composable
+private fun StatusColorEditor(
+    errorHex: String,
+    warningHex: String,
+    onErrorChange: (String) -> Unit,
+    onWarningChange: (String) -> Unit
+) {
+    var errorText by remember(errorHex) { mutableStateOf(errorHex) }
+    var warningText by remember(warningHex) { mutableStateOf(warningHex) }
+
+    Column {
+        OutlinedTextField(
+            value = errorText,
+            onValueChange = {
+                errorText = it
+                onErrorChange(it)
+            },
+            label = { Text("Error color (hex, e.g. #FF5555)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedTextField(
+            value = warningText,
+            onValueChange = {
+                warningText = it
+                onWarningChange(it)
+            },
+            label = { Text("Status/warning color (hex, e.g. #F1C40F)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+/** ARGB int for #FF5555 - a readable default error red. */
+const val DEFAULT_STATUS_ERROR = 0xFFFF5555.toInt()
+
+/** ARGB int for #F1C40F - a readable default status/warning yellow. */
+const val DEFAULT_STATUS_WARNING = 0xFFF1C40F.toInt()
 
 @Composable
 private fun CustomRgbEditor(

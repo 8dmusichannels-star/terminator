@@ -53,6 +53,33 @@ object SettingsKeys {
     val CUSTOM_FG = intPreferencesKey("custom_fg")
     val CUSTOM_BG = intPreferencesKey("custom_bg")
 
+    // Theme > Material color override. Off (default): Material only fills
+    // in fg/bg for colorless output, same as before - any ANSI palette the
+    // running program sets (or CUSTOM_FG/CUSTOM_BG/Nord/imported themes)
+    // is left alone. On: Material's dynamic palette is also mapped onto
+    // the terminal's 16 ANSI slots, overriding whatever palette would
+    // otherwise apply - see TerminalPalette.materialOverride().
+    val MATERIAL_COLOR_OVERRIDE = booleanPreferencesKey("material_color_override")
+
+    // Theme > separate error/status colors, independent of whichever
+    // COLOR_SCHEME_MODE/MATERIAL_COLOR_OVERRIDE is active. When enabled,
+    // ANSI red (1/9, conventionally "error") and yellow (3/11,
+    // conventionally "warning/status") are pinned to these two RGB values
+    // regardless of what the rest of the palette resolves to.
+    val STATUS_COLORS_ENABLED = booleanPreferencesKey("status_colors_enabled")
+    val STATUS_ERROR_COLOR = intPreferencesKey("status_error_color")
+    val STATUS_WARNING_COLOR = intPreferencesKey("status_warning_color")
+
+    // Appearance > pinch-to-zoom on/off. On by default (existing
+    // behaviour). Off disables the two-finger pinch gesture entirely -
+    // font size then only changes via the Text Size slider.
+    val ZOOM_ENABLED = booleanPreferencesKey("zoom_enabled")
+
+    // Clipboard history: off by default. When on, every Copy (from the
+    // selection toolbar) is appended to a persisted log the user can
+    // export later via the runner toolbar's save icon.
+    val CLIPBOARD_HISTORY_ENABLED = booleanPreferencesKey("clipboard_history_enabled")
+
     // Sound
     val BELL_ENABLED = booleanPreferencesKey("bell_enabled")
     val USE_CUSTOM_SOUND = booleanPreferencesKey("use_custom_sound")

@@ -41,7 +41,16 @@ import android.graphics.Typeface
 class TerminalPalette(
     val ansiColors: IntArray, // 16 base colors, index -> ARGB int
     val defaultForeground: Int,
-    val defaultBackground: Int
+    val defaultBackground: Int,
+    // Independent of ansiColors/defaultForeground/defaultBackground above -
+    // see Settings > Theme > "Separate error/status colors". When non-null,
+    // these pin ANSI red (indices 1 and 9) and yellow (indices 3 and 11)
+    // to a fixed RGB regardless of what the rest of the palette resolves
+    // to (Material, Nord, custom RGB, imported theme...), so a program's
+    // own red/yellow SGR codes always read as "error"/"status" the same
+    // way even if the surrounding palette changes.
+    val statusErrorColor: Int? = null,
+    val statusWarningColor: Int? = null
 ) {
     fun resolve(index: Int): Int = when {
         // Index 15 doubles as "default foreground" (see TerminalBuffer.
@@ -54,9 +63,23 @@ class TerminalPalette(
         // do nothing. Mirrors the same special-casing already done for
         // DEFAULT_BACKGROUND (index 0) in drawTerminal() below.
         index == TerminalBuffer.DEFAULT_FOREGROUND -> defaultForeground
+        // Checked before the general ansiColors branch below so a pinned
+        // status color always wins over whatever red/yellow the active
+        // palette (Material override included) would otherwise resolve to.
+        statusErrorColor != null && (index == 1 || index == 9) -> statusErrorColor
+        statusWarningColor != null && (index == 3 || index == 11) -> statusWarningColor
         index in ansiColors.indices -> ansiColors[index]
         else -> defaultForeground
     }
+
+    /** Returns a copy with the same ansiColors/fg/bg but the given status
+     *  override colors applied (or cleared, if either is null) - lets the
+     *  caller layer Settings > Theme > "Separate error/status colors" on
+     *  top of whatever base palette (Material, Nord, Custom RGB, Material
+     *  override...) was already chosen, without duplicating that base
+     *  palette's own construction logic. */
+    fun withStatusColors(errorColor: Int?, warningColor: Int?): TerminalPalette =
+        TerminalPalette(ansiColors, defaultForeground, defaultBackground, errorColor, warningColor)
 
     companion object {
         /** A Nord-inspired default palette as a sane out-of-the-box theme. */
@@ -97,6 +120,58 @@ class TerminalPalette(
                 0xFF81A1C1.toInt(), 0xFFB48EAD.toInt(), 0xFF8FBCBB.toInt(), 0xFFECEFF4.toInt()
             )
             return TerminalPalette(colors, foreground, background)
+        }
+
+        /**
+         * Settings > Theme > "Material color override" toggle, ON state.
+         * Unlike [custom] (which only ever touches defaultForeground/
+         * defaultBackground and leaves the 16 ANSI accent colors fixed),
+         * this maps Material's own dynamic scheme onto all 16 ANSI slots -
+         * so a program's own SGR color codes (red, green, blue...) render
+         * in Material-derived hues too, instead of the fixed Nord-style
+         * accents every other mode keeps for readability. Whether this or
+         * [custom] is used for "Material" mode is decided by the caller
+         * reading MATERIAL_COLOR_OVERRIDE - this function only builds the
+         * palette, it doesn't read settings itself.
+         *
+         * Standard ANSI ordering: 0 black, 1 red, 2 green, 3 yellow,
+         * 4 blue, 5 magenta, 6 cyan, 7 white, 8-15 the bright variants.
+         * Material's tonal roles don't map 1:1 onto 8 hues, so this picks
+         * the closest-fitting role for each slot and derives the bright
+         * variant by leaning on the "inverse"/"container" counterpart
+         * Material already computes, rather than inventing new colors.
+         */
+        fun materialOverride(
+            primary: Int,
+            error: Int,
+            tertiary: Int,
+            secondary: Int,
+            onBackground: Int,
+            background: Int,
+            primaryContainer: Int,
+            errorContainer: Int,
+            tertiaryContainer: Int,
+            secondaryContainer: Int
+        ): TerminalPalette {
+            val colors = intArrayOf(
+                background,          // 0 black
+                error,                // 1 red
+                tertiary,             // 2 green (closest "positive" role Material exposes)
+                secondary,            // 3 yellow/status
+                primary,              // 4 blue
+                secondary,            // 5 magenta
+                tertiary,             // 6 cyan
+                onBackground,         // 7 white
+                background,           // 8 bright black
+                errorContainer,       // 9 bright red
+                tertiaryContainer,    // 10 bright green
+                secondaryContainer,   // 11 bright yellow
+                primaryContainer,     // 12 bright blue
+                secondaryContainer,   // 13 bright magenta
+                tertiaryContainer,    // 14 bright cyan
+                onBackground          // 15 bright white / default foreground
+            )
+            return TerminalPalette(colors, onBackground, background)
         }
     }
 }

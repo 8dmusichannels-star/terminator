@@ -36,6 +36,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -129,6 +130,13 @@ fun VirtualKeyBar(
     // its chip here is what actually sends its key combo to the terminal.
     keymaps: List<com.terminator.app.ui.settings.KeymapEntry> = emptyList(),
     onKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit = {},
+    // Opens the same session drawer as the titlebar hamburger / right-drag
+    // gesture (see MainActivity's onMenuClicked wiring). Placed right next
+    // to ESC on the key-rows page so the drawer is reachable without
+    // needing the titlebar to be visible or reaching across for the edge
+    // swipe - purely an extra entry point into the existing drawer, the
+    // drawer's own contents/behavior are untouched.
+    onMenuClicked: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var textEntryOpen by remember { mutableStateOf(false) }
@@ -251,23 +259,45 @@ fun VirtualKeyBar(
                             )
                         }
                 ) {
-                    VirtualKeyRow(row1, onKeyPressed, ctrlActive, altActive, scrollState)
-                    VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
-                    if (keymaps.isNotEmpty()) {
-                        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-                        Row(
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // Hamburger button: opens the same drawer as the titlebar's
+                        // own hamburger (onMenuClicked passes straight through to
+                        // viewModel.setDrawerOpen(true) in MainActivity) - doesn't
+                        // replace or restructure that menu, just gives it a second
+                        // entry point right next to ESC.
+                        IconButton(onClick = onMenuClicked) {
+                            Icon(
+                                Icons.Filled.Menu,
+                                contentDescription = "Open sessions",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            keymaps.forEach { entry ->
-                                TextButton(onClick = { onKeymapTriggered(entry) }) {
-                                    Text(
-                                        entry.name,
-                                        fontSize = 12.sp,
-                                        color = MaterialTheme.colorScheme.secondary
-                                    )
+                                .height(24.dp)
+                                .width(1.dp)
+                                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            VirtualKeyRow(row1, onKeyPressed, ctrlActive, altActive, scrollState)
+                            VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
+                            if (keymaps.isNotEmpty()) {
+                                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    keymaps.forEach { entry ->
+                                        TextButton(onClick = { onKeymapTriggered(entry) }) {
+                                            Text(
+                                                entry.name,
+                                                fontSize = 12.sp,
+                                                color = MaterialTheme.colorScheme.secondary
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
