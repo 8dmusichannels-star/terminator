@@ -62,13 +62,24 @@ fun TerminatorTheme(
     // hardcoded palette (TerminatorFlatScheme), so turning it on threw
     // away the device's wallpaper-derived colors entirely - accents,
     // tints, everything went flat blue-on-black regardless of wallpaper.
-    // Now: on API 31+, AMOLED Black takes the real dynamic scheme and
-    // only pushes the neutrals (background/surface) to pure black,
-    // keeping every Material You hue (primary/secondary/tertiary/accents)
-    // intact - true "AMOLED-ified Material You" instead of a separate
-    // theme. OFF just uses the dynamic scheme untouched, exactly as the
-    // system provides it. Pre-Android-12 has no dynamic palette to work
-    // from, so both states fall back to the old hardcoded schemes there.
+    //
+    // OFF = the dynamic scheme completely untouched, exactly as the
+    // system provides it (normal Material You).
+    //
+    // ON = every neutral/surface slot pushed to pure black - not just
+    // background/surface/surfaceVariant like before, which left
+    // surfaceContainer/surfaceContainerHigh/surfaceContainerHighest (cards,
+    // dialogs, menus, the settings list's own row backgrounds) and
+    // inverseSurface sitting at Material You's dark-gray tones instead of
+    // true black, so "AMOLED Black" only affected part of the screen and
+    // the rest stayed visibly dark-gray. Every hue slot (primary/
+    // secondary/tertiary/error and their on-/container pairs, all of
+    // which Material You actually derives from the wallpaper) is left
+    // alone either way - AMOLED Black only ever touches neutrals, never
+    // the accent colors that make it "Material You" in the first place.
+    //
+    // Pre-Android-12 has no dynamic palette to work from, so both states
+    // fall back to the old hardcoded schemes there.
     val context = LocalContext.current
     val colorScheme = when {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
@@ -76,11 +87,18 @@ fun TerminatorTheme(
             if (amoledBlack) {
                 dynamic.copy(
                     background = FlatBlack,
-                    onBackground = dynamic.onBackground,
                     surface = FlatBlack,
-                    onSurface = dynamic.onSurface,
                     surfaceVariant = FlatBlackSurface,
-                    onSurfaceVariant = dynamic.onSurfaceVariant
+                    surfaceBright = FlatBlackSurface,
+                    surfaceDim = FlatBlack,
+                    surfaceContainer = FlatBlackSurface,
+                    surfaceContainerLow = FlatBlack,
+                    surfaceContainerLowest = FlatBlack,
+                    surfaceContainerHigh = FlatBlackSurface,
+                    surfaceContainerHighest = FlatBlackSurface,
+                    inverseSurface = Color(0xFFE6E6E6),
+                    inverseOnSurface = FlatBlack,
+                    scrim = Color.Black
                 )
             } else {
                 dynamic

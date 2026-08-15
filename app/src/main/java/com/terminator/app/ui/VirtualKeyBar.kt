@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalMinimumInteractiveComponentEnforcement
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -88,7 +89,10 @@ enum class VirtualKey(val label: String, val sendSequence: String) {
     LEFT("←", "\u001B[D"),
     DOWN("↓", "\u001B[B"),
     RIGHT("→", "\u001B[C"),
-    PGDN("PGDN", "\u001B[6~")
+    PGDN("PGDN", "\u001B[6~"),
+    // Not on any mobile IME (only CTRL/ALT/DEL share that gap) - VT
+    // sequence for Insert, same tilde-terminated family as PGUP/PGDN.
+    INSERT("INS", "\u001B[2~")
 }
 
 private val row1 = listOf(
@@ -96,10 +100,11 @@ private val row1 = listOf(
     VirtualKey.UP, VirtualKey.END, VirtualKey.PGUP
 )
 private val row2 = listOf(
-    VirtualKey.TAB, VirtualKey.CTRL, VirtualKey.ALT, VirtualKey.LEFT,
+    VirtualKey.TAB, VirtualKey.INSERT, VirtualKey.CTRL, VirtualKey.ALT, VirtualKey.LEFT,
     VirtualKey.DOWN, VirtualKey.RIGHT, VirtualKey.PGDN
 )
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun VirtualKeyBar(
     onKeyPressed: (VirtualKey) -> Unit,
@@ -141,7 +146,6 @@ fun VirtualKeyBar(
 ) {
     var textEntryOpen by remember { mutableStateOf(false) }
     var textEntryValue by remember { mutableStateOf("") }
-    val scrollState = rememberScrollState()
     val revealThresholdPx = with(androidx.compose.ui.platform.LocalDensity.current) { 56.dp.toPx() }
     // Requests focus on the text-entry field every time the page opens -
     // see the LaunchedEffect below for why this exists.
@@ -201,53 +205,26 @@ fun VirtualKeyBar(
                     modifier = Modifier
                         .fillMaxWidth()
                         .pointerInput(Unit) {
-                            // Manual pan instead of Modifier.horizontalScroll: once
-                            // the row is at its scroll boundary, extra drag in that
-                            // direction accumulates as "overscroll" instead of being
-                            // silently absorbed - that overscroll is what swaps to
-                            // the text page. Normal scrolling and the swap gesture
-                            // share the same continuous drag.
+                            // Both key rows now always fit the full screen
+                            // width (see FirstKeyRowWithMenuButton's doc -
+                            // every key gets an equal weight() share of the
+                            // row instead of its own intrinsic width), so
+                            // there's no more "scrolled to the edge" state
+                            // to detect: there's nothing left to scroll to
+                            // reveal. Any leftward drag on this page is
+                            // already at that edge, so it goes straight
+                            // into accumulating overscroll toward opening
+                            // the text page - rightward drag just resets
+                            // it, same as before.
                             var overscroll = 0f
                             detectHorizontalDragGestures(
                                 onDragStart = { overscroll = 0f },
                                 onHorizontalDrag = { change, delta ->
                                     change.consume()
-                                    // dispatchRawDelta(-delta) is what makes a
-                                    // right-finger-drag (delta > 0) reveal keys
-                                    // further to the LEFT of the row and a
-                                    // left-finger-drag (delta < 0) reveal keys
-                                    // further to the RIGHT - the normal
-                                    // "drag content under your finger" mapping
-                                    // any horizontalScroll-backed row uses. Once
-                                    // already scrolled all the way to that right
-                                    // edge (atEnd), continuing to drag further in
-                                    // that same reveal-more-to-the-right
-                                    // direction - i.e. still dragging LEFT,
-                                    // delta < 0 - has nothing left to scroll to,
-                                    // so that's the natural point to treat it as
-                                    // "swipe past the end" and accumulate
-                                    // overscroll toward opening the text page.
-                                    // This used to check delta > 0 (a
-                                    // right-finger-drag) instead, which is the
-                                    // opposite direction from the one that
-                                    // actually runs out of row to scroll -
-                                    // dragging right at atEnd just re-scrolls
-                                    // back toward the start (always available,
-                                    // so overscroll could never accumulate),
-                                    // while the genuine "nothing left to scroll"
-                                    // drag (left) fell into the plain-scroll
-                                    // else branch and silently did nothing. It
-                                    // also made the open gesture point the
-                                    // opposite way from the text page's own
-                                    // close gesture below (drag < 0 to close),
-                                    // which is the inconsistent-feeling half of
-                                    // this bug.
-                                    val atEnd = scrollState.value >= scrollState.maxValue
-                                    if (atEnd && delta < 0) {
+                                    if (delta < 0) {
                                         overscroll += -delta
                                     } else {
                                         overscroll = 0f
-                                        scrollState.dispatchRawDelta(-delta)
                                     }
                                 },
                                 onDragEnd = {
@@ -259,22 +236,38 @@ fun VirtualKeyBar(
                             )
                         }
                 ) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        // Row 1 with the menu button inlined between ESC and
-                        // SLASH - same size/style as the other virtual keys,
-                        // replacing the old standalone hamburger section that
-                        // sat to the left of the whole bar (which read as
-                        // oversized next to the compact key rows). Opens the
-                        // same drawer as the titlebar's own hamburger.
+                    // Material3's TextButton enforces its own ~40dp minimum
+                    // touch target regardless of contentPadding, silently
+                    // re-padding a button back up to that floor even when
+                    // FirstKeyRowWithMenuButton/VirtualKeyRow ask for much
+                    // less - that's what made this whole bar stay bulky no
+                    // matter how far their own padding/font sizes were
+                    // shrunk. Disabling the enforcement for just this key
+                    // section lets those smaller sizes actually take
+                    // effect; every key here is still comfortably tappable,
+                    // just no longer padded out to a minimum meant for
+                    // sparser touch targets like a toolbar's icon buttons.
+                    androidx.compose.runtime.CompositionLocalProvider(
+                        LocalMinimumInteractiveComponentEnforcement provides false
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                        // Row1 has 8 columns (7 keys + MENU inlined between
+                        // ESC and SLASH). Row2 has 7 real keys but TAB
+                        // carries weight(2f) instead of 1f - so TAB alone
+                        // spans the same width as ESC+MENU combined, and
+                        // every key after it (CTRL, ALT, LEFT, DOWN, RIGHT,
+                        // PGDN) still lines up under its row1 counterpart
+                        // (SLASH, DASH, HOME, UP, END, PGUP) with zero
+                        // drift - without adding an invisible spacer
+                        // column or a separate menu row.
                         FirstKeyRowWithMenuButton(
                             keys = row1,
                             onKeyPressed = onKeyPressed,
                             ctrlActive = ctrlActive,
                             altActive = altActive,
-                            scrollState = scrollState,
                             onMenuClicked = onMenuClicked
                         )
-                        VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
+                        VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive)
                         if (keymaps.isNotEmpty()) {
                             HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
                             Row(
@@ -294,6 +287,7 @@ fun VirtualKeyBar(
                                 }
                             }
                         }
+                    }
                     }
                 }
             } else {
@@ -375,11 +369,9 @@ fun VirtualKeyBar(
 
 /**
  * Row 1 (ESC, /, —, HOME, ↑, END, PGUP) with a menu button inlined right
- * between ESC and SLASH, sized and styled like the surrounding keys instead
- * of as a separate oversized section. Everything else about the row -
- * scroll behavior, spacing, landscape sizing - matches [VirtualKeyRow]
- * exactly; this only exists because that function takes a flat
- * List<VirtualKey> with no injection point for a non-VirtualKey button.
+ * between ESC and SLASH, sized and styled like the surrounding keys. 8
+ * equal-weight columns total. See [VirtualKeyRow]'s doc for how row2
+ * mirrors this width with only 7 real keys, no spacer, no extra row.
  */
 @Composable
 private fun FirstKeyRowWithMenuButton(
@@ -387,18 +379,17 @@ private fun FirstKeyRowWithMenuButton(
     onKeyPressed: (VirtualKey) -> Unit,
     ctrlActive: Boolean,
     altActive: Boolean,
-    scrollState: androidx.compose.foundation.ScrollState,
     onMenuClicked: () -> Unit
 ) {
     val isLandscape = androidx.compose.ui.platform.LocalConfiguration.current.orientation ==
         android.content.res.Configuration.ORIENTATION_LANDSCAPE
-    val verticalPadding = if (isLandscape) 0.dp else 8.dp
-    val fontSize = if (isLandscape) 12.sp else MaterialTheme.typography.bodyMedium.fontSize
+    val verticalPadding = if (isLandscape) 0.dp else 4.dp
+    val fontSize = if (isLandscape) 11.sp else 13.sp
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .horizontalScroll(scrollState, enabled = false),
+            .padding(horizontal = 8.dp),
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {
         keys.forEach { key ->
@@ -406,43 +397,37 @@ private fun FirstKeyRowWithMenuButton(
             TextButton(
                 onClick = { onKeyPressed(key) },
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    horizontal = 10.dp, vertical = verticalPadding
+                    horizontal = 4.dp, vertical = verticalPadding
                 ),
-                modifier = Modifier.background(
-                    if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
-                )
+                modifier = Modifier
+                    .weight(1f)
+                    .background(
+                        if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
+                    )
             ) {
                 Text(
                     key.label,
                     fontSize = fontSize,
-                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary
+                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
+                    maxLines = 1
                 )
             }
-            // Inserted right after ESC (before SLASH), matching the
-            // TextButton keys around it in padding/size so it reads as
-            // "one of the keys" rather than a bolted-on extra. Was a
-            // fixed-size IconButton (40dp/32dp touch target) before, which
-            // was bigger than the TextButton keys around it. First attempt
-            // swapped to TextButton but sized the icon off fontSize.value
-            // treated as dp instead of sp - that's a much bigger number
-            // than intended (fontSize is ~14-16sp, but .value.dp reads that
-            // number as dp instead), so the icon came out oversized again,
-            // just via a different mistake. Sizing it as a plain fixed dp
-            // close to the surrounding text's actual rendered height (not
-            // derived from a unit mismatch) is what actually matches their
-            // footprint.
+            // Inlined right after ESC (before SLASH) - same weight/padding
+            // as the surrounding keys so it reads as "one of the keys",
+            // not a bolted-on extra.
             if (key == VirtualKey.ESC) {
                 TextButton(
                     onClick = onMenuClicked,
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                        horizontal = 10.dp, vertical = verticalPadding
-                    )
+                        horizontal = 4.dp, vertical = verticalPadding
+                    ),
+                    modifier = Modifier.weight(1f)
                 ) {
                     Icon(
                         Icons.Filled.Menu,
                         contentDescription = "Open sessions",
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(if (isLandscape) 14.dp else 18.dp)
+                        modifier = Modifier.size(if (isLandscape) 13.dp else 15.dp)
                     )
                 }
             }
@@ -455,21 +440,29 @@ private fun VirtualKeyRow(
     keys: List<VirtualKey>,
     onKeyPressed: (VirtualKey) -> Unit,
     ctrlActive: Boolean,
-    altActive: Boolean,
-    scrollState: androidx.compose.foundation.ScrollState
+    altActive: Boolean
 ) {
     // In landscape there's a lot less vertical room (titlebar + 2 key rows +
     // IME can easily eat most of the screen), so the two rows shrink down
     // instead of keeping the same tall portrait-sized buttons.
     val isLandscape = androidx.compose.ui.platform.LocalConfiguration.current.orientation ==
         android.content.res.Configuration.ORIENTATION_LANDSCAPE
-    val verticalPadding = if (isLandscape) 0.dp else 8.dp
-    val fontSize = if (isLandscape) 12.sp else MaterialTheme.typography.bodyMedium.fontSize
+    // Matches FirstKeyRowWithMenuButton's sizing - see that composable's
+    // doc for why these shrank from 8.dp/bodyMedium.
+    val verticalPadding = if (isLandscape) 0.dp else 4.dp
+    val fontSize = if (isLandscape) 11.sp else 13.sp
 
+    // Row1 has 8 weight(1f) columns (7 keys + MENU inlined after ESC).
+    // This row also has 8 real keys now (7 original + INSERT filling the
+    // slot that used to sit empty next to TAB), all weight(1f) too - equal
+    // column counts on both rows is what makes SpaceEvenly divide them
+    // into identical-width columns: TAB lands under ESC, INSERT under
+    // MENU, then CTRL/ALT/LEFT/DOWN/RIGHT/PGDN each land directly under
+    // SLASH/DASH/HOME/UP/END/PGUP with zero drift.
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .horizontalScroll(scrollState, enabled = false),
+            .padding(horizontal = 8.dp),
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {
         keys.forEach { key ->
@@ -480,16 +473,19 @@ private fun VirtualKeyRow(
             TextButton(
                 onClick = { onKeyPressed(key) },
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    horizontal = 10.dp, vertical = verticalPadding
+                    horizontal = 4.dp, vertical = verticalPadding
                 ),
-                modifier = Modifier.background(
-                    if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
-                )
+                modifier = Modifier
+                    .weight(1f)
+                    .background(
+                        if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
+                    )
             ) {
                 Text(
                     key.label,
                     fontSize = fontSize,
-                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary
+                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
+                    maxLines = 1
                 )
             }
         }
