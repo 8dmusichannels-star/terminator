@@ -22,6 +22,8 @@ package com.terminator.app.ui.settings
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -56,6 +58,16 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
     val customBg by repo.flow(SettingsKeys.CUSTOM_BG, DEFAULT_CUSTOM_BG).collectAsState(initial = DEFAULT_CUSTOM_BG)
     var importError by remember { mutableStateOf<String?>(null) }
     var importedFileName by remember { mutableStateOf<String?>(null) }
+
+    // "Custom Palette" mode - a real 16-slot termcolor palette, distinct
+    // from the plain CUSTOM_FG/CUSTOM_BG pair above. See PaletteThemes.kt.
+    val customPaletteColorsJson by repo.flow(SettingsKeys.CUSTOM_PALETTE_COLORS, "")
+        .collectAsState(initial = "")
+    val customPaletteFg by repo.flow(SettingsKeys.CUSTOM_PALETTE_FG, PalettePresets.default.foreground)
+        .collectAsState(initial = PalettePresets.default.foreground)
+    val customPaletteBg by repo.flow(SettingsKeys.CUSTOM_PALETTE_BG, PalettePresets.default.background)
+        .collectAsState(initial = PalettePresets.default.background)
+    val customPaletteColors = remember(customPaletteColorsJson) { decodePaletteColors(customPaletteColorsJson) }
 
     // "Material color override" - see TerminalPalette.materialOverride()'s
     // doc. Only meaningful while colorSchemeMode == "Material"; shown
@@ -122,7 +134,7 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
 
             Spacer(modifier = Modifier.height(16.dp))
             Text("Terminal color scheme", style = MaterialTheme.typography.labelLarge)
-            listOf("Material", "Custom RGB", "Nord", "Import theme file").forEach { option ->
+            listOf("Material", "No color", "Custom fg/bg", "Custom Palette", "Nord", "Import theme file").forEach { option ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
@@ -135,7 +147,16 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
                 }
             }
 
-            if (colorSchemeMode == "Custom RGB") {
+            if (colorSchemeMode == "No color") {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "Terminal keeps its own stable built-in colors - no " +
+                        "Material, status, or custom override is applied.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            if (colorSchemeMode == "Custom fg/bg") {
                 Spacer(modifier = Modifier.height(8.dp))
                 CustomRgbEditor(
                     foregroundHex = "#%06X".format(customFg and 0xFFFFFF),
@@ -145,6 +166,42 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
                     },
                     onBackgroundChange = { hex ->
                         parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.CUSTOM_BG, it) } }
+                    }
+                )
+            }
+
+            if (colorSchemeMode == "Custom Palette") {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "All 16 ANSI colors, defined individually - start from a " +
+                        "preset below or edit any slot directly.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                PalettePresetRow(
+                    onPresetSelected = { preset ->
+                        scope.launch {
+                            repo.set(SettingsKeys.CUSTOM_PALETTE_COLORS, encodePaletteColors(preset.colors))
+                            repo.set(SettingsKeys.CUSTOM_PALETTE_FG, preset.foreground)
+                            repo.set(SettingsKeys.CUSTOM_PALETTE_BG, preset.background)
+                        }
+                    }
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                CustomPaletteEditor(
+                    colors = customPaletteColors,
+                    foregroundHex = "#%06X".format(customPaletteFg and 0xFFFFFF),
+                    backgroundHex = "#%06X".format(customPaletteBg and 0xFFFFFF),
+                    onColorChange = { index, argb ->
+                        val next = customPaletteColors.copyOf()
+                        next[index] = argb
+                        scope.launch { repo.set(SettingsKeys.CUSTOM_PALETTE_COLORS, encodePaletteColors(next)) }
+                    },
+                    onForegroundChange = { hex ->
+                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.CUSTOM_PALETTE_FG, it) } }
+                    },
+                    onBackgroundChange = { hex ->
+                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.CUSTOM_PALETTE_BG, it) } }
                     }
                 )
             }
@@ -189,36 +246,43 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-            HorizontalDivider()
-            Spacer(modifier = Modifier.height(16.dp))
-            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Separate error/status colors", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "Independent of the color scheme above. When on, ANSI " +
-                            "red is pinned to the error color and ANSI yellow to " +
-                            "the status color below, no matter which theme is active.",
-                        style = MaterialTheme.typography.bodySmall
+            // "No color" means "leave the terminal's stable built-in colors
+            // completely untouched" - showing the status-color override
+            // section underneath would contradict that, so it's hidden
+            // (not just disabled) for this mode rather than letting the
+            // two settings quietly fight each other.
+            if (colorSchemeMode != "No color") {
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Separate error/status colors", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Independent of the color scheme above. When on, ANSI " +
+                                "red is pinned to the error color and ANSI yellow to " +
+                                "the status color below, no matter which theme is active.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = statusColorsEnabled,
+                        onCheckedChange = { scope.launch { repo.set(SettingsKeys.STATUS_COLORS_ENABLED, it) } }
                     )
                 }
-                Switch(
-                    checked = statusColorsEnabled,
-                    onCheckedChange = { scope.launch { repo.set(SettingsKeys.STATUS_COLORS_ENABLED, it) } }
-                )
-            }
-            if (statusColorsEnabled) {
-                Spacer(modifier = Modifier.height(8.dp))
-                StatusColorEditor(
-                    errorHex = "#%06X".format(statusErrorColor and 0xFFFFFF),
-                    warningHex = "#%06X".format(statusWarningColor and 0xFFFFFF),
-                    onErrorChange = { hex ->
-                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_ERROR_COLOR, it) } }
-                    },
-                    onWarningChange = { hex ->
-                        parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_WARNING_COLOR, it) } }
-                    }
-                )
+                if (statusColorsEnabled) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    StatusColorEditor(
+                        errorHex = "#%06X".format(statusErrorColor and 0xFFFFFF),
+                        warningHex = "#%06X".format(statusWarningColor and 0xFFFFFF),
+                        onErrorChange = { hex ->
+                            parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_ERROR_COLOR, it) } }
+                        },
+                        onWarningChange = { hex ->
+                            parseHexColor(hex)?.let { scope.launch { repo.set(SettingsKeys.STATUS_WARNING_COLOR, it) } }
+                        }
+                    )
+                }
             }
         }
     }
@@ -305,6 +369,75 @@ const val DEFAULT_CUSTOM_FG = 0xFFE6E6E6.toInt()
 
 /** ARGB int for #000000 - matches the previous flatBlack() default background. */
 const val DEFAULT_CUSTOM_BG = 0xFF000000.toInt()
+
+@Composable
+private fun PalettePresetRow(onPresetSelected: (com.terminator.app.ui.settings.NamedPalette) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PalettePresets.all.forEach { preset ->
+            OutlinedButton(onClick = { onPresetSelected(preset) }) {
+                Text(preset.name, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CustomPaletteEditor(
+    colors: IntArray,
+    foregroundHex: String,
+    backgroundHex: String,
+    onColorChange: (index: Int, argb: Int) -> Unit,
+    onForegroundChange: (String) -> Unit,
+    onBackgroundChange: (String) -> Unit
+) {
+    Column {
+        CustomRgbEditor(
+            foregroundHex = foregroundHex,
+            backgroundHex = backgroundHex,
+            onForegroundChange = onForegroundChange,
+            onBackgroundChange = onBackgroundChange
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        HorizontalDivider()
+        Spacer(modifier = Modifier.height(8.dp))
+        ANSI_SLOT_NAMES.forEachIndexed { index, label ->
+            var hexText by remember(colors[index]) {
+                mutableStateOf("#%06X".format(colors.getOrElse(index) { 0 } and 0xFFFFFF))
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(
+                            androidx.compose.ui.graphics.Color(colors.getOrElse(index) { 0 }),
+                            androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
+                        )
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Text(label, modifier = Modifier.width(110.dp), style = MaterialTheme.typography.bodyMedium)
+                OutlinedTextField(
+                    value = hexText,
+                    onValueChange = { text ->
+                        hexText = text
+                        parseHexColor(text)?.let { onColorChange(index, it) }
+                    },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
 
 /**
  * Parses a small theme file into (foreground, background) ARGB ints.

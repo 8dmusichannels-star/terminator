@@ -181,25 +181,27 @@ private fun SessionSettingsRow(
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (!session.imageUri.isNullOrBlank()) {
-            val context = LocalContext.current
-            val bitmap = remember(session.imageUri) {
+        // Only renders when the session actually has a picture set - no
+        // placeholder/initial circle is shown for sessions without one.
+        val context = LocalContext.current
+        val bitmap = remember(session.imageUri) {
+            session.imageUri?.takeIf { it.isNotBlank() }?.let { uri ->
                 runCatching {
-                    context.contentResolver.openInputStream(android.net.Uri.parse(session.imageUri))
+                    context.contentResolver.openInputStream(android.net.Uri.parse(uri))
                         ?.use { android.graphics.BitmapFactory.decodeStream(it) }
                 }.getOrNull()
             }
-            bitmap?.let {
-                Image(
-                    bitmap = it.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                )
-                Spacer(modifier = Modifier.width(12.dp))
-            }
+        }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
         }
         Column(
             modifier = Modifier

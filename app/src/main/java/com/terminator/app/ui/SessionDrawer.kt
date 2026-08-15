@@ -324,6 +324,29 @@ private fun SessionRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        // Only renders when the session actually has a picture set - no
+        // placeholder/initial circle is shown for sessions without one, so
+        // rows without a photo just skip straight to the name/star.
+        if (!session.imageUri.isNullOrBlank()) {
+            val context = LocalContext.current
+            val bitmap = remember(session.imageUri) {
+                runCatching {
+                    context.contentResolver.openInputStream(android.net.Uri.parse(session.imageUri))
+                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
+                }.getOrNull()
+            }
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+            }
+        }
         // combinedClickable lives ONLY on this column now, not on the
         // whole row. It was on the outer Row before, which meant its
         // press-gesture handling covered the star IconButton's area too -

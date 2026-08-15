@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -100,17 +101,19 @@ fun TerminatorTitleBar(
                 Icon(Icons.Filled.Add, contentDescription = "Quick session select")
             }
         },
-        // Material3's default TopAppBar tints its container with a translucent
-        // primary-color overlay ("tonal elevation") once the surface scrolls
-        // under it - that's the unwanted blue wash at the top of the window.
-        // Pin every state to flat black so the titlebar always matches the
-        // rest of the flat-black theme.
+        // Kept flat black - see the comment on `colors` below for why the
+        // container itself stays pinned. Text/icon color, however, now
+        // follows the active Material color scheme (onBackground) instead
+        // of a hardcoded Color.White, so it stays readable against
+        // whatever theme (including AMOLED/light variants of Material)
+        // the user has picked in Settings > Theme rather than assuming
+        // dark-on-black always applies.
         colors = TopAppBarDefaults.topAppBarColors(
             containerColor = Color.Black,
             scrolledContainerColor = Color.Black,
-            titleContentColor = Color.White,
-            navigationIconContentColor = Color.White,
-            actionIconContentColor = Color.White
+            titleContentColor = MaterialTheme.colorScheme.onBackground,
+            navigationIconContentColor = MaterialTheme.colorScheme.onBackground,
+            actionIconContentColor = MaterialTheme.colorScheme.onBackground
         )
     )
 }

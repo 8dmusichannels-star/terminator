@@ -48,6 +48,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -155,7 +156,8 @@ class MainActivity : ComponentActivity() {
 
             val amoledBlack by repo.flow(SettingsKeys.AMOLED_BLACK, false).collectAsState(initial = false)
             val wallpaperUriStr by repo.flow(SettingsKeys.WALLPAPER_URI, "").collectAsState(initial = "")
-            val blurAlpha by repo.flow(SettingsKeys.BLUR_ALPHA, 0.3f).collectAsState(initial = 0.3f)
+            val blurAlpha by repo.flow(SettingsKeys.BACKGROUND_ALPHA, 0.3f).collectAsState(initial = 0.3f)
+            val backgroundBlur by repo.flow(SettingsKeys.BACKGROUND_BLUR, 0f).collectAsState(initial = 0f)
             val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
             val virtualKeysEnabled by repo.flow(SettingsKeys.VIRTUAL_KEYS, true).collectAsState(initial = true)
             val softKeyboardEnabled by repo.flow(SettingsKeys.SOFT_KEYBOARD, true).collectAsState(initial = true)
@@ -164,6 +166,18 @@ class MainActivity : ComponentActivity() {
                 .collectAsState(initial = "Material")
             val customFg by repo.flow(SettingsKeys.CUSTOM_FG, DEFAULT_CUSTOM_FG).collectAsState(initial = DEFAULT_CUSTOM_FG)
             val customBg by repo.flow(SettingsKeys.CUSTOM_BG, DEFAULT_CUSTOM_BG).collectAsState(initial = DEFAULT_CUSTOM_BG)
+            // Settings > Theme > "Custom Palette" - all 16 ANSI slots, distinct
+            // from CUSTOM_FG/CUSTOM_BG above. See PaletteThemes.kt.
+            val customPaletteColorsJson by repo.flow(SettingsKeys.CUSTOM_PALETTE_COLORS, "")
+                .collectAsState(initial = "")
+            val customPaletteFg by repo.flow(
+                SettingsKeys.CUSTOM_PALETTE_FG,
+                com.terminator.app.ui.settings.PalettePresets.default.foreground
+            ).collectAsState(initial = com.terminator.app.ui.settings.PalettePresets.default.foreground)
+            val customPaletteBg by repo.flow(
+                SettingsKeys.CUSTOM_PALETTE_BG,
+                com.terminator.app.ui.settings.PalettePresets.default.background
+            ).collectAsState(initial = com.terminator.app.ui.settings.PalettePresets.default.background)
             // Settings > Theme > "Override ANSI colors too" and "Separate
             // error/status colors" - see TerminalPalette.materialOverride()/
             // withStatusColors() for what each actually changes.
@@ -406,14 +420,30 @@ class MainActivity : ComponentActivity() {
                 val materialColors = MaterialTheme.colorScheme
                 val terminalPalette = remember(
                     colorSchemeMode, customFg, customBg, materialColors,
-                    materialColorOverride, statusColorsEnabled, statusErrorColor, statusWarningColor
+                    materialColorOverride, statusColorsEnabled, statusErrorColor, statusWarningColor,
+                    customPaletteColorsJson, customPaletteFg, customPaletteBg
                 ) {
                     val basePalette = when (colorSchemeMode) {
                         "Nord" -> TerminalPalette.nord()
+                        // "No color": the terminal's own stable built-in
+                        // palette, completely untouched by Material/status/
+                        // custom overrides - see ThemeSettingsScreen's note
+                        // under this radio option.
+                        "No color" -> TerminalPalette.flatBlack()
+                        // "Custom Palette": all 16 ANSI slots individually
+                        // defined (see PaletteThemes.kt) - distinct from
+                        // "Custom fg/bg" below, which only varies fg/bg.
+                        "Custom Palette" -> TerminalPalette.fromPalette(
+                            colors = com.terminator.app.ui.settings.decodePaletteColors(customPaletteColorsJson),
+                            foreground = customPaletteFg,
+                            background = customPaletteBg
+                        )
                         // Imported theme files are parsed straight into CUSTOM_FG/CUSTOM_BG
                         // (see ThemeSettingsScreen), so this now actually reflects what was
-                        // imported instead of silently falling back to flatBlack().
-                        "Custom RGB", "Import theme file" ->
+                        // imported instead of silently falling back to flatBlack(). "Custom
+                        // RGB" is kept as an alias so a value persisted before the mode was
+                        // renamed to "Custom fg/bg" still resolves correctly.
+                        "Custom fg/bg", "Custom RGB", "Import theme file" ->
                             TerminalPalette.custom(foreground = customFg, background = customBg)
                         // "Material" mode: normally just fills fg/bg from the Material
                         // scheme (custom()), leaving the 16 ANSI accent colors fixed.
@@ -442,8 +472,12 @@ class MainActivity : ComponentActivity() {
                     }
                     // Layered on top of whichever base palette was just picked - see
                     // Settings > Theme > "Separate error/status colors". Independent
-                    // of colorSchemeMode/materialColorOverride by design.
-                    if (statusColorsEnabled) {
+                    // of colorSchemeMode/materialColorOverride by design, EXCEPT for
+                    // "No color" - that mode's whole point is untouched stable colors,
+                    // so a stale STATUS_COLORS_ENABLED=true from a previously-selected
+                    // mode (the UI hides this toggle for "No color", but doesn't clear
+                    // it) must not leak through here.
+                    if (statusColorsEnabled && colorSchemeMode != "No color") {
                         basePalette.withStatusColors(statusErrorColor, statusWarningColor)
                     } else {
                         basePalette
@@ -1164,7 +1198,23 @@ class MainActivity : ComponentActivity() {
                                                 bitmap = it.asImageBitmap(),
                                                 contentDescription = null,
                                                 contentScale = ContentScale.Crop,
-                                                modifier = Modifier.fillMaxSize().alpha(1f - blurAlpha)
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .alpha(1f - blurAlpha)
+                                                    // Real blur (Settings > Appearance >
+                                                    // "Background blur"), independent of
+                                                    // alpha above - a 0f value is a no-op
+                                                    // blur radius rather than skipping the
+                                                    // modifier, since RenderEffect.blur
+                                                    // requires a positive radius on some
+                                                    // API levels.
+                                                    .then(
+                                                        if (backgroundBlur > 0f) {
+                                                            Modifier.blur(radius = (backgroundBlur * 25).dp)
+                                                        } else {
+                                                            Modifier
+                                                        }
+                                                    )
                                             )
                                         }
                                     }
@@ -1416,7 +1466,11 @@ class MainActivity : ComponentActivity() {
                                                     focusManager.clearFocus()
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
                                                 }
-                                            }
+                                            },
+                                            // Fast clone: no popup, unlike the titlebar "+"
+                                            // (QuickAddSessionPickerDialog) - see
+                                            // SelectionToolbar's onCloneClicked doc.
+                                            onCloneClicked = { viewModel.duplicateActiveSession() }
                                         )
                                     }
 

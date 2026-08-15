@@ -47,6 +47,13 @@ fun SelectionToolbar(
     onCopy: () -> Unit,
     onPaste: () -> Unit,
     onCancel: () -> Unit,
+    // Optional "+" placed in front of Copy/Paste/Cancel. Unlike the
+    // titlebar's "+" (which opens QuickAddSessionPickerDialog so the user
+    // picks which running session to clone), this one is a fast path: no
+    // popup, tapping it clones whichever session is active right now. Null
+    // hides the button entirely, keeping every other caller of this
+    // toolbar unaffected.
+    onCloneClicked: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -54,6 +61,9 @@ fun SelectionToolbar(
             .clip(RoundedCornerShape(8.dp))
             .background(Color(0xFF262626)),
     ) {
+        if (onCloneClicked != null) {
+            ToolbarAction("+", onCloneClicked)
+        }
         ToolbarAction("Copy", onCopy)
         ToolbarAction("Paste", onPaste)
         ToolbarAction("Cancel", onCancel)

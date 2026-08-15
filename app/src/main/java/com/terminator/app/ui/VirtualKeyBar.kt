@@ -259,44 +259,37 @@ fun VirtualKeyBar(
                             )
                         }
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Hamburger button: opens the same drawer as the titlebar's
-                        // own hamburger (onMenuClicked passes straight through to
-                        // viewModel.setDrawerOpen(true) in MainActivity) - doesn't
-                        // replace or restructure that menu, just gives it a second
-                        // entry point right next to ESC.
-                        IconButton(onClick = onMenuClicked) {
-                            Icon(
-                                Icons.Filled.Menu,
-                                contentDescription = "Open sessions",
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .height(24.dp)
-                                .width(1.dp)
-                                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        // Row 1 with the menu button inlined between ESC and
+                        // SLASH - same size/style as the other virtual keys,
+                        // replacing the old standalone hamburger section that
+                        // sat to the left of the whole bar (which read as
+                        // oversized next to the compact key rows). Opens the
+                        // same drawer as the titlebar's own hamburger.
+                        FirstKeyRowWithMenuButton(
+                            keys = row1,
+                            onKeyPressed = onKeyPressed,
+                            ctrlActive = ctrlActive,
+                            altActive = altActive,
+                            scrollState = scrollState,
+                            onMenuClicked = onMenuClicked
                         )
-                        Column(modifier = Modifier.weight(1f)) {
-                            VirtualKeyRow(row1, onKeyPressed, ctrlActive, altActive, scrollState)
-                            VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
-                            if (keymaps.isNotEmpty()) {
-                                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    keymaps.forEach { entry ->
-                                        TextButton(onClick = { onKeymapTriggered(entry) }) {
-                                            Text(
-                                                entry.name,
-                                                fontSize = 12.sp,
-                                                color = MaterialTheme.colorScheme.secondary
-                                            )
-                                        }
+                        VirtualKeyRow(row2, onKeyPressed, ctrlActive, altActive, scrollState)
+                        if (keymaps.isNotEmpty()) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                keymaps.forEach { entry ->
+                                    TextButton(onClick = { onKeymapTriggered(entry) }) {
+                                        Text(
+                                            entry.name,
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.secondary
+                                        )
                                     }
                                 }
                             }
@@ -374,6 +367,71 @@ fun VirtualKeyBar(
                     }) {
                         Icon(Icons.Filled.Send, contentDescription = "Send text")
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Row 1 (ESC, /, —, HOME, ↑, END, PGUP) with a menu button inlined right
+ * between ESC and SLASH, sized and styled like the surrounding keys instead
+ * of as a separate oversized section. Everything else about the row -
+ * scroll behavior, spacing, landscape sizing - matches [VirtualKeyRow]
+ * exactly; this only exists because that function takes a flat
+ * List<VirtualKey> with no injection point for a non-VirtualKey button.
+ */
+@Composable
+private fun FirstKeyRowWithMenuButton(
+    keys: List<VirtualKey>,
+    onKeyPressed: (VirtualKey) -> Unit,
+    ctrlActive: Boolean,
+    altActive: Boolean,
+    scrollState: androidx.compose.foundation.ScrollState,
+    onMenuClicked: () -> Unit
+) {
+    val isLandscape = androidx.compose.ui.platform.LocalConfiguration.current.orientation ==
+        android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    val verticalPadding = if (isLandscape) 0.dp else 8.dp
+    val fontSize = if (isLandscape) 12.sp else MaterialTheme.typography.bodyMedium.fontSize
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(scrollState, enabled = false),
+        horizontalArrangement = Arrangement.SpaceEvenly
+    ) {
+        keys.forEach { key ->
+            val isActive = (key == VirtualKey.CTRL && ctrlActive) || (key == VirtualKey.ALT && altActive)
+            TextButton(
+                onClick = { onKeyPressed(key) },
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    horizontal = 10.dp, vertical = verticalPadding
+                ),
+                modifier = Modifier.background(
+                    if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
+                )
+            ) {
+                Text(
+                    key.label,
+                    fontSize = fontSize,
+                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary
+                )
+            }
+            // Inserted right after ESC (before SLASH), matching the
+            // TextButton keys around it in padding/size so it reads as
+            // "one of the keys" rather than a bolted-on extra.
+            if (key == VirtualKey.ESC) {
+                IconButton(
+                    onClick = onMenuClicked,
+                    modifier = Modifier.size(if (isLandscape) 32.dp else 40.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Menu,
+                        contentDescription = "Open sessions",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(if (isLandscape) 16.dp else 20.dp)
+                    )
                 }
             }
         }

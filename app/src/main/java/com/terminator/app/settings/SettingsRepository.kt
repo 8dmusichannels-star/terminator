@@ -44,7 +44,16 @@ object SettingsKeys {
     val FONT_URI = stringPreferencesKey("font_uri") // used when FONT_FAMILY == "Custom"
     val TEXT_SIZE = floatPreferencesKey("text_size")
     val COLUMNS = floatPreferencesKey("columns")
-    val BLUR_ALPHA = floatPreferencesKey("blur_alpha")
+    val BLUR_ALPHA = floatPreferencesKey("blur_alpha") // legacy key, kept for migration - see BACKGROUND_ALPHA
+    // Appearance > wallpaper background: alpha and blur are now two
+    // independent sliders instead of one value driving both. BACKGROUND_ALPHA
+    // controls how transparent the wallpaper/terminal background is;
+    // BACKGROUND_BLUR controls how blurred the wallpaper image itself is
+    // (0 = sharp, higher = blurrier). Both default to BLUR_ALPHA's old
+    // default (0.3) / no blur (0f) respectively so existing installs don't
+    // visually jump on upgrade.
+    val BACKGROUND_ALPHA = floatPreferencesKey("background_alpha")
+    val BACKGROUND_BLUR = floatPreferencesKey("background_blur")
     val WALLPAPER_URI = stringPreferencesKey("wallpaper_uri")
 
     // Theme
@@ -69,6 +78,17 @@ object SettingsKeys {
     val STATUS_COLORS_ENABLED = booleanPreferencesKey("status_colors_enabled")
     val STATUS_ERROR_COLOR = intPreferencesKey("status_error_color")
     val STATUS_WARNING_COLOR = intPreferencesKey("status_warning_color")
+
+    // Theme > "Custom Palette" mode - a real 16-slot termcolor palette
+    // (distinct from CUSTOM_FG/CUSTOM_BG above, which only ever override
+    // the default text/background pair and leave the 16 ANSI accent colors
+    // fixed). Stored as a JSON array of 16 ARGB ints, index 0-15 in
+    // standard ANSI order (black, red, green, yellow, blue, magenta, cyan,
+    // white, then the bright variants) - see PaletteThemes.kt for parsing/
+    // encoding and the bundled Solarized/Gruvbox/Dracula presets.
+    val CUSTOM_PALETTE_COLORS = stringPreferencesKey("custom_palette_colors")
+    val CUSTOM_PALETTE_FG = intPreferencesKey("custom_palette_fg")
+    val CUSTOM_PALETTE_BG = intPreferencesKey("custom_palette_bg")
 
     // Appearance > pinch-to-zoom on/off. On by default (existing
     // behaviour). Off disables the two-finger pinch gesture entirely -

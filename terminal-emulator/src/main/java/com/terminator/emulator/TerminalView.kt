@@ -123,6 +123,19 @@ class TerminalPalette(
         }
 
         /**
+         * Settings > Theme > "Custom Palette" mode - all 16 ANSI slots plus
+         * fg/bg, either hand-picked by the user or seeded from one of
+         * PalettePresets (Solarized, Gruvbox, Dracula, Nord...). Distinct
+         * from [custom], which only ever varies fg/bg and keeps a fixed
+         * accent set; this is a real termcolor-style palette where every
+         * slot is independently defined.
+         */
+        fun fromPalette(colors: IntArray, foreground: Int, background: Int): TerminalPalette {
+            require(colors.size == 16) { "fromPalette requires exactly 16 colors, got ${colors.size}" }
+            return TerminalPalette(colors.copyOf(), foreground, background)
+        }
+
+        /**
          * Settings > Theme > "Material color override" toggle, ON state.
          * Unlike [custom] (which only ever touches defaultForeground/
          * defaultBackground and leaves the 16 ANSI accent colors fixed),
@@ -171,7 +184,24 @@ class TerminalPalette(
                 tertiaryContainer,    // 14 bright cyan
                 onBackground          // 15 bright white / default foreground
             )
-            return TerminalPalette(colors, onBackground, background)
+            // Also seed statusErrorColor/statusWarningColor with the same
+            // Material error/secondary this palette already used for ANSI
+            // slots 1/9 and 3/11 above. Without this, "Override ANSI colors
+            // too" only touched the general 16-slot palette - a program's
+            // own SGR red/yellow still landed on index 1/3 and looked
+            // identical to before, because Material's error red is close
+            // enough to the existing Nord-style red that the change wasn't
+            // visible. Status colors are checked first in resolve(), so
+            // seeding them here (rather than leaving them null) is what
+            // actually makes the override read as "error/warning now follow
+            // Material" instead of doing nothing. MainActivity's separate
+            // "Separate error/status colors" + RGB picker layer still wins
+            // when the user turns that on explicitly - see withStatusColors().
+            return TerminalPalette(
+                colors, onBackground, background,
+                statusErrorColor = error,
+                statusWarningColor = secondary
+            )
         }
     }
 }
