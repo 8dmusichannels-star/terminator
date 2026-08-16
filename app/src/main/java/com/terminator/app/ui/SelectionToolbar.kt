@@ -24,7 +24,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Save
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -54,6 +58,11 @@ fun SelectionToolbar(
     // hides the button entirely, keeping every other caller of this
     // toolbar unaffected.
     onCloneClicked: (() -> Unit)? = null,
+    // Save/export icon for the active session's full terminal output
+    // (screen + scrollback) - see MainViewModel.exportSessionOutput's doc.
+    // Nullable so other/future callers of this toolbar can still hide it,
+    // but MainActivity always passes a non-null handler.
+    onSaveHistoryClicked: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -67,6 +76,17 @@ fun SelectionToolbar(
         ToolbarAction("Copy", onCopy)
         ToolbarAction("Paste", onPaste)
         ToolbarAction("Cancel", onCancel)
+        if (onSaveHistoryClicked != null) {
+            Icon(
+                Icons.Filled.Save,
+                contentDescription = "Export terminal output",
+                tint = Color.White,
+                modifier = Modifier
+                    .clickable(onClick = onSaveHistoryClicked)
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .size(20.dp)
+            )
+        }
     }
 }
 

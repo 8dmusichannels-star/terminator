@@ -78,8 +78,22 @@ data class MainUiState(
     // the active session changes - see bumpVersion()/setActiveSession-style
     // call sites - so the user is never silently stuck looking at history
     // while missing new output with no indication why nothing's updating.
-    val scrollOffset: Int = 0
+    val scrollOffset: Int = 0,
+    // Split-screen (see SplitScreenContainer). Null splitRuntimeId means
+    // split is off - the terminal renders as a single pane exactly as
+    // before. When set, it names a second RunningSession (distinct from
+    // activeSessionId) shown alongside the primary pane. orientation/ratio
+    // are purely presentational (which axis, how much space each pane
+    // gets) and have no effect on either PTY. broadcastInput, when true,
+    // sends typed input to BOTH panes' sessions instead of just the
+    // primary - entirely opt-in, off by default, see sendInput's doc.
+    val splitRuntimeId: String? = null,
+    val splitOrientation: SplitOrientation = SplitOrientation.Horizontal,
+    val splitRatio: Float = 0.5f,
+    val broadcastInput: Boolean = false
 )
+
+enum class SplitOrientation { Horizontal, Vertical }
 
 class MainViewModel(
     private val app: TerminatorApp,
@@ -226,6 +240,37 @@ class MainViewModel(
     }
 
     /**
+     * Exports the given session's full terminal output (current screen +
+     * everything still in scrollback, up to TerminalBuffer.
+     * MAX_SCROLLBACK_LINES) as plain text to the given destination Uri (a
+     * CreateDocument launcher in MainActivity - the user picks where to
+     * save it, per the feature request, rather than a fixed app-private
+     * path). This replaced a separate clipboard-history log: exporting
+     * everything the session has actually printed is strictly more useful
+     * than a log of only what was manually selected and copied, and avoids
+     * maintaining a second persisted history nobody asked to keep.
+     * Defaults to the active session when no runtimeId is given, so the
+     * primary pane's save button doesn't need to know its own runtimeId.
+     */
+    fun exportSessionOutput(destination: android.net.Uri, runtimeId: String? = null) {
+        val targetId = runtimeId ?: _uiState.value.activeSessionId
+        val buffer = liveSessions[targetId]?.buffer ?: return
+        viewModelScope.launch {
+            val text = buffer.fullText()
+            try {
+                app.contentResolver.openOutputStream(destination)?.use { out ->
+                    out.write(text.toByteArray())
+                }
+            } catch (_: Exception) {
+                // Best-effort: if the destination Uri became invalid (e.g.
+                // the user cancelled a slow-loading storage provider), there's
+                // nothing meaningful to recover here - the buffer itself is
+                // untouched either way, the user can just retry Save.
+            }
+        }
+    }
+
+    /**
      * Backs QuickAddSessionPickerDialog: spawns a fresh copy of whichever
      * *specific* running session the user picked from that popup (by
      * runtimeId), rather than always whatever happens to be active - see
@@ -246,7 +291,19 @@ class MainViewModel(
     /** Switches to an already-running instance without spawning anything new. */
     fun openRunningSession(runtimeId: String) {
         if (liveSessions[runtimeId]?.isAlive() == true) {
-            _uiState.value = _uiState.value.copy(activeSessionId = runtimeId, drawerOpen = false, scrollOffset = 0)
+            _uiState.value = _uiState.value.copy(
+                activeSessionId = runtimeId,
+                drawerOpen = false,
+                scrollOffset = 0,
+                // Switching the active pane onto whatever was the split
+                // partner would leave both panes showing the same session -
+                // not a crash, just a confusing dead-end (nothing left to
+                // show alongside it). Closing the split here is the same
+                // "no longer distinct sessions" cleanup killSession() does
+                // when the split partner dies outright.
+                splitRuntimeId = _uiState.value.splitRuntimeId?.takeUnless { it == runtimeId },
+                broadcastInput = if (_uiState.value.splitRuntimeId == runtimeId) false else _uiState.value.broadcastInput
+            )
         }
     }
 
@@ -376,7 +433,15 @@ class MainViewModel(
         liveEntries.remove(runtimeId)
         _uiState.value = _uiState.value.copy(
             runningSessions = _uiState.value.runningSessions.filterNot { it.runtimeId == runtimeId },
-            sessionTextSizes = _uiState.value.sessionTextSizes - runtimeId
+            sessionTextSizes = _uiState.value.sessionTextSizes - runtimeId,
+            // If the session that just died was the split partner, close
+            // the split entirely rather than leaving splitRuntimeId pointing
+            // at a session that no longer exists - bufferFor() would just
+            // return null forever and the secondary pane would be stuck
+            // showing an empty/dead screen with no way back to single-pane
+            // view short of the user finding the split toggle again.
+            splitRuntimeId = _uiState.value.splitRuntimeId?.takeUnless { it == runtimeId },
+            broadcastInput = if (_uiState.value.splitRuntimeId == runtimeId) false else _uiState.value.broadcastInput
         )
     }
 
@@ -434,14 +499,79 @@ class MainViewModel(
 
     fun activeBuffer(): TerminalBuffer? = liveSessions[_uiState.value.activeSessionId]?.buffer
 
+    /** Buffer for an arbitrary runtimeId, not just the active one - what the
+     *  split-screen secondary pane renders. Same underlying liveSessions map
+     *  as activeBuffer(); a runtimeId not currently live returns null so the
+     *  pane can show "session ended" instead of crashing on a stale buffer. */
+    fun bufferFor(runtimeId: String): TerminalBuffer? = liveSessions[runtimeId]?.buffer
+
     fun sendInput(text: String) {
-        liveSessions[_uiState.value.activeSessionId]?.write(text)
+        val state = _uiState.value
+        liveSessions[state.activeSessionId]?.write(text)
+        // Split-screen "broadcast input" (Settings-less, per-split toggle -
+        // see MainUiState.broadcastInput's doc): mirrors the same keystroke
+        // to the split partner's PTY too. Fire-and-forget on both, neither
+        // write waits on the other - they're independent PTYs and one being
+        // slow to drain shouldn't delay input reaching the other.
+        if (state.broadcastInput) {
+            state.splitRuntimeId?.let { liveSessions[it]?.write(text) }
+        }
         // Typing always jumps back to the live screen, same as a real
         // terminal/tmux - otherwise keystrokes would land while the user is
         // looking at scrollback and they'd never see what they just typed.
         if (_uiState.value.scrollOffset != 0) {
             _uiState.value = _uiState.value.copy(scrollOffset = 0)
         }
+    }
+
+    /** Sends input to one specific pane's session, bypassing broadcast -
+     *  used by the split-screen secondary pane's own keyboard/paste so
+     *  typing directly into pane 2 never doubles into pane 1 regardless of
+     *  the broadcast toggle (broadcast only mirrors FROM the primary pane's
+     *  input path, sendInput() above - it was never meant to loop pane 2's
+     *  own typing back into itself). */
+    fun sendInputTo(runtimeId: String, text: String) {
+        liveSessions[runtimeId]?.write(text)
+    }
+
+    /**
+     * Turns split-screen on for the given runtimeId (must be a currently
+     * running session, distinct from the active one - the drawer's "Split"
+     * action / SelectionToolbar entry point is expected to enforce this by
+     * only offering other running sessions as candidates) or off when
+     * [runtimeId] is null. Resets ratio to 0.5 and orientation to Horizontal
+     * each time split is turned ON from an off state, so re-enabling it
+     * after closing always starts from a predictable 50/50 split rather
+     * than resuming whatever ratio a previous, unrelated split left behind.
+     */
+    fun setSplitSession(runtimeId: String?) {
+        // Guard against the active session being asked to split against
+        // itself (the drawer already hides the split button on the active
+        // row, but this keeps the invariant enforced at the state layer
+        // too, not just in one UI entry point).
+        val safeRuntimeId = runtimeId?.takeUnless { it == _uiState.value.activeSessionId }
+        _uiState.value = _uiState.value.copy(
+            splitRuntimeId = safeRuntimeId,
+            splitRatio = if (safeRuntimeId != null && _uiState.value.splitRuntimeId == null) 0.5f else _uiState.value.splitRatio,
+            splitOrientation = if (safeRuntimeId != null && _uiState.value.splitRuntimeId == null) SplitOrientation.Horizontal else _uiState.value.splitOrientation,
+            broadcastInput = if (safeRuntimeId == null) false else _uiState.value.broadcastInput
+        )
+    }
+
+    fun setSplitOrientation(orientation: SplitOrientation) {
+        _uiState.value = _uiState.value.copy(splitOrientation = orientation)
+    }
+
+    /** Clamped well away from 0/1 so neither pane can be dragged down to an
+     *  unusable sliver - matches the drag handle's own min-size guard in
+     *  SplitScreenContainer, kept here too since this is also reachable
+     *  from anywhere else that might set the ratio directly. */
+    fun setSplitRatio(ratio: Float) {
+        _uiState.value = _uiState.value.copy(splitRatio = ratio.coerceIn(0.15f, 0.85f))
+    }
+
+    fun setBroadcastInput(enabled: Boolean) {
+        _uiState.value = _uiState.value.copy(broadcastInput = enabled)
     }
 
     /** True while the active session's running program has switched to the

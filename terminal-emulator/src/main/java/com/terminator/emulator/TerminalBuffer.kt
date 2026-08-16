@@ -202,6 +202,48 @@ class TerminalBuffer(
     val maxScrollOffset: Int get() = lock.withLock { scrollback.size }
 
     /**
+     * The session's entire visible output as plain text: everything still
+     * in scrollback (oldest first) followed by the current on-screen grid,
+     * each row trimmed of trailing padding the same way [selectedText]
+     * trims a selection. Used by the runner toolbar's save/export button -
+     * "everything the terminal has shown", not just what got selected and
+     * copied by hand. Bounded by however much scrollback is actually kept
+     * (MAX_SCROLLBACK_LINES) - older output that already scrolled out
+     * isn't recoverable here, same limit selectedText()/lineAt() already
+     * have.
+     */
+    fun fullText(): String = lock.withLock {
+        val lines = mutableListOf<String>()
+        val totalScrollback = scrollback.size
+        // lineAt(row, col, scrollOffset) only resolves scrollback rows when
+        // scrollOffset > 0 (offset 0 is always just the live grid - see its
+        // own doc). To read scrollback line `idx` (0 = oldest), the
+        // equivalent view is "row 0 at scrollOffset = totalScrollback - idx"
+        // - i.e. walk scrollOffset down from its max toward 0 as idx
+        // increases, which lands on row 0 of that offset's window each
+        // time rather than trying to address scrollback with a negative
+        // row number (which cellAt() - what scrollOffset=0 falls through
+        // to - doesn't support; it just returns a blank Cell for anything
+        // outside the visible [0, rows) range.
+        for (idx in 0 until totalScrollback) {
+            val sb = StringBuilder()
+            val offset = totalScrollback - idx
+            for (col in 0 until columns) {
+                sb.append(lineAt(0, col, scrollOffset = offset).text)
+            }
+            lines.add(sb.toString().trimEnd(' '))
+        }
+        for (row in 0 until rows) {
+            val sb = StringBuilder()
+            for (col in 0 until columns) {
+                sb.append(lineAt(row, col, scrollOffset = 0).text)
+            }
+            lines.add(sb.toString().trimEnd(' '))
+        }
+        lines.joinToString("\n")
+    }
+
+    /**
      * Plain text between two screen positions (row, col), as currently
      * rendered - i.e. respecting [scrollOffset] the same way [lineAt] does,
      * so selecting into scrollback and copying grabs what's actually on

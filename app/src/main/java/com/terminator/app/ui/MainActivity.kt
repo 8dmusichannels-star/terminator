@@ -28,6 +28,7 @@ import android.util.Log
 import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import kotlinx.coroutines.Job
@@ -155,6 +156,14 @@ class MainActivity : ComponentActivity() {
 
             val amoledBlack by repo.flow(SettingsKeys.AMOLED_BLACK, false).collectAsState(initial = false)
             val wallpaperUriStr by repo.flow(SettingsKeys.WALLPAPER_URI, "").collectAsState(initial = "")
+            // Runner toolbar's save icon - exports the active (or split
+            // secondary) pane's full terminal output. Always available, no
+            // toggle: unlike the old clipboard-history log this replaced,
+            // there's no persisted state to gate - it just reads whatever
+            // the session's buffer currently holds at export time.
+            val terminalExportLauncher = rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.CreateDocument("text/plain")
+            ) { uri -> uri?.let { viewModel.exportSessionOutput(it) } }
             val blurAlpha by repo.flow(SettingsKeys.BACKGROUND_ALPHA, 0.3f).collectAsState(initial = 0.3f)
             val backgroundBlur by repo.flow(SettingsKeys.BACKGROUND_BLUR, 0f).collectAsState(initial = 0f)
             val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
@@ -350,7 +359,22 @@ class MainActivity : ComponentActivity() {
                 // own actions because it's written in the same call that
                 // performs the action.
                 var lastKeyboardIntentOpen by remember { mutableStateOf<Boolean?>(null) }
-                fun effectiveKeyboardWasOpen(): Boolean = lastKeyboardIntentOpen ?: settledKeyboardOpen
+                // Falls back to keyboardOpen (the live inset read) instead of
+                // settledKeyboardOpen when this app hasn't shown/hidden the
+                // keyboard itself yet. This only matters for the very first
+                // long-press-to-select of a session: at that point the
+                // finger has already been held stationary past the long-
+                // press timeout (400ms+), which is well past settled-
+                // Keyboard's own 120ms debounce window - so keyboardOpen is
+                // no less reliable here than settledKeyboardOpen would be,
+                // and reading it directly closes a gap where a long-press
+                // landing inside that 120ms window (e.g. right after the
+                // user manually dismissed the IME via the system back
+                // gesture, with no show()/hide() call from this file to set
+                // lastKeyboardIntentOpen) could still capture a stale
+                // settledKeyboardOpen and have Copy/Paste/Cancel wrongly
+                // reopen or reclose the keyboard on that first use.
+                fun effectiveKeyboardWasOpen(): Boolean = lastKeyboardIntentOpen ?: keyboardOpen
                 var hiddenFieldFocused by remember { mutableStateOf(false) }
                 var textPageFieldFocused by remember { mutableStateOf(false) }
                 // Titlebar "+" button state: whether the running-session
@@ -759,9 +783,15 @@ class MainActivity : ComponentActivity() {
                             }
 
                             Column(modifier = Modifier.fillMaxSize()) {
+                                // Split-screen (see MainUiState.splitRuntimeId's doc). When
+                                // splitRuntimeId is null this block is a complete no-op - the
+                                // Box right after it keeps exactly its old weight(1f)/
+                                // fillMaxWidth(), single-pane rendering is 100% untouched.
+                                val splitRuntimeId = state.splitRuntimeId
+                                val primaryWeight = if (splitRuntimeId != null) state.splitRatio else 1f
                                 Box(
                                     modifier = Modifier
-                                        .weight(1f)
+                                        .weight(primaryWeight)
                                         .fillMaxWidth()
                                         .background(Color.Black)
                                         .onSizeChanged { size: IntSize ->
@@ -886,14 +916,14 @@ class MainActivity : ComponentActivity() {
                                                         // keyboardWasOpenBeforeSelection's own doc for
                                                         // why the toolbar's Copy/Paste/Cancel callbacks
                                                         // can't just read live keyboardOpen themselves.
-                                                        // Reads settledKeyboardOpen rather than the raw
-                                                        // live keyboardOpen: keyboardOpen can be mid-
-                                                        // animation at the exact instant the long-press
-                                                        // timer fires and briefly disagree with what's
-                                                        // actually on screen, which is what caused the
-                                                        // toolbar to occasionally restore/dismiss the
-                                                        // wrong keyboard state - see settledKeyboardOpen's
-                                                        // own doc above.
+                                                        // effectiveKeyboardWasOpen() prefers
+                                                        // lastKeyboardIntentOpen (this file's own most
+                                                        // recent show()/hide() call) and only falls back
+                                                        // to live keyboardOpen when nothing has been
+                                                        // called yet - see that function's own doc for
+                                                        // why settledKeyboardOpen's 120ms debounce isn't
+                                                        // actually needed here (the long-press timeout
+                                                        // this branch fires from is already well past it).
                                                         keyboardWasOpenBeforeSelection = effectiveKeyboardWasOpen()
                                                         Log.d("KbDebug", "SELECTION START: keyboardOpen=$keyboardOpen settledKeyboardOpen=$settledKeyboardOpen lastKeyboardIntentOpen=$lastKeyboardIntentOpen hiddenFieldFocused=$hiddenFieldFocused -> captured keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                         if (keyboardWasOpenBeforeSelection) {
@@ -1098,6 +1128,23 @@ class MainActivity : ComponentActivity() {
                                                                 if (zoom != 1f && activeSessionId != null) {
                                                                     val newSize = (latestEffectiveTextSize.value * zoom)
                                                                         .coerceIn(8f, 40f)
+                                                                    // Anchor the pinch to the midpoint between
+                                                                    // the two fingers, not to row 0 / the top
+                                                                    // of the viewport. Without this, resizing
+                                                                    // the grid (below) always keeps row 0
+                                                                    // pinned and grows/shrinks everything
+                                                                    // downward from there - so content under
+                                                                    // the fingers visibly drifted upward out
+                                                                    // from under them as soon as the finger
+                                                                    // midpoint wasn't already at the very top
+                                                                    // of the screen (the common case). Convert
+                                                                    // the midpoint's CURRENT pixel-y into a
+                                                                    // row using the OLD charHeight, so we know
+                                                                    // which row the fingers are actually over
+                                                                    // before anything changes size.
+                                                                    val (_, oldCharHeight) = charMetrics
+                                                                    val midY = (p1.position.y + p2.position.y) / 2f
+                                                                    val anchorRow = if (oldCharHeight > 0f) (midY / oldCharHeight).toInt() else 0
                                                                     liveZoomSize = newSize
                                                                     zoomCommitJob?.cancel()
                                                                     zoomCommitJob = coroutineScope.launch {
@@ -1122,13 +1169,28 @@ class MainActivity : ComponentActivity() {
                                                                             this.textSize = newSize * density * fontScale
                                                                         }
                                                                         val charWidth = metricsPaint.measureText("M")
-                                                                        val charHeight = metricsPaint.fontSpacing
+                                                                        val newCharHeight = metricsPaint.fontSpacing
                                                                         val finalSize = latestTerminalSize
-                                                                        if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                                                        if (charWidth > 0f && newCharHeight > 0f && finalSize != null) {
                                                                             val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
-                                                                            val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                                                            Log.d("SelDebug", "zoom-commit resize: finalSize=$finalSize charWidth=$charWidth charHeight=$charHeight newSize=$newSize -> cols=$cols rws=$rws")
+                                                                            val rws = (finalSize.height / newCharHeight).toInt().coerceAtLeast(1)
+                                                                            Log.d("SelDebug", "zoom-commit resize: finalSize=$finalSize charWidth=$charWidth charHeight=$newCharHeight newSize=$newSize -> cols=$cols rws=$rws")
                                                                             viewModel.updateTerminalSize(cols, rws)
+                                                                            // Re-anchor: the row the fingers were
+                                                                            // over (anchorRow, in OLD char-height
+                                                                            // units) should land at the same pixel
+                                                                            // midY again, now measured in the NEW
+                                                                            // char-height. The gap between where
+                                                                            // that row naturally falls post-resize
+                                                                            // and where it needs to be is what
+                                                                            // scrollOffset makes up - same unit
+                                                                            // (whole lines) adjustScrollOffset
+                                                                            // already expects.
+                                                                            val desiredRowAtMidY = (midY / newCharHeight)
+                                                                            val anchorDelta = (desiredRowAtMidY - anchorRow)
+                                                                            if (kotlin.math.abs(anchorDelta) >= 1f) {
+                                                                                viewModel.adjustScrollOffset(-anchorDelta)
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -1203,6 +1265,16 @@ class MainActivity : ComponentActivity() {
                                                         // moment later. Using insetsController here too
                                                         // makes every keyboard show/hide in this file go
                                                         // through the one API that's actually reliable.
+                                                        // Reads keyboardOpen (the live, per-frame inset
+                                                        // read) rather than effectiveKeyboardWasOpen()/
+                                                        // settledKeyboardOpen deliberately: a plain tap is
+                                                        // a direct toggle of whatever's on screen RIGHT
+                                                        // NOW, not a "restore what it was before some
+                                                        // other action" decision like Copy/Paste/Cancel's
+                                                        // handlers make - those need the debounced/intent
+                                                        // reads specifically because they're restoring a
+                                                        // PRIOR state after an intervening selection, a
+                                                        // case that doesn't apply here.
                                                         if (keyboardOpen) {
                                                             focusManager.clearFocus()
                                                             insetsController.hide(WindowInsetsCompat.Type.ime())
@@ -1550,7 +1622,14 @@ class MainActivity : ComponentActivity() {
                                             // Fast clone: no popup, unlike the titlebar "+"
                                             // (QuickAddSessionPickerDialog) - see
                                             // SelectionToolbar's onCloneClicked doc.
-                                            onCloneClicked = { viewModel.duplicateActiveSession() }
+                                            onCloneClicked = { viewModel.duplicateActiveSession() },
+                                            // Always available - exports the active session's
+                                            // full terminal output (screen + scrollback), not
+                                            // gated behind any toggle since there's no persisted
+                                            // log to opt in to anymore.
+                                            onSaveHistoryClicked = {
+                                                terminalExportLauncher.launch("terminal-output.txt")
+                                            }
                                         )
                                     }
 
@@ -1750,6 +1829,44 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
 
+                                // Split-screen secondary pane + drag handle - only present
+                                // when splitRuntimeId is set (see the primaryWeight
+                                // computation above this Box). A simpler sibling pane: its
+                                // own TerminalView bound to the split session's buffer, basic
+                                // tap-to-focus keyboard input via sendInputTo (or the shared
+                                // broadcast path via sendInput when broadcastInput is on -
+                                // see MainViewModel.sendInput's doc), but deliberately WITHOUT
+                                // the primary Box's rich gesture stack (edge-scroll-while-
+                                // selecting, long-press selection drag, pinch-zoom) - hoisting
+                                // that ~450-line gesture loop out to serve two independent
+                                // panes would be a much larger, riskier rewrite of code that
+                                // already works correctly for the primary pane today.
+                                if (splitRuntimeId != null) {
+                                    SplitDragHandle(
+                                        onDrag = { deltaPx, containerHeightPx ->
+                                            if (containerHeightPx > 0f) {
+                                                val deltaRatio = deltaPx / containerHeightPx
+                                                viewModel.setSplitRatio(state.splitRatio + deltaRatio)
+                                            }
+                                        }
+                                    )
+                                    SplitTerminalPane(
+                                        modifier = Modifier
+                                            .weight(1f - state.splitRatio)
+                                            .fillMaxWidth(),
+                                        runtimeId = splitRuntimeId,
+                                        buffer = viewModel.bufferFor(splitRuntimeId),
+                                        bufferVersion = state.bufferVersion,
+                                        palette = terminalPalette,
+                                        fontFamily = terminalTypeface,
+                                        fontSizeSp = effectiveTextSize,
+                                        broadcastInput = state.broadcastInput,
+                                        onToggleBroadcast = { viewModel.setBroadcastInput(!state.broadcastInput) },
+                                        onInput = { text -> viewModel.sendInputTo(splitRuntimeId, text) },
+                                        onClose = { viewModel.setSplitSession(null) }
+                                    )
+                                }
+
                                 // The bar's enter/exit was previously keyed only on the Settings
                                 // toggle, so it sat statically ("donuk") whenever the real soft
                                 // keyboard opened or closed underneath it - imePadding() on the
@@ -1919,6 +2036,16 @@ class MainActivity : ComponentActivity() {
                                 onKillRunningSession = { viewModel.killSession(it) },
                                 onToggleWakeUpRunningSession = { viewModel.toggleWakeUp(it) },
                                 onCloneRunningSession = { viewModel.duplicateSession(it) },
+                                // Toggling a row that's already the split partner closes
+                                // the split; toggling a different row switches the split
+                                // partner directly to it (setSplitSession just overwrites
+                                // splitRuntimeId, no need to close-then-reopen).
+                                splitRuntimeId = state.splitRuntimeId,
+                                onToggleSplitSession = { runtimeId ->
+                                    viewModel.setSplitSession(
+                                        if (state.splitRuntimeId == runtimeId) null else runtimeId
+                                    )
+                                },
                                 onSettingsClicked = {
                                     startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                                 },

@@ -95,11 +95,6 @@ object SettingsKeys {
     // font size then only changes via the Text Size slider.
     val ZOOM_ENABLED = booleanPreferencesKey("zoom_enabled")
 
-    // Clipboard history: off by default. When on, every Copy (from the
-    // selection toolbar) is appended to a persisted log the user can
-    // export later via the runner toolbar's save icon.
-    val CLIPBOARD_HISTORY_ENABLED = booleanPreferencesKey("clipboard_history_enabled")
-
     // Sound
     val BELL_ENABLED = booleanPreferencesKey("bell_enabled")
     val USE_CUSTOM_SOUND = booleanPreferencesKey("use_custom_sound")

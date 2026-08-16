@@ -42,6 +42,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.VerticalSplit
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -83,6 +84,13 @@ fun SessionDrawer(
     onKillRunningSession: (String) -> Unit = {},
     onToggleWakeUpRunningSession: (String) -> Unit = {},
     onCloneRunningSession: (String) -> Unit = {},
+    // Split-screen: which runtimeId (if any) is currently the split
+    // partner, and the callback to toggle a given running session in/out
+    // of that role - see MainViewModel.setSplitSession's doc. Null means
+    // no split is open, in which case the per-row split button still shows
+    // (to open one) but none of them render as "already the partner".
+    splitRuntimeId: String? = null,
+    onToggleSplitSession: (String) -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -176,10 +184,19 @@ fun SessionDrawer(
                                 // picture as its profile, if one was set.
                                 imageUri = sessions.firstOrNull { it.id == running.entryId }?.imageUri,
                                 isActive = running.runtimeId == activeSessionId,
+                                isSplitPartner = running.runtimeId == splitRuntimeId,
                                 onClick = { onRunningSessionSelected(running.runtimeId) },
                                 onKillClick = { onKillRunningSession(running.runtimeId) },
                                 onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) },
-                                onCloneClick = { onCloneRunningSession(running.runtimeId) }
+                                onCloneClick = { onCloneRunningSession(running.runtimeId) },
+                                // Split only makes sense between two DISTINCT running
+                                // sessions - hidden on the active row itself (there'd be
+                                // nothing else to show alongside it).
+                                onSplitClick = if (running.runtimeId != activeSessionId) {
+                                    { onToggleSplitSession(running.runtimeId) }
+                                } else {
+                                    null
+                                }
                             )
                         }
                         item(key = "running-divider") {
@@ -238,10 +255,12 @@ private fun RunningSessionRow(
     running: RunningSession,
     imageUri: String? = null,
     isActive: Boolean,
+    isSplitPartner: Boolean = false,
     onClick: () -> Unit,
     onKillClick: () -> Unit = {},
     onWakeUpClick: () -> Unit = {},
-    onCloneClick: () -> Unit = {}
+    onCloneClick: () -> Unit = {},
+    onSplitClick: (() -> Unit)? = null
 ) {
     Row(
         modifier = Modifier
@@ -286,6 +305,23 @@ private fun RunningSessionRow(
                     "Session exited",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color(0xFFBF616A)
+                )
+            }
+        }
+        // Split-screen toggle for this specific running session - only
+        // shown for OTHER running sessions (never the currently active
+        // one, since split needs two distinct sessions). Tapping opens it
+        // as the split secondary pane; tapping again while it's already
+        // the split partner closes the split - see MainViewModel.
+        // setSplitSession's doc. Null onSplitClick (only passed for the
+        // active row) hides the button entirely rather than showing it
+        // disabled.
+        if (onSplitClick != null) {
+            IconButton(onClick = onSplitClick) {
+                Icon(
+                    Icons.Filled.VerticalSplit,
+                    contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
+                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
                 )
             }
         }
