@@ -1,28 +1,60 @@
-# Changelog
+# 🚧 Terminator Pre-Release
 
-All notable changes to this project are documented in this file.
+> ⚠️ Pre-release build — active development, testing and bug fixing.
 
-## [v0.3.6] - 2026-08-14
+This pre-release includes a major round of UI, theming, virtual keybar, navigation and session improvements developed over the last two days.
 
-### Fixed
+## ✨ Highlights
 
-* Fixed blue highlight/selection behavior while scrolling.
-* Fixed toolbar copy, paste, and close actions.
-* Fixed long text field issues.
-* Fixed a crash related to the terminal buffer in the lock screen.
-* Added a toolbar barrier to prevent unintended interactions.
-* Fixed virtual keyboard swipe gestures for left/right navigation.
+- Added and improved **Virtual Keybar**
+  - Insert support
+  - Padding controls
+  - Fixed font sizing
+  - Navbar integration
+- Improved **keyboard interaction**
+  - Keyboard selection highlighting
+  - Copy / paste / close toolbar behavior
+  - Fixed keyboard open/close behavior
+- Added **AMOLED Black** mode
+  - Full AMOLED black mode
+  - Material You black theme improvements
+- Improved **Navbar**
+  - Size adjustments
+  - Location adjustments
+  - Menu integration
+- Added **Running Session cloning**
+- Added **Session Clone Bar**
+- Improved **Custom Palette**
+  - Scrollback support
+  - Termcolor custom CSS palette support
+- Improved **Material You**
+  - Color override
+  - Color scheme handling
+  - Material color titlebar support
+- Added **Blur / Alpha separation**
+- Added **Alpha support**
+- Added **Zoom toggle**
+- Added **Status / Error color selection**
+- Improved **Session / Runner UI**
+- Added **Session row photo rendering**
+- Fixed various UI sizing and layout issues
 
-### Improved
+## 📦 Pre-Release Commits
 
-* Improved terminal stability and lock-screen buffer handling.
-* Improved text selection and clipboard interactions.
-* Improved virtual keyboard gesture handling.
-* Improved popup runner session selection.
-* General stability and usability improvements.
+| Commit | Description |
+|---|---|
+| [`15579a1`](https://github.com/8dmusichannels-star/terminator/commit/15579a1) | Virtual keybar insert & padding, font size fixes, AMOLED Black full mode |
+| [`efd6776`](https://github.com/8dmusichannels-star/terminator/commit/efd6776) | Navbar sizing, keyboard selection highlight, copy/paste/close toolbar and keyboard behavior fixes |
+| [`739ff6c`](https://github.com/8dmusichannels-star/terminator/commit/739ff6c) | Navbar location, custom palette scrollback, running session clone, session clone and AMOLED/Material You improvements |
+| [`c1dc548`](https://github.com/8dmusichannels-star/terminator/commit/c1dc548) | Virtual keybar, navbar menu, Material You overrides, status/error colors, zoom, palettes, blur/alpha and session UI |
+| [`652c574`](https://github.com/8dmusichannels-star/terminator/commit/652c574) | Virtual keybar, navbar, Material You color override, status/error colors and zoom toggle |
 
-### Commits
+## 🔗 Repository
 
-* [`db87f71`](commit/db87f71) — Bump version 0.3.6
-* [`d9678ae`](commit/d9678ae) — Fix scrolled blue highlighting/selection, toolbar copy/paste/close, and long text field issues
-* [`c91a447`](commit/c91a447) — Fix lock terminal buffer crash, toolbar barrier, copy/paste/close, virtual keyboard swipe gestures, and popup runner session selection
+https://github.com/8dmusichannels-star/terminator
+
+# ⚠️ Note
+
+This is a **pre-release** version. Some features may still need polishing and additional edge-case fixes.
+
+Feedback and bug reports are welcome.
