@@ -161,9 +161,26 @@ class MainActivity : ComponentActivity() {
             // toggle: unlike the old clipboard-history log this replaced,
             // there's no persisted state to gate - it just reads whatever
             // the session's buffer currently holds at export time.
+            //
+            // pendingSaveRuntimeId: which running session's output the NEXT
+            // launcher result should export. CreateDocument's callback only
+            // gets the destination Uri back, not anything about which
+            // button triggered it - so when the drawer's per-row Save icon
+            // (SessionDrawer's onSaveRunningSession) is tapped for a
+            // session that ISN'T the active one, the target runtimeId is
+            // stashed here right before launching, then consumed (and
+            // cleared) in the callback below. Left null for the runner
+            // toolbar's own Save icon and the long-press selection
+            // toolbar's save icon, both of which always mean "the active
+            // session" - exportSessionOutput's own runtimeId = null default
+            // already covers that case without this.
+            var pendingSaveRuntimeId by remember { mutableStateOf<String?>(null) }
             val terminalExportLauncher = rememberLauncherForActivityResult(
                 androidx.activity.result.contract.ActivityResultContracts.CreateDocument("text/plain")
-            ) { uri -> uri?.let { viewModel.exportSessionOutput(it) } }
+            ) { uri ->
+                uri?.let { viewModel.exportSessionOutput(it, pendingSaveRuntimeId) }
+                pendingSaveRuntimeId = null
+            }
             val blurAlpha by repo.flow(SettingsKeys.BACKGROUND_ALPHA, 0.3f).collectAsState(initial = 0.3f)
             val backgroundBlur by repo.flow(SettingsKeys.BACKGROUND_BLUR, 0f).collectAsState(initial = 0f)
             val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
@@ -219,6 +236,12 @@ class MainActivity : ComponentActivity() {
             // DisplaySettingsScreen but never read - the system status bar
             // stayed hidden (edge-to-edge) regardless of this toggle.
             val showStatusbar by repo.flow(SettingsKeys.SHOW_STATUSBAR, false).collectAsState(initial = false)
+            // Settings > Display > "Show runner toolbar save button" - now
+            // only gates the per-session Save icon in SessionDrawer's
+            // Running rows (see SessionDrawer.kt's onSaveRunningSession
+            // doc). The persistent RunnerToolbar bar above the terminal
+            // that this setting used to also gate has been removed.
+            val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
             // Settings > Keyboard > Input Mode. See the keyboardOptions
             // wiring on the hidden input field below for what each mode
             // actually changes.
@@ -2036,6 +2059,17 @@ class MainActivity : ComponentActivity() {
                                 onKillRunningSession = { viewModel.killSession(it) },
                                 onToggleWakeUpRunningSession = { viewModel.toggleWakeUp(it) },
                                 onCloneRunningSession = { viewModel.duplicateSession(it) },
+                                // Exports this specific row's session output, not
+                                // necessarily the active one - stash the target runtimeId
+                                // for the launcher callback to pick up (see
+                                // pendingSaveRuntimeId's doc above), then launch the same
+                                // CreateDocument picker the runner toolbar/selection
+                                // toolbar's Save icons already use.
+                                onSaveRunningSession = { runtimeId ->
+                                    pendingSaveRuntimeId = runtimeId
+                                    terminalExportLauncher.launch("terminal-output.txt")
+                                },
+                                showRunnerSaveButtons = showRunnerToolbarSave,
                                 // Toggling a row that's already the split partner closes
                                 // the split; toggling a different row switches the split
                                 // partner directly to it (setSplitSession just overwrites

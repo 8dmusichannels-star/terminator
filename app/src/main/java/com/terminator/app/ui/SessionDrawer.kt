@@ -40,6 +40,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.VerticalSplit
@@ -53,7 +54,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -84,6 +84,16 @@ fun SessionDrawer(
     onKillRunningSession: (String) -> Unit = {},
     onToggleWakeUpRunningSession: (String) -> Unit = {},
     onCloneRunningSession: (String) -> Unit = {},
+    // Exports this specific running session's terminal output (screen +
+    // scrollback) - see MainViewModel.exportSessionOutput's doc. Placed
+    // right in front of each row's own Clone ("+") icon, per-session,
+    // rather than only existing as a single save button for whichever
+    // session happens to be active - see RunningSessionRow's doc for why.
+    onSaveRunningSession: (String) -> Unit = {},
+    // Settings > Display > "Show runner toolbar save button"
+    // (SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE). False hides the Save icon
+    // on every running-session row entirely (not shown-but-disabled).
+    showRunnerSaveButtons: Boolean = true,
     // Split-screen: which runtimeId (if any) is currently the split
     // partner, and the callback to toggle a given running session in/out
     // of that role - see MainViewModel.setSplitSession's doc. Null means
@@ -189,6 +199,11 @@ fun SessionDrawer(
                                 onKillClick = { onKillRunningSession(running.runtimeId) },
                                 onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) },
                                 onCloneClick = { onCloneRunningSession(running.runtimeId) },
+                                onSaveClick = if (showRunnerSaveButtons) {
+                                    { onSaveRunningSession(running.runtimeId) }
+                                } else {
+                                    null
+                                },
                                 // Split only makes sense between two DISTINCT running
                                 // sessions - hidden on the active row itself (there'd be
                                 // nothing else to show alongside it).
@@ -260,6 +275,12 @@ private fun RunningSessionRow(
     onKillClick: () -> Unit = {},
     onWakeUpClick: () -> Unit = {},
     onCloneClick: () -> Unit = {},
+    // Exports this row's own running session's terminal output - see
+    // SessionDrawer's onSaveRunningSession doc. Null (rather than a
+    // disabled button) hides the icon entirely when the runner-toolbar
+    // save toggle is off, matching how onSplitClick == null already hides
+    // the split icon here for the active row.
+    onSaveClick: (() -> Unit)? = null,
     onSplitClick: (() -> Unit)? = null
 ) {
     Row(
@@ -271,13 +292,9 @@ private fun RunningSessionRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (!imageUri.isNullOrBlank()) {
-            val context = LocalContext.current
-            val bitmap = remember(imageUri) {
-                runCatching {
-                    context.contentResolver.openInputStream(android.net.Uri.parse(imageUri))
-                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
-                }.getOrNull()
-            }
+            // See SessionImage.kt's doc - adds SVG support alongside the
+            // raster formats BitmapFactory already handled.
+            val bitmap = rememberSessionImage(imageUri)
             bitmap?.let {
                 Image(
                     bitmap = it.asImageBitmap(),
@@ -322,6 +339,21 @@ private fun RunningSessionRow(
                     Icons.Filled.VerticalSplit,
                     contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
                     tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                )
+            }
+        }
+        // Exports this specific running session's terminal output (screen +
+        // scrollback) directly from the drawer row - see SessionDrawer's
+        // onSaveRunningSession doc. Placed immediately before the Clone
+        // ("+") icon per the request ("+ onune save buttonu"). Gated
+        // per-row by onSaveClick being null (icon isn't rendered at all)
+        // rather than shown-disabled, same pattern as onSplitClick above.
+        if (onSaveClick != null) {
+            IconButton(onClick = onSaveClick) {
+                Icon(
+                    Icons.Filled.Save,
+                    contentDescription = "Save session output",
+                    tint = Color.White.copy(alpha = 0.6f)
                 )
             }
         }
@@ -379,13 +411,9 @@ private fun SessionRow(
         // placeholder/initial circle is shown for sessions without one, so
         // rows without a photo just skip straight to the name/star.
         if (!session.imageUri.isNullOrBlank()) {
-            val context = LocalContext.current
-            val bitmap = remember(session.imageUri) {
-                runCatching {
-                    context.contentResolver.openInputStream(android.net.Uri.parse(session.imageUri))
-                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
-                }.getOrNull()
-            }
+            // See SessionImage.kt's doc - adds SVG support alongside the
+            // raster formats BitmapFactory already handled.
+            val bitmap = rememberSessionImage(session.imageUri)
             bitmap?.let {
                 Image(
                     bitmap = it.asImageBitmap(),

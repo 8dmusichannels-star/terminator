@@ -104,6 +104,14 @@ object SettingsKeys {
     val SHOW_STATUSBAR = booleanPreferencesKey("show_statusbar")
     val SHOW_TITLEBAR = booleanPreferencesKey("show_titlebar")
     val HORIZONTAL_MODE = booleanPreferencesKey("horizontal_mode")
+    // Display > "Show runner toolbar save button". Controls whether the
+    // per-session Save/export icon is rendered on each running-session row
+    // in SessionDrawer (see SessionDrawer.kt's onSaveRunningSession doc).
+    // Default true so existing installs see the Save icon appear the same
+    // way a new feature normally would. The same Save action remains
+    // reachable via the long-press selection toolbar's own save icon
+    // regardless, unaffected by this.
+    val SHOW_RUNNER_TOOLBAR_SAVE = booleanPreferencesKey("show_runner_toolbar_save")
 
     // Keyboard
     val SOFT_KEYBOARD = booleanPreferencesKey("soft_keyboard")

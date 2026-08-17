@@ -115,5 +115,18 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.2")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // SVG rendering for session picture support (Settings > Sessions > edit
+    // session > picture, plus the titlebar picture - see
+    // TerminatorTitleBar.kt). AndroidSVG (Apache 2.0) rather than pulling in
+    // a full image-loading library like Coil/Glide just for this one format:
+    // it's a small, pure-Kotlin/Java, no-native-code library that parses an
+    // SVG document straight to an Android Canvas/Picture, which is exactly
+    // what's needed here since every other session-picture format already
+    // goes through plain BitmapFactory. Picked over the AOSP
+    // androidx.graphics.shapes / VectorDrawable path because those require
+    // an SVG to be precompiled to a VectorDrawable XML at build time - not
+    // usable here, where the SVG is an arbitrary file the user picks at
+    // runtime via a content picker, not a bundled app resource.
+    implementation("com.caverock:androidsvg-aar:1.4")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

@@ -183,15 +183,9 @@ private fun SessionSettingsRow(
     ) {
         // Only renders when the session actually has a picture set - no
         // placeholder/initial circle is shown for sessions without one.
-        val context = LocalContext.current
-        val bitmap = remember(session.imageUri) {
-            session.imageUri?.takeIf { it.isNotBlank() }?.let { uri ->
-                runCatching {
-                    context.contentResolver.openInputStream(android.net.Uri.parse(uri))
-                        ?.use { android.graphics.BitmapFactory.decodeStream(it) }
-                }.getOrNull()
-            }
-        }
+        // See SessionImage.kt's doc - adds SVG support alongside the
+        // raster formats BitmapFactory already handled.
+        val bitmap = com.terminator.app.ui.rememberSessionImage(session.imageUri)
         if (bitmap != null) {
             Image(
                 bitmap = bitmap.asImageBitmap(),
@@ -297,12 +291,10 @@ private fun AddSessionDialog(
                 Text("Session picture (optional)", style = MaterialTheme.typography.labelLarge)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (imageUri.isNotBlank()) {
-                        val bitmap = remember(imageUri) {
-                            runCatching {
-                                context.contentResolver.openInputStream(android.net.Uri.parse(imageUri))
-                                    ?.use { android.graphics.BitmapFactory.decodeStream(it) }
-                            }.getOrNull()
-                        }
+                        // See SessionImage.kt's doc - adds SVG support
+                        // alongside the raster formats BitmapFactory
+                        // already handled.
+                        val bitmap = com.terminator.app.ui.rememberSessionImage(imageUri)
                         bitmap?.let {
                             Image(
                                 bitmap = it.asImageBitmap(),
@@ -315,7 +307,17 @@ private fun AddSessionDialog(
                             Spacer(modifier = Modifier.width(8.dp))
                         }
                     }
-                    TextButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) {
+                    TextButton(onClick = {
+                        // "image/*" alone doesn't reliably surface .svg
+                        // files in every device's SAF picker - some
+                        // content providers index SVG under a generic/
+                        // octet-stream MIME rather than image/svg+xml, so
+                        // an image/*-only filter can hide them entirely.
+                        // Listing both explicitly ensures SVG files show up
+                        // now that decodeSessionImage() can actually render
+                        // them (see SessionImage.kt).
+                        imagePicker.launch(arrayOf("image/*", "image/svg+xml"))
+                    }) {
                         Text(if (imageUri.isBlank()) "Choose picture" else "Change")
                     }
                     if (imageUri.isNotBlank()) {

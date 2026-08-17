@@ -253,6 +253,25 @@ class TerminalBuffer(
      * (the common terminal-copy convention - unwritten cells are blank
      * padding, not real content) but a run of spaces in the *middle* of a
      * line is preserved untouched. Multi-row selections are newline-joined.
+     *
+     * Trailing fully-blank rows are dropped from the result (but never
+     * leading ones - see below). The drag-to-extend-selection gesture has
+     * no equivalent of the long-press start point's snap-to-last-real-
+     * content behavior (MainActivity's lastNonBlankColumn call, used only
+     * when a selection is first created): every frame it just floors the
+     * raw finger position to a (row, col), so a drag that runs past the
+     * last line of real output into the blank terminal space below the
+     * prompt - extremely easy to do, since that blank space is most of the
+     * screen after only a couple lines of output - extended the selection
+     * across those empty rows too. Each contributed its own empty string,
+     * still joined by "\n" like any other row, so Copy produced trailing
+     * blank lines the user never meant to grab ("kopyalama yaparken
+     * boşluklar oluşuyor bazen"). Only trimming from the end (not the
+     * start) matters here: a selection's start point already went through
+     * that snap-to-content logic when it was first placed, so a genuinely
+     * blank *first* row only happens if the user deliberately long-pressed
+     * on empty space with no real content anywhere on that row - in which
+     * case leaving it alone is correct, there's nothing to snap to.
      */
     fun selectedText(startRow: Int, startCol: Int, endRow: Int, endCol: Int, scrollOffset: Int): String = lock.withLock {
         var r1 = startRow; var c1 = startCol
@@ -295,6 +314,14 @@ class TerminalBuffer(
                 sb.append(lineAt(row, col, scrollOffset).text)
             }
             lines.add(sb.toString().trimEnd(' '))
+        }
+        // Drop trailing blank rows picked up by an over-drag past the last
+        // real line - see this function's doc. Keeps at least one line so
+        // a selection that is genuinely all blank (single row, or the user
+        // really did drag across nothing but empty space) still copies as
+        // an empty string rather than throwing an index exception here.
+        while (lines.size > 1 && lines.last().isEmpty()) {
+            lines.removeAt(lines.size - 1)
         }
         lines.joinToString("\n")
     }

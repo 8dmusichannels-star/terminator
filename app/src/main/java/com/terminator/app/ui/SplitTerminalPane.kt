@@ -60,6 +60,16 @@ import com.terminator.emulator.TerminalView
  * the caller (MainActivity) can convert to a ratio itself using the same
  * measured size it already tracks for the primary pane, rather than this
  * composable trying to independently measure or own the split geometry.
+ *
+ * Visually this is just a plain straight divider line - no filled block.
+ * It used to render as a solid 20dp-tall Color(0xFF1A1A1A) rectangle plus a
+ * separate little rounded "grip" pill centered on top of it, which read as
+ * a chunky black bar sitting between the two panes rather than a clean
+ * seam. The touch target still needs real height to stay comfortably
+ * draggable with a finger (a true 1px-tall hit area would be unusable), so
+ * the height is kept but made transparent - only a hairline Divider drawn
+ * through its vertical center is actually visible, matching how a desktop
+ * split-pane divider typically looks (a line you can grab, not a block).
  */
 @Composable
 fun SplitDragHandle(onDrag: (deltaPx: Float, containerHeightPx: Float) -> Unit) {
@@ -68,7 +78,6 @@ fun SplitDragHandle(onDrag: (deltaPx: Float, containerHeightPx: Float) -> Unit) 
         modifier = Modifier
             .fillMaxWidth()
             .height(20.dp)
-            .background(Color(0xFF1A1A1A))
             .pointerInput(Unit) {
                 containerHeightPx = size.height.toFloat()
                 detectVerticalDragGestures { change, dragAmount ->
@@ -81,10 +90,10 @@ fun SplitDragHandle(onDrag: (deltaPx: Float, containerHeightPx: Float) -> Unit) 
             },
         contentAlignment = Alignment.Center
     ) {
-        Box(
-            modifier = Modifier
-                .size(width = 36.dp, height = 4.dp)
-                .background(Color.White.copy(alpha = 0.35f), androidx.compose.foundation.shape.RoundedCornerShape(2.dp))
+        androidx.compose.material3.HorizontalDivider(
+            modifier = Modifier.fillMaxWidth(),
+            thickness = 1.dp,
+            color = Color.White.copy(alpha = 0.35f)
         )
     }
 }

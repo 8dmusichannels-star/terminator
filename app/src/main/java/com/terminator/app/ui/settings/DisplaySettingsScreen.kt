@@ -44,6 +44,7 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
     val showStatusbar by repo.flow(SettingsKeys.SHOW_STATUSBAR, false).collectAsState(initial = false)
     val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
     val horizontalModeEnabled by repo.flow(SettingsKeys.HORIZONTAL_MODE, true).collectAsState(initial = true)
+    val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
 
     Scaffold(
         topBar = {
@@ -73,6 +74,15 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
             SwitchRow("Horizontal (landscape) mode", horizontalModeEnabled) {
                 scope.launch { repo.set(SettingsKeys.HORIZONTAL_MODE, it) }
             }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            SwitchRow("Show runner toolbar save button", showRunnerToolbarSave) {
+                scope.launch { repo.set(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, it) }
+            }
+            Text(
+                "The runner toolbar above the terminal is always shown. This only shows/hides its Save button.",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
