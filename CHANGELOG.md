@@ -1,31 +1,74 @@
-# 🚧 Terminator Pre-Release
+# Terminator — Multi Split Screen & Native Copy/Paste Updates
 
-## ✨ What's New
+This release includes major updates to the terminal session interface and Android's native copy/paste system.
 
-### (unreleased) Native text selection
+## ✨ Highlights
 
-* 🔄 **Selection/Copy now uses Compose's native `SelectionContainer`** (requires compose-bom `2026.08.00` / Compose 1.12) instead of the hand-rolled long-press/drag/edge-scroll pointerInput logic - this is the fix for the recurring "kesik kusuk" / partial-copy-with-blank-spaces bug class. `TerminalView` overlays an invisible, real-text row stack on top of its Canvas; Android owns long-press, drag handles, and edge auto-scroll. The **Copy/Paste toolbar is now Android's own native floating toolbar** (`LocalTextToolbar.showMenu`) - not a custom-styled composable anymore. `SelectionToolbar.kt` is gone; Copy pulls straight from the new `SelectionState` API (`rememberSelectionState()`/`selectedTexts`) instead of hand-tracked (row, col) pairs, so there's no more separate highlight-draw vs. copied-text logic to go out of sync. The old toolbar's Clone-session/Save-history quick actions are dropped (the native toolbar can't show custom actions) - both already have other entry points (titlebar "+" and the export menu), so nothing is actually lost. **⚠️ Not yet build-verified on a real toolchain** - `compileSdk`/AGP were bumped to match, but the Kotlin/Compose-compiler plugin setup may also need updating for Kotlin 2.x before this actually compiles. See `TerminalView.kt` and `MainActivity.kt`'s toolbar wiring for details.
+### Experimental Multi Split Screen
 
-### [`60c380b`](https://github.com/8dmusichannels-star/terminator/commit/60c380b)
+Added an experimental **Multi Split Screen** system that allows multiple terminal sessions to be displayed and managed simultaneously.
 
-* 🧩 **ZWJ Emoji Support** added.
-* 🖼️ **Session picture icons** now support `.svg` format.
-* 📋 Fixed a bug where **copying content resulted in blank content**.
-* 🪟 Improved split panel by removing the unwanted **black block**.
-* ➖ Added a **straight divider line** to the split panel.
-* 💾 Added **Runner Session Save** button.
-* 🔘 Improved **Toggle Save Button** management.
+* Added multi-pane terminal support.
+* Added pane focus management.
+* Added pane resizing and repositioning.
+* Added support for adding and removing terminal sessions from the multi-pane layout.
+* Added multi-pane session management.
+* Added an option to broadcast keyboard input to all visible panes.
+* Added experimental multi-pane UI and controls.
+* Added support for switching between different pane modes.
+* Added pane-specific terminal sizing.
+* Existing single/split terminal behavior remains available when multi-pane mode is inactive.
 
-### [`103152f`](https://github.com/8dmusichannels-star/terminator/commit/103152f)
+Commit: [80bb2e7](https://github.com/8dmusichannels-star/terminator/commit/80bb2e7)
 
-* 🪟 Added **Split Screen** support.
-* 🛠️ Added an **experimental toolbar** for split-screen usage.
-* 📋 Added support for saving **all Clipboard session history**.
-* 🤏 Fixed the **pinch gesture slide-up** issue.
-* ⌨️ Fixed keyboard behavior when using **Copy / Paste / Close** toolbar actions.
+---
 
-## 📦 Repository
+## 📋 Native Android Copy/Paste API
 
-[**8dmusichannels-star/terminator**](https://github.com/8dmusichannels-star/terminator)
+Terminator has been migrated to the **native Android copy/paste API system**.
 
-> ⚠️ **Pre-release:** Some split-screen and toolbar features are still experimental and may receive further changes.
+### Changes
+
+* Reworked the Android text selection and copy/paste implementation.
+* Added native Android selection toolbar integration.
+* Removed the previous custom copy/paste handling where no longer required.
+* Improved compatibility with Android's native text selection behavior.
+* Improved interaction between terminal selection and the Android system.
+* Updated terminal selection handling across the application.
+* Continued cleanup and transition toward Android's native clipboard APIs.
+
+Commit: [0dc8396](https://github.com/8dmusichannels-star/terminator/commit/0dc8396)
+
+---
+
+## 🔧 Native Copy/Paste API Transition
+
+The initial transition to the native Android copy/paste system has been completed.
+
+* Native Android copy/paste API is now used by the terminal.
+* Updated terminal text selection behavior.
+* Improved compatibility with Android system selection controls.
+* Removed legacy copy/paste behavior where applicable.
+* Prepared the terminal UI for the newer native Android selection workflow.
+
+Commit: [3b4bd00](https://github.com/8dmusichannels-star/terminator/commit/3b4bd00)
+
+---
+
+## 🧪 Experimental
+
+The **Multi Split Screen** functionality is currently experimental.
+
+Some UI behavior, pane management, and interaction details may change in future releases as the feature continues to be developed and stabilized.
+
+## 🔗 Commits
+
+* [80bb2e7](https://github.com/8dmusichannels-star/terminator/commit/80bb2e7) — Experimental Multi Split Screen
+* [0dc8396](https://github.com/8dmusichannels-star/terminator/commit/0dc8396) — Native Android Copy/Paste API transition and fixes
+* [3b4bd00](https://github.com/8dmusichannels-star/terminator/commit/3b4bd00) — Initial native Android Copy/Paste API implementation
+
+## 📱 Project
+
+**Terminator** is an Android terminal emulator focused on a compact, customizable terminal experience with multiple session support.
+
+More information is available in the [repository](https://github.com/8dmusichannels-star/terminator).
