@@ -12,7 +12,9 @@ plugins {
 
 android {
     namespace = "com.terminator.emulator"
-    compileSdk = 35
+    // 37: required by Compose 1.12 / compose-bom 2026.08.00 below - see
+    // this module's own dependencies block, and app/build.gradle.kts.
+    compileSdk = 37
 
     defaultConfig {
         minSdk = 33
@@ -55,9 +57,13 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
 
-    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    // 2026.08.00 (Compose 1.12): brings native edge-auto-scroll-while-
+    // selecting to SelectionContainer, used by TerminalView's selection
+    // overlay below instead of hand-rolled scroll-while-dragging math.
+    implementation(platform("androidx.compose:compose-bom:2026.08.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-text")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.runtime:runtime")
 }

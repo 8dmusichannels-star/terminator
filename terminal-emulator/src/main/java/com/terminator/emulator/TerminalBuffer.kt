@@ -202,6 +202,27 @@ class TerminalBuffer(
     val maxScrollOffset: Int get() = lock.withLock { scrollback.size }
 
     /**
+     * [row]'s on-screen text, respecting [scrollOffset] the same way
+     * [lineAt] does - but, unlike [selectedText] and [fullText],
+     * deliberately NOT trimmed of trailing spaces. This backs
+     * TerminalView's native-selection overlay: an invisible row of real
+     * text stacked directly on top of the Canvas-painted glyph grid, used
+     * so Android's own SelectionContainer can own long-press/drag
+     * selection and Copy instead of the app hand-tracking (row, col)
+     * pairs. Every character in that overlay row has to land at the same
+     * col*charWidth X position the Canvas below it painted that column
+     * at - trimming here would shorten some rows more than others and
+     * throw that alignment off for every column after the trim point.
+     */
+    fun rowPlainText(row: Int, scrollOffset: Int): String = lock.withLock {
+        val sb = StringBuilder(columns)
+        for (col in 0 until columns) {
+            sb.append(lineAt(row, col, scrollOffset).text)
+        }
+        sb.toString()
+    }
+
+    /**
      * The session's entire visible output as plain text: everything still
      * in scrollback (oldest first) followed by the current on-screen grid,
      * each row trimmed of trailing padding the same way [selectedText]

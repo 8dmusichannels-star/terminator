@@ -34,7 +34,6 @@ import androidx.activity.viewModels
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.Image
@@ -905,91 +904,30 @@ class MainActivity : ComponentActivity() {
                                                 // ONLY thing reading the touch stream (see the
                                                 // comment above), so a long-press timeout has to
                                                 // live inside it rather than compete with it.
+                                                // NOTE (native selection migration): this used to
+                                                // race a hand-rolled long-press timer here to start
+                                                // a custom text selection (setting `selecting = true`
+                                                // and seeding selectionStart/selectionEnd). That's
+                                                // what produced the "kesik kusuk" copy bugs - a
+                                                // separate highlight-draw path and a separate
+                                                // selectedText() path that could each interpret a
+                                                // drag/scroll slightly differently. Long-press-to-
+                                                // select is now handled natively by the
+                                                // SelectionContainer overlay wrapping the terminal
+                                                // (see TerminalView's `selectable` param) - Android
+                                                // owns the long-press timing, the drag handles, the
+                                                // edge auto-scroll, and the copy toolbar, so this
+                                                // loop doesn't need to detect or race a long-press at
+                                                // all anymore. `selecting`/`selectionStart`/
+                                                // `selectionEnd` are left declared below (permanently
+                                                // false/null) purely so the old highlight-draw and
+                                                // old SelectionToolbar wiring further down - which are
+                                                // now dead code paths, kept rather than surgically cut
+                                                // out of this interleaved gesture loop - simply never
+                                                // activate instead of needing to be removed by hand.
                                                 var selecting = false
-                                                val longPressDeadline = System.currentTimeMillis() + viewConfiguration.longPressTimeoutMillis
                                                 while (true) {
-                                                    val remainingMillis = longPressDeadline - System.currentTimeMillis()
-                                                    val event = if (!moved && !selecting && remainingMillis > 0) {
-                                                        withTimeoutOrNull(remainingMillis) { awaitPointerEvent() }
-                                                    } else {
-                                                        awaitPointerEvent()
-                                                    }
-
-                                                    if (event == null) {
-                                                        // Timed out with the finger still down and
-                                                        // stationary (no event arrived within the
-                                                        // deadline) - that's the long-press.
-                                                        selecting = true
-                                                        moved = true
-                                                        // Starting a text selection shouldn't imply
-                                                        // "close the keyboard" - without this, focus
-                                                        // silently drops off the hidden IME field the
-                                                        // moment the long-press gesture takes over
-                                                        // (nothing else claims focus during selection),
-                                                        // and Android auto-dismisses the keyboard as
-                                                        // soon as the focused field loses focus with
-                                                        // nothing requesting it elsewhere. Re-requesting
-                                                        // keeps typing available immediately after
-                                                        // Copy/Paste/Cancel without the user having to
-                                                        // tap the terminal again to bring it back.
-                                                        //
-                                                        // This is also the one reliable place to record
-                                                        // whether the keyboard was open BEFORE the
-                                                        // selection toolbar appears - see
-                                                        // keyboardWasOpenBeforeSelection's own doc for
-                                                        // why the toolbar's Copy/Paste/Cancel callbacks
-                                                        // can't just read live keyboardOpen themselves.
-                                                        // effectiveKeyboardWasOpen() prefers
-                                                        // lastKeyboardIntentOpen (this file's own most
-                                                        // recent show()/hide() call) and only falls back
-                                                        // to live keyboardOpen when nothing has been
-                                                        // called yet - see that function's own doc for
-                                                        // why settledKeyboardOpen's 120ms debounce isn't
-                                                        // actually needed here (the long-press timeout
-                                                        // this branch fires from is already well past it).
-                                                        keyboardWasOpenBeforeSelection = effectiveKeyboardWasOpen()
-                                                        Log.d("KbDebug", "SELECTION START: keyboardOpen=$keyboardOpen settledKeyboardOpen=$settledKeyboardOpen lastKeyboardIntentOpen=$lastKeyboardIntentOpen hiddenFieldFocused=$hiddenFieldFocused -> captured keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
-                                                        if (keyboardWasOpenBeforeSelection) {
-                                                            focusRequester.requestFocus()
-                                                        }
-                                                        val (charWidth, charHeight) = charMetrics
-                                                        Log.d("SelDebug", "SELECTION START: touch=(${lastPos.x},${lastPos.y}) charWidth=$charWidth charHeight=$charHeight liveZoomSize=$liveZoomSize sessionTextSize=$sessionTextSize effectiveTextSize=$effectiveTextSize bufferCols=${viewModel.activeBuffer()?.columns} bufferRows=${viewModel.activeBuffer()?.rows}")
-                                                        if (charWidth > 0f && charHeight > 0f) {
-                                                            val touchedRow = (lastPos.y / charHeight).toInt()
-                                                            val touchedCol = (lastPos.x / charWidth).toInt()
-                                                            // A long-press very commonly lands on blank
-                                                            // terminal space below the actual output -
-                                                            // with only a couple of lines printed, most
-                                                            // of the screen is empty. Starting the
-                                                            // selection exactly where the finger is in
-                                                            // that case just selects nothing (and Copy
-                                                            // silently does nothing). Snap up to the
-                                                            // nearest row above the touch that actually
-                                                            // has content, landing on its last real
-                                                            // character, so a long-press anywhere below
-                                                            // the visible output still selects that
-                                                            // output instead of empty space.
-                                                            val liveBuffer = viewModel.activeBuffer()
-                                                            val snapped = if (liveBuffer != null &&
-                                                                liveBuffer.lastNonBlankColumn(touchedRow, state.scrollOffset) == null
-                                                            ) {
-                                                                val contentRow = (touchedRow downTo 0).firstOrNull { r ->
-                                                                    liveBuffer.lastNonBlankColumn(r, state.scrollOffset) != null
-                                                                }
-                                                                if (contentRow != null) {
-                                                                    val lastCol = liveBuffer.lastNonBlankColumn(contentRow, state.scrollOffset)!!
-                                                                    contentRow to lastCol
-                                                                } else {
-                                                                    touchedRow to touchedCol
-                                                                }
-                                                            } else {
-                                                                touchedRow to touchedCol
-                                                            }
-                                                            selectionStart = snapped
-                                                            selectionEnd = snapped
-                                                        }
-                                                        continue
-                                                    }
+                                                    val event = awaitPointerEvent()
 
                                                     val changes = event.changes
                                                     pointerCount = changes.count { it.pressed }

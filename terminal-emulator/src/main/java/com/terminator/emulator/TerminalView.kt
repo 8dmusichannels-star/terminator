@@ -21,14 +21,25 @@
 package com.terminator.emulator
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.matchParentSize
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.sp
 import android.graphics.Paint
 import android.graphics.Typeface
 
@@ -222,22 +233,85 @@ fun TerminalView(
     // 0 = showing the live screen (normal). >0 = the user has dragged the
     // terminal down to look at scrollback history, this many lines back.
     scrollOffset: Int = 0,
-    // Long-press-to-select range, in (row, col) screen space - null when
-    // nothing is selected. Order doesn't matter (start can be after end,
-    // e.g. dragging upward); the highlight and the copied text both
-    // normalize it the same way.
+    // UNUSED as of the native-selection migration (see the SelectionContainer
+    // overlay below) - selection, its highlight, and Copy are now entirely
+    // owned by Android via SelectionContainer, not by hand-tracked (row, col)
+    // pairs. Kept as no-op parameters (always null in every caller) rather
+    // than removed outright, so MainActivity.kt and SplitTerminalPane.kt
+    // don't both need editing in the same pass as this file.
     selectionStart: Pair<Int, Int>? = null,
     selectionEnd: Pair<Int, Int>? = null,
     modifier: Modifier = Modifier
 ) {
-    // bufferVersion is bumped by the caller's ViewModel on every
-    // TerminalEmulator.Listener callback (cursor move / content change).
-    // Reading it here (even though drawTerminal reads straight from
-    // `buffer`) is what makes Compose actually recompose on new output.
-    Canvas(modifier = modifier.fillMaxSize()) {
-        @Suppress("UNUSED_EXPRESSION")
-        bufferVersion
-        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectionStart, selectionEnd)
+    val density = LocalDensity.current
+    // Same px math drawTerminal uses below (sp -> px via density * fontScale,
+    // then Paint's own font metrics) computed once here too, so the invisible
+    // selection overlay's row height/column width in dp lines up with the
+    // actual glyph grid the Canvas paints. Recomputed only when one of the
+    // inputs that could change it actually changes, not on every frame.
+    val (charWidthPx, charHeightPx) = remember(fontFamily, fontSizeSp, density.density, density.fontScale) {
+        val measuringPaint = Paint().apply {
+            typeface = fontFamily
+            textSize = fontSizeSp * density.density * density.fontScale
+        }
+        measuringPaint.measureText("M") to measuringPaint.fontSpacing
+    }
+
+    Box(modifier = modifier) {
+        // bufferVersion is bumped by the caller's ViewModel on every
+        // TerminalEmulator.Listener callback (cursor move / content change).
+        // Reading it here (even though drawTerminal reads straight from
+        // `buffer`) is what makes Compose actually recompose on new output.
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            @Suppress("UNUSED_EXPRESSION")
+            bufferVersion
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectionStart, selectionEnd)
+        }
+
+        // Native text-selection overlay (requires Compose BOM 2026.08.00 /
+        // Compose Foundation 1.12+, which added edge auto-scroll-while-
+        // selecting to SelectionContainer - see build.gradle.kts). This is
+        // an invisible, real-text row stack positioned exactly over the
+        // Canvas above it. Long-press-to-select, drag-to-extend, the
+        // system's own selection handles, auto-scroll past the viewport
+        // edge, and the floating Copy/Select All toolbar are now all
+        // Android's job via SelectionContainer - none of it is hand-rolled
+        // pointerInput math anymore (see MainActivity's gesture loop,
+        // which no longer starts a selection on long-press for exactly
+        // this reason). The Canvas above still owns everything actually
+        // painted (ANSI colors, bold/italic, the block cursor); this layer
+        // only has to carry the right characters in the right on-screen
+        // positions for selection/copy to work correctly - text color is
+        // fully transparent so it never visually doubles the glyphs
+        // Canvas already drew. It intentionally uses FontFamily.Monospace
+        // rather than the caller's own `fontFamily` Typeface: Compose's
+        // font APIs don't take an android.graphics.Typeface directly, and
+        // since this layer is invisible its glyph shapes don't matter -
+        // only that it stays reasonably monospaced so column positions
+        // (and therefore where a drag lands / where handles appear) stay
+        // close to the Canvas grid underneath. bufferVersion is read via
+        // the enclosing composable's own recomposition (see the Canvas
+        // comment above) rather than a second explicit read here.
+        SelectionContainer {
+            Column(modifier = Modifier.matchParentSize()) {
+                val rowHeightDp = with(density) { charHeightPx.toDp() }
+                val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
+                for (row in 0 until buffer.rows) {
+                    BasicText(
+                        text = buffer.rowPlainText(row, scrollOffset),
+                        style = TextStyle(
+                            color = Color.Transparent,
+                            fontSize = fontSizeSp.sp,
+                            fontFamily = FontFamily.Monospace
+                        ),
+                        softWrap = false,
+                        modifier = Modifier
+                            .height(rowHeightDp)
+                            .width(rowWidthDp)
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -4,7 +4,9 @@ plugins {
 }
 android {
     namespace = "com.terminator.app"
-    compileSdk = 35
+    // 37: required by Compose 1.12 / compose-bom 2026.08.00 below, which
+    // Compose always targets against the latest compileSdk.
+    compileSdk = 37
 
     dependenciesInfo {
         includeInApk = false
@@ -107,7 +109,12 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("com.google.android.material:material:1.12.0")
-    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    // 2026.08.00 (Compose 1.12): brings native edge-auto-scroll-while-
+    // selecting and rememberSelectionState()/SelectionState to
+    // SelectionContainer - what TerminalView's selection overlay
+    // (terminal-emulator module) now relies on instead of the app's old
+    // hand-rolled long-press/drag selection + Copy plumbing.
+    implementation(platform("androidx.compose:compose-bom:2026.08.00"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
