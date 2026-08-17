@@ -1,6 +1,6 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 android {
     namespace = "com.terminator.app"
@@ -17,22 +17,19 @@ android {
         applicationId = "com.terminator.app"
         minSdk = 33
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.6.0"
+        versionCode = 11
+        versionName = "0.6.1"
     }
     buildFeatures {
         compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // No kotlinOptions block needed: with AGP 9's built-in Kotlin support,
+    // kotlin.compilerOptions.jvmTarget defaults to
+    // android.compileOptions.targetCompatibility automatically.
     val keystorePath = System.getenv("KEYSTORE_PATH")
     signingConfigs {
         if (keystorePath != null) {

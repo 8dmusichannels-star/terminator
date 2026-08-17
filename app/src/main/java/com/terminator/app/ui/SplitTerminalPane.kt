@@ -175,8 +175,6 @@ fun SplitTerminalPane(
                         bufferVersion = bufferVersion,
                         backgroundAlpha = 1f,
                         scrollOffset = 0,
-                        selectionStart = null,
-                        selectionEnd = null,
                         modifier = Modifier.fillMaxWidth().fillMaxHeight()
                     )
                 } else {

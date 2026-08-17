@@ -25,14 +25,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.matchParentSize
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.SelectionState
+import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
@@ -233,14 +234,13 @@ fun TerminalView(
     // 0 = showing the live screen (normal). >0 = the user has dragged the
     // terminal down to look at scrollback history, this many lines back.
     scrollOffset: Int = 0,
-    // UNUSED as of the native-selection migration (see the SelectionContainer
-    // overlay below) - selection, its highlight, and Copy are now entirely
-    // owned by Android via SelectionContainer, not by hand-tracked (row, col)
-    // pairs. Kept as no-op parameters (always null in every caller) rather
-    // than removed outright, so MainActivity.kt and SplitTerminalPane.kt
-    // don't both need editing in the same pass as this file.
-    selectionStart: Pair<Int, Int>? = null,
-    selectionEnd: Pair<Int, Int>? = null,
+    // Hoisted by the caller (MainActivity) so its own Copy/Paste/Close
+    // toolbar can read selectionState.selectedTexts and call .clear() -
+    // see that file's SelectionToolbar wiring. Callers that don't need to
+    // observe/drive selection themselves (SplitTerminalPane's panes) can
+    // just leave the default, which still gets full native long-press/
+    // drag selection - they just don't read anything back out of it.
+    selectionState: SelectionState = rememberSelectionState(),
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
@@ -265,7 +265,7 @@ fun TerminalView(
         Canvas(modifier = Modifier.fillMaxSize()) {
             @Suppress("UNUSED_EXPRESSION")
             bufferVersion
-            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectionStart, selectionEnd)
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset)
         }
 
         // Native text-selection overlay (requires Compose BOM 2026.08.00 /
@@ -292,8 +292,17 @@ fun TerminalView(
         // close to the Canvas grid underneath. bufferVersion is read via
         // the enclosing composable's own recomposition (see the Canvas
         // comment above) rather than a second explicit read here.
-        SelectionContainer {
-            Column(modifier = Modifier.matchParentSize()) {
+        SelectionContainer(state = selectionState) {
+            androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
+                android.util.Log.d("SelDebug", "TerminalView: selectedTexts changed, count=${selectionState.selectedTexts.size}")
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onGloballyPositioned { coords ->
+                        android.util.Log.d("SelDebug", "TerminalView: overlay Column size=${coords.size}")
+                    }
+            ) {
                 val rowHeightDp = with(density) { charHeightPx.toDp() }
                 val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
                 for (row in 0 until buffer.rows) {
@@ -321,9 +330,7 @@ private fun DrawScope.drawTerminal(
     fontFamily: Typeface,
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
-    scrollOffset: Int = 0,
-    selectionStart: Pair<Int, Int>? = null,
-    selectionEnd: Pair<Int, Int>? = null
+    scrollOffset: Int = 0
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -350,66 +357,12 @@ private fun DrawScope.drawTerminal(
 
     drawRect(color = Color(palette.defaultBackground).copy(alpha = backgroundAlpha.coerceIn(0f, 1f)), size = size)
 
-    // Selection highlight, drawn before glyphs so text stays legible on top
-    // of it. Normalized the same way TerminalBuffer.selectedText() does -
-    // start/end can be given in either order (dragging up vs down) - so the
-    // two stay visually and textually consistent with each other.
-    if (selectionStart != null && selectionEnd != null) {
-        var (r1, c1) = selectionStart
-        var (r2, c2) = selectionEnd
-        if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-            val tr = r1; val tc = c1
-            r1 = r2; c1 = c2
-            r2 = tr; c2 = tc
-        }
-        val highlightColor = Color(0xFF4A90D9).copy(alpha = 0.45f)
-        for (row in r1..r2) {
-            // NOT `if (row !in 0 until buffer.rows) continue`. Same reason
-            // as TerminalBuffer.selectedText()'s matching loop (see its
-            // own doc): r1/r2 are screen-space rows meant to be resolved
-            // together with scrollOffset via buffer.lineAt(), and a
-            // selection's stationary endpoint can legitimately sit outside
-            // [0, buffer.rows) once auto-scroll-while-dragging has shifted
-            // scrollOffset underneath it. Filtering those rows out here
-            // used to truncate the highlight at the top/bottom edge of the
-            // visible screen even though selectedText() - once it also
-            // stopped filtering them - kept including that same text in
-            // what Copy actually produced, so the blue highlight and what
-            // got copied silently disagreed. buffer.lineAt() already
-            // bounds-checks internally, so there's nothing to guard here.
-            val fromCol = (if (row == r1) c1 else 0).coerceIn(0, buffer.columns - 1)
-            val rawToCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
-
-            // Trailing blank cells on a row (columns never written to, or
-            // cleared back to a space) aren't real content - selectedText()
-            // already trims them from what actually gets copied. The
-            // highlight used to always paint out to the row's raw toCol
-            // (the far edge of the screen for every row except the last),
-            // so dragging a selection down past a couple lines of real
-            // text into the blank rows below it painted a solid full-width
-            // bar across all that empty space - looking like one giant
-            // block instead of just the two or three lines actually
-            // selected. Clamping to the row's last non-space character
-            // keeps the highlight's shape matching what Copy will actually
-            // produce.
-            val lastNonBlankCol = buffer.lastNonBlankColumn(row, scrollOffset)
-            // Only clamp the *end* of the row's highlighted range - the
-            // drag's start column (fromCol, on r1) is always where the
-            // user actually put their finger, so it's left untouched even
-            // if that lands past the last real character.
-            val toCol = if (lastNonBlankCol != null) rawToCol.coerceAtMost(lastNonBlankCol) else -1
-            if (toCol < fromCol) continue
-
-            val x = fromCol * charWidth
-            val y = (row + 1) * charHeight
-            val width = (toCol - fromCol + 1) * charWidth
-            drawRect(
-                color = highlightColor,
-                topLeft = Offset(x, y - charHeight),
-                size = androidx.compose.ui.geometry.Size(width, charHeight)
-            )
-        }
-    }
+    // Selection highlight used to be drawn here by hand (blue rect per
+    // row, normalized/clamped against buffer.lastNonBlankColumn) - removed
+    // now that selection is owned by TerminalView's native
+    // SelectionContainer overlay, which draws its own highlight behind the
+    // (invisible) text it manages. That overlay sits directly on top of
+    // this Canvas, so nothing here needs to paint a highlight anymore.
 
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {

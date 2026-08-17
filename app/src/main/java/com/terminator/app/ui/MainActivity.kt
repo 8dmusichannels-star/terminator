@@ -25,7 +25,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,7 +33,11 @@ import androidx.activity.viewModels
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -65,9 +68,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.foundation.layout.offset
-import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.asImageBitmap
@@ -636,73 +637,35 @@ class MainActivity : ComponentActivity() {
                             var liveZoomSize by remember(activeSessionId) { mutableStateOf<Float?>(null) }
                             var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
 
-                            // Long-press-to-select range (row, col screen-space), shown as a
-                            // highlight in TerminalView and backing the Copy/Paste toolbar
-                            // below. Reset whenever the active session changes so a leftover
-                            // selection from a different session's screen can never linger.
-                            var selectionStart by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
-                            var selectionEnd by remember(activeSessionId) { mutableStateOf<Pair<Int, Int>?>(null) }
-                            // Snapshot of keyboardOpen taken the instant the
-                            // long-press selection starts (see that gesture
-                            // below), NOT read live inside the toolbar's
-                            // Copy/Paste/Cancel callbacks. Those buttons are
-                            // themselves focusable/clickable, so tapping any
-                            // one of them steals Compose focus away from the
-                            // hidden input field first - which flips
-                            // hiddenFieldFocused, and therefore keyboardOpen,
-                            // to false before (or racing with) the button's
-                            // own onClick actually running. Reading the live
-                            // keyboardOpen from inside onCopy/onPaste/onCancel
-                            // meant "was the keyboard open" was answered with
-                            // whatever that race happened to leave behind -
-                            // sometimes still true (falsely re-opening a
-                            // keyboard the user had left closed), sometimes
-                            // already flipped to false (failing to restore a
-                            // keyboard the user had open), rather than
-                            // reliably reflecting the state the user actually
-                            // left things in. This field is set once, before
-                            // the toolbar (and thus its focus-stealing
-                            // buttons) even exists, so it's immune to that
-                            // race.
-                            var keyboardWasOpenBeforeSelection by remember(activeSessionId) { mutableStateOf(false) }
+                            val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
+                            // Hoisted here (rather than created inside TerminalView) so the
+                            // toolbar below can read selectionState.selectedTexts to decide
+                            // whether it's visible and what Copy actually copies - passed down
+                            // into TerminalView's SelectionContainer, which is the only thing
+                            // that actually mutates it (via long-press/drag). Reset whenever the
+                            // active session changes so a leftover selection from a different
+                            // session's screen can never linger.
+                            val selectionState = rememberSelectionState()
+                            LaunchedEffect(activeSessionId) { selectionState.clear() }
                             val clipboardManager = LocalClipboardManager.current
-
-                            // selectionStart/End are absolute (row, col) screen positions, not
-                            // tied to any particular piece of text. The moment new output prints
-                            // to the live screen (bufferVersion bumps), every row after the first
-                            // changed line shifts - whatever the user had highlighted no longer
-                            // lines up with the same on-screen rows, which is what made the
-                            // highlighted/"about to copy" region appear to silently jump/fall to
-                            // a different spot. Clearing the selection as soon as the buffer
-                            // changes underneath it means a finished selection stays exactly
-                            // where the user left it (nothing more prints once they've stopped
-                            // and are just about to tap Copy), while a genuinely live-updating
-                            // screen can't leave a stale, now-wrong highlight sitting around.
-                            //
-                            // Only clears while scrollOffset == 0 (looking at the live screen),
-                            // though - the original version cleared on every bufferVersion bump
-                            // regardless of scroll position, which meant a selection made in
-                            // scrollback (history that has already scrolled off and is frozen -
-                            // scrollOffset > 0) got wiped the instant the *live* screen at the
-                            // bottom changed at all, e.g. a background process printing a line or
-                            // the shell prompt's cursor moving, even though nothing about the
-                            // scrolled-back rows the user actually highlighted had moved. That's
-                            // what made the highlight disappear the moment the user started
-                            // scrolling to look at what they'd selected - ordinary background
-                            // terminal activity kept bumping bufferVersion out from under them.
-                            // Content changes on the live row range genuinely can still invalidate
-                            // a scrollback selection (e.g. the buffer growing enough to push
-                            // scrollback content off the top), but that shows up as scrollOffset
-                            // itself changing/clamping, which selectionStart/End tracking elsewhere
-                            // already accounts for - it doesn't need this effect to also react to
-                            // every bufferVersion bump while scrolled back.
-                            LaunchedEffect(state.bufferVersion, activeSessionId) {
-                                if (state.scrollOffset == 0 && (selectionStart != null || selectionEnd != null)) {
-                                    selectionStart = null
-                                    selectionEnd = null
+                            val textToolbar = LocalTextToolbar.current
+                            // Snapshot of keyboardOpen taken the instant a selection starts -
+                            // see the doc further down (onCopy) for why the toolbar's Copy/
+                            // Paste/Cancel callbacks read this instead of live keyboardOpen.
+                            // Previously captured inline in the gesture loop at the moment a
+                            // long-press started a selection; now that long-press-to-select is
+                            // entirely native (TerminalView's SelectionContainer), there's no
+                            // hook left in this file to snapshot from directly - so this reacts
+                            // to selectionState.selectedTexts transitioning from empty to
+                            // non-empty instead, which happens on the same frame the toolbar
+                            // below becomes visible, before any of its buttons exist to steal
+                            // focus.
+                            var keyboardWasOpenBeforeSelection by remember(activeSessionId) { mutableStateOf(false) }
+                            LaunchedEffect(selectionState.selectedTexts.isNotEmpty()) {
+                                if (selectionState.selectedTexts.isNotEmpty()) {
+                                    keyboardWasOpenBeforeSelection = effectiveKeyboardWasOpen()
                                 }
                             }
-                            val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
                             // The pinch gesture's pointerInput below is keyed only on
                             // activeSessionId (not effectiveTextSize) so it doesn't restart
                             // mid-pinch - rememberUpdatedState lets that long-lived gesture
@@ -848,6 +811,7 @@ class MainActivity : ComponentActivity() {
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
+                                                android.util.Log.d("SelDebug", "outer loop: down received, isConsumed=${down.isConsumed}")
 
                                                 if (viewModel.activeSessionWantsMouseEvents()) {
                                                     // Mouse reporting owns this entire gesture -
@@ -887,46 +851,105 @@ class MainActivity : ComponentActivity() {
                                                 // No mouse reporting active: fall back to the
                                                 // previous behavior - tap toggles the soft
                                                 // keyboard, drag pinches zoom / pans scrollback.
-                                                // Tracked by hand here (instead of the separate
-                                                // detectTapGestures/detectTransformGestures calls
-                                                // this replaced) so this single gesture loop is
-                                                // the only thing reading the touch stream.
                                                 var moved = false
                                                 var lastPos = down.position
                                                 var pointerCount = 1
-                                                // Text selection: a long-press with the finger
-                                                // still down and (near-)stationary starts it,
-                                                // exactly like Android's native text selection.
-                                                // Raced against the existing tap/scroll/pinch
-                                                // handling below via a per-iteration
-                                                // withTimeoutOrNull instead of a second, separate
-                                                // pointerInput - this loop is deliberately the
-                                                // ONLY thing reading the touch stream (see the
-                                                // comment above), so a long-press timeout has to
-                                                // live inside it rather than compete with it.
-                                                // NOTE (native selection migration): this used to
-                                                // race a hand-rolled long-press timer here to start
-                                                // a custom text selection (setting `selecting = true`
-                                                // and seeding selectionStart/selectionEnd). That's
-                                                // what produced the "kesik kusuk" copy bugs - a
-                                                // separate highlight-draw path and a separate
-                                                // selectedText() path that could each interpret a
-                                                // drag/scroll slightly differently. Long-press-to-
-                                                // select is now handled natively by the
+
+                                                // Long-press-to-select is handled natively by the
                                                 // SelectionContainer overlay wrapping the terminal
-                                                // (see TerminalView's `selectable` param) - Android
-                                                // owns the long-press timing, the drag handles, the
-                                                // edge auto-scroll, and the copy toolbar, so this
-                                                // loop doesn't need to detect or race a long-press at
-                                                // all anymore. `selecting`/`selectionStart`/
-                                                // `selectionEnd` are left declared below (permanently
-                                                // false/null) purely so the old highlight-draw and
-                                                // old SelectionToolbar wiring further down - which are
-                                                // now dead code paths, kept rather than surgically cut
-                                                // out of this interleaved gesture loop - simply never
-                                                // activate instead of needing to be removed by hand.
-                                                var selecting = false
-                                                while (true) {
+                                                // (see TerminalView.kt), which runs its own
+                                                // long-press detector as a coroutine on this same
+                                                // pointerInput subtree. In practice that detector
+                                                // never got an uncontested window to actually
+                                                // reach its timeout: as long as this loop kept
+                                                // calling awaitPointerEvent() itself on every
+                                                // frame, it kept "winning" that shared input
+                                                // queue first, so the child's timer effectively
+                                                // never elapsed (confirmed via logging - the
+                                                // child's selectedTexts never changed and this
+                                                // loop never saw a consumed change either).
+                                                //
+                                                // The fix: give the child first, uncontested
+                                                // crack at every down. Wait here - without
+                                                // calling awaitPointerEvent() in a competing loop,
+                                                // just watching for movement - for up to the
+                                                // system's own long-press timeout. If the finger
+                                                // hasn't moved past touch slop by then, treat this
+                                                // as a long-press: stop reading the pointer stream
+                                                // entirely and return, handing the rest of the
+                                                // gesture to SelectionContainer completely.
+                                                val longPressDeadline = System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                                                var longPressCandidate = true
+                                                var fingerLifted = false
+                                                while (longPressCandidate) {
+                                                    val remainingMillis = (longPressDeadline - System.nanoTime()) / 1_000_000L
+                                                    if (remainingMillis <= 0L) break
+                                                    val event = withTimeoutOrNull(remainingMillis) { awaitPointerEvent() } ?: break
+                                                    val changes = event.changes
+                                                    val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
+                                                    if (primary == null || !changes.any { it.pressed }) {
+                                                        // Finger lifted before the long-press
+                                                        // timeout - this was a plain tap, not a
+                                                        // long-press. Skip the normal loop below
+                                                        // entirely (there's no more pointer to
+                                                        // read) and fall straight through to the
+                                                        // tap handling (moved stays false).
+                                                        longPressCandidate = false
+                                                        fingerLifted = true
+                                                        break
+                                                    }
+                                                    pointerCount = changes.count { it.pressed }
+                                                    if (pointerCount >= 2) {
+                                                        // A second finger landed - this is a
+                                                        // pinch, not a long-press. Hand off to the
+                                                        // normal loop below immediately.
+                                                        longPressCandidate = false
+                                                        break
+                                                    }
+                                                    val totalDx = primary.position.x - down.position.x
+                                                    val totalDy = primary.position.y - down.position.y
+                                                    if (kotlin.math.sqrt(totalDx * totalDx + totalDy * totalDy) > viewConfiguration.touchSlop) {
+                                                        // Real movement - this is a scroll, not a
+                                                        // long-press. Apply THIS event's motion
+                                                        // right now instead of discarding it -
+                                                        // otherwise the very first bit of scroll
+                                                        // motion (the event that crossed touch
+                                                        // slop) was silently dropped, since the
+                                                        // normal loop below only starts reading
+                                                        // from the NEXT event onward. That's what
+                                                        // made short/slow drags fail to scroll at
+                                                        // all, or feel like they needed an extra
+                                                        // nudge before anything moved.
+                                                        moved = true
+                                                        val dy = primary.position.y - lastPos.y
+                                                        if (!viewModel.activeSessionInAlternateScreen()) {
+                                                            val (_, charHeight) = charMetrics
+                                                            if (charHeight > 0f) {
+                                                                viewModel.adjustScrollOffset(dy / charHeight)
+                                                            }
+                                                        }
+                                                        primary.consume()
+                                                        lastPos = primary.position
+                                                        longPressCandidate = false
+                                                        break
+                                                    }
+                                                    // Still down, still stationary, timeout not
+                                                    // yet reached - keep waiting without
+                                                    // consuming anything.
+                                                }
+                                                if (longPressCandidate) {
+                                                    // Timeout reached with the finger still down
+                                                    // and stationary: this is a long-press.
+                                                    // SelectionContainer's own detector has had
+                                                    // this exact same window, uncontested, to
+                                                    // reach its own timeout and claim the
+                                                    // gesture - don't read the pointer stream
+                                                    // again for the rest of this gesture.
+                                                    android.util.Log.d("SelDebug", "outer loop: long-press window elapsed, backing off entirely")
+                                                    return@awaitEachGesture
+                                                }
+
+                                                while (!fingerLifted) {
                                                     val event = awaitPointerEvent()
 
                                                     val changes = event.changes
@@ -934,140 +957,9 @@ class MainActivity : ComponentActivity() {
                                                     val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
                                                     if (primary == null || !changes.any { it.pressed }) break
 
-                                                    if (selecting) {
-                                                        // Dragging while selecting extends the
-                                                        // range instead of scrolling/pinching -
-                                                        // exactly one finger is expected here since
-                                                        // a second finger joining mid-selection just
-                                                        // keeps tracking the original one.
-                                                        val (charWidth, charHeight) = charMetrics
-                                                        if (charWidth > 0f && charHeight > 0f) {
-                                                            val rawCol = (primary.position.x / charWidth).toInt()
-                                                            val rawRow = (primary.position.y / charHeight).toInt()
-                                                            val current = selectionEnd
-                                                            if (current == null) {
-                                                                selectionEnd = rawRow to rawCol
-                                                            } else {
-                                                                val (curRow, curCol) = current
-                                                                // Hysteresis band around each cell's
-                                                                // boundary: a few natural-tremor pixels
-                                                                // (well under one whole cell) sitting
-                                                                // right at the edge between two rows/
-                                                                // cols used to flip selectionEnd back
-                                                                // and forth every frame with a plain
-                                                                // floor(position/cellSize) - visually
-                                                                // that read as the selection endpoint
-                                                                // "falling"/jittering even though the
-                                                                // finger barely moved. Only actually
-                                                                // moves to a new cell once the touch is
-                                                                // solidly inside it (past a margin from
-                                                                // the boundary), same idea as how native
-                                                                // Android text-selection handles keeps
-                                                                // handles from chattering at cell edges.
-                                                                val margin = 0.25f
-                                                                val rowCenterOffset = (primary.position.y / charHeight) - rawRow
-                                                                val colCenterOffset = (primary.position.x / charWidth) - rawCol
-                                                                val newRow = when {
-                                                                    rawRow == curRow -> curRow
-                                                                    rawRow > curRow && rowCenterOffset > margin -> rawRow
-                                                                    rawRow < curRow && rowCenterOffset < (1f - margin) -> rawRow
-                                                                    else -> curRow
-                                                                }
-                                                                val newCol = when {
-                                                                    rawCol == curCol -> curCol
-                                                                    rawCol > curCol && colCenterOffset > margin -> rawCol
-                                                                    rawCol < curCol && colCenterOffset < (1f - margin) -> rawCol
-                                                                    else -> curCol
-                                                                }
-                                                                selectionEnd = newRow to newCol
-                                                            }
-                                                        }
-                                                        // Edge auto-scroll: holding the finger near the
-                                                        // top/bottom of the terminal while selecting
-                                                        // scrolls scrollback into view in that direction,
-                                                        // same as native Android text selection does at
-                                                        // the edge of a scrollable text view. Without
-                                                        // this, a selection drag had no way to reach any
-                                                        // content above/below what happened to already be
-                                                        // on screen when the long-press started - the
-                                                        // `if (selecting) { ... continue }` branch here
-                                                        // returns before ever reaching the plain-drag
-                                                        // scroll logic further down, so selecting and
-                                                        // scrolling were mutually exclusive.
-                                                        val viewportHeight = latestTerminalSize?.height?.toFloat()
-                                                        if (viewportHeight != null && viewportHeight > 0f &&
-                                                            !viewModel.activeSessionInAlternateScreen()
-                                                        ) {
-                                                            val edgeZone = (viewportHeight * 0.15f).coerceAtMost(charHeight * 3f)
-                                                            val distanceFromTop = primary.position.y
-                                                            val distanceFromBottom = viewportHeight - primary.position.y
-                                                            // scrollOffset=0 is the live/newest screen;
-                                                            // scrollOffset>0 is N lines back into history
-                                                            // (see TerminalBuffer.lineAt's doc). Dragging
-                                                            // toward the TOP edge means "let me keep
-                                                            // selecting upward, past what's currently on
-                                                            // screen" - i.e. reveal OLDER content, which
-                                                            // means scrollOffset must INCREASE. Dragging
-                                                            // toward the BOTTOM edge is the opposite: reveal
-                                                            // content toward the live end, so scrollOffset
-                                                            // must DECREASE. This was backwards before (top
-                                                            // edge decreased it, bottom edge increased it),
-                                                            // which is what made the selection appear to
-                                                            // jump backward/upward while dragging down: the
-                                                            // view itself was scrolling toward history
-                                                            // instead of toward the live screen, opposite to
-                                                            // the finger's own direction.
-                                                            val scrollLines = when {
-                                                                distanceFromTop < edgeZone && charHeight > 0f -> {
-                                                                    // Nearer the edge -> faster scroll, same
-                                                                    // proportional-speed idea as native
-                                                                    // Android edge-scroll-while-selecting.
-                                                                    val proximity = 1f - (distanceFromTop / edgeZone).coerceIn(0f, 1f)
-                                                                    0.3f + proximity * 0.9f
-                                                                }
-                                                                distanceFromBottom < edgeZone && charHeight > 0f -> {
-                                                                    val proximity = 1f - (distanceFromBottom / edgeZone).coerceIn(0f, 1f)
-                                                                    -(0.3f + proximity * 0.9f)
-                                                                }
-                                                                else -> 0f
-                                                            }
-                                                            if (scrollLines != 0f) {
-                                                                // adjustScrollOffset returns the actual
-                                                                // applied delta (clamped to the buffer's
-                                                                // bounds, so it can be 0 even when
-                                                                // scrollLines isn't, e.g. already at the
-                                                                // top/bottom of scrollback).
-                                                                //
-                                                                // Only selectionStart gets shifted here,
-                                                                // not selectionEnd. selectionStart was
-                                                                // anchored in an earlier frame (when the
-                                                                // long-press first landed) against
-                                                                // whatever scrollOffset was active then,
-                                                                // so it does need correcting when
-                                                                // scrollOffset moves out from under it -
-                                                                // same reasoning as the plain-scroll
-                                                                // branch below. selectionEnd is different:
-                                                                // it's freshly recomputed THIS SAME frame,
-                                                                // just above, straight from the finger's
-                                                                // raw position divided by the current
-                                                                // charHeight - it's already correct for
-                                                                // the current scrollOffset. Shifting it
-                                                                // again on top of that double-counted the
-                                                                // scroll, so every frame the edge-scroll
-                                                                // fired while the finger held still near
-                                                                // the edge, the highlight's far end kept
-                                                                // climbing away on its own - the finger
-                                                                // wasn't moving, but the stored row kept
-                                                                // incrementing anyway.
-                                                                val appliedDelta = viewModel.adjustScrollOffset(scrollLines)
-                                                                if (appliedDelta != 0) {
-                                                                    selectionStart = selectionStart?.let { (r, c) -> (r + appliedDelta) to c }
-                                                                }
-                                                            }
-                                                        }
-                                                        primary.consume()
-                                                        lastPos = primary.position
-                                                        continue
+                                                    if (changes.any { it.isConsumed }) {
+                                                        android.util.Log.d("SelDebug", "outer loop: backing off, child consumed a change")
+                                                        break
                                                     }
 
                                                     if (pointerCount >= 2 && zoomEnabled) {
@@ -1180,21 +1072,7 @@ class MainActivity : ComponentActivity() {
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
                                                                 val (_, charHeight) = charMetrics
                                                                 if (charHeight > 0f) {
-                                                                    // Same reasoning as the selecting-drag
-                                                                    // edge-autoscroll case above: a finished
-                                                                    // selection (drag already lifted, still
-                                                                    // shown while the user decides whether to
-                                                                    // tap Copy) is a plain, unrelated scroll
-                                                                    // drag away from having its stored rows
-                                                                    // silently point at different content -
-                                                                    // nothing about this branch requires the
-                                                                    // selection to be gone, only that this
-                                                                    // particular drag isn't extending it.
-                                                                    val appliedDelta = viewModel.adjustScrollOffset(dy / charHeight)
-                                                                    if (appliedDelta != 0) {
-                                                                        selectionStart = selectionStart?.let { (r, c) -> (r + appliedDelta) to c }
-                                                                        selectionEnd = selectionEnd?.let { (r, c) -> (r + appliedDelta) to c }
-                                                                    }
+                                                                    viewModel.adjustScrollOffset(dy / charHeight)
                                                                 }
                                                             }
                                                             primary.consume()
@@ -1203,48 +1081,43 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
 
-                                                if (!selecting) {
-                                                    if (selectionStart != null) {
-                                                        selectionStart = null
-                                                        selectionEnd = null
-                                                    } else if (!moved && softKeyboardEnabled) {
-                                                        // Was keyboardController?.hide()/show() (the
-                                                        // Compose IME abstraction) - left over from
-                                                        // before the toolbar's Copy/Paste/Cancel
-                                                        // handlers were switched to
-                                                        // WindowInsetsControllerCompat below, for
-                                                        // exactly the same reason documented at their
-                                                        // call sites: keyboardController's show()/
-                                                        // hide() is unreliable here specifically,
-                                                        // producing the open-keyboard-closes/closed-
-                                                        // keyboard-opens-then-a-moment-later-flips-back
-                                                        // behavior. This plain tap-to-toggle path never
-                                                        // got migrated when the toolbar paths were, so
-                                                        // a tap on the terminal right after a Copy/
-                                                        // Paste/Cancel restore could still hit this
-                                                        // unreliable API and re-trigger the same bug a
-                                                        // moment later. Using insetsController here too
-                                                        // makes every keyboard show/hide in this file go
-                                                        // through the one API that's actually reliable.
-                                                        // Reads keyboardOpen (the live, per-frame inset
-                                                        // read) rather than effectiveKeyboardWasOpen()/
-                                                        // settledKeyboardOpen deliberately: a plain tap is
-                                                        // a direct toggle of whatever's on screen RIGHT
-                                                        // NOW, not a "restore what it was before some
-                                                        // other action" decision like Copy/Paste/Cancel's
-                                                        // handlers make - those need the debounced/intent
-                                                        // reads specifically because they're restoring a
-                                                        // PRIOR state after an intervening selection, a
-                                                        // case that doesn't apply here.
-                                                        if (keyboardOpen) {
-                                                            focusManager.clearFocus()
-                                                            insetsController.hide(WindowInsetsCompat.Type.ime())
-                                                            lastKeyboardIntentOpen = false
-                                                        } else {
-                                                            focusRequester.requestFocus()
-                                                            currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
-                                                            lastKeyboardIntentOpen = true
-                                                        }
+                                                if (!moved && softKeyboardEnabled) {
+                                                    // Was keyboardController?.hide()/show() (the
+                                                    // Compose IME abstraction) - left over from
+                                                    // before the toolbar's Copy/Paste/Cancel
+                                                    // handlers were switched to
+                                                    // WindowInsetsControllerCompat below, for
+                                                    // exactly the same reason documented at their
+                                                    // call sites: keyboardController's show()/
+                                                    // hide() is unreliable here specifically,
+                                                    // producing the open-keyboard-closes/closed-
+                                                    // keyboard-opens-then-a-moment-later-flips-back
+                                                    // behavior. This plain tap-to-toggle path never
+                                                    // got migrated when the toolbar paths were, so
+                                                    // a tap on the terminal right after a Copy/
+                                                    // Paste/Cancel restore could still hit this
+                                                    // unreliable API and re-trigger the same bug a
+                                                    // moment later. Using insetsController here too
+                                                    // makes every keyboard show/hide in this file go
+                                                    // through the one API that's actually reliable.
+                                                    // Reads keyboardOpen (the live, per-frame inset
+                                                    // read) rather than effectiveKeyboardWasOpen()/
+                                                    // settledKeyboardOpen deliberately: a plain tap is
+                                                    // a direct toggle of whatever's on screen RIGHT
+                                                    // NOW, not a "restore what it was before some
+                                                    // other action" decision like Copy/Paste/Cancel's
+                                                    // handlers make - those need the debounced/intent
+                                                    // reads specifically because they're restoring a
+                                                    // PRIOR state after an intervening selection, a
+                                                    // case that doesn't apply here.
+                                                    if (keyboardOpen) {
+                                                        focusManager.clearFocus()
+                                                        insetsController.hide(WindowInsetsCompat.Type.ime())
+                                                        lastKeyboardIntentOpen = false
+                                                    } else {
+                                                        focusRequester.requestFocus()
+                                                        currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                        lastKeyboardIntentOpen = true
                                                     }
                                                 }
                                             }
@@ -1302,8 +1175,7 @@ class MainActivity : ComponentActivity() {
                                             // behind it - otherwise stay fully opaque as before.
                                             backgroundAlpha = if (wallpaperUriStr.isNotBlank()) blurAlpha else 1f,
                                             scrollOffset = state.scrollOffset,
-                                            selectionStart = selectionStart,
-                                            selectionEnd = selectionEnd,
+                                            selectionState = selectionState,
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     }
@@ -1316,145 +1188,60 @@ class MainActivity : ComponentActivity() {
                                             .background(Color.Black.copy(alpha = 0.12f))
                                     )
 
-                                    if (selectionStart != null && selectionEnd != null) {
-                                        // Anchored near the selection itself - normally just
-                                        // above its topmost row - rather than always pinned to
-                                        // the very top of the screen regardless of where the
-                                        // selection actually is. A selection made low on screen
-                                        // (the common case: selecting recent output, which is
-                                        // near the bottom) used to put the toolbar far away from
-                                        // what was just selected. Falls back to below the
-                                        // selection when it starts too close to the top for the
-                                        // toolbar to fit above it.
-                                        //
-                                        // Neither branch used to be clamped against this Box's
-                                        // own bounds, only computed from the selection's row -
-                                        // so a selection near row 0 (aboveY negative, falling
-                                        // through to the below-selection branch right at the
-                                        // top) could still land close enough to 0 to read as
-                                        // sitting under the titlebar above this Box, and a
-                                        // selection near the bottom of a tall/scrolled buffer
-                                        // could compute a y taller than the Box itself, pushing
-                                        // the toolbar down into the VirtualKeyBar/soft-keyboard
-                                        // area below - there was no barrier keeping either edge
-                                        // in bounds. Clamping y into
-                                        // [0, boxHeight - toolbarHeight - margin] using the same
-                                        // measured size the resize logic above already tracks
-                                        // (latestTerminalSize) keeps the toolbar fully inside
-                                        // the terminal's own area no matter where the selection
-                                        // sits.
-                                        val (charWidth, charHeight) = charMetrics
-                                        val localDensity = LocalDensity.current
-                                        val toolbarOffset = if (charHeight > 0f) {
-                                            val (r1, _) = selectionStart!!
-                                            val (r2, _) = selectionEnd!!
-                                            val topRow = minOf(r1, r2)
-                                            val toolbarHeightPx = with(localDensity) { 44.dp.toPx() }
-                                            val margin = with(localDensity) { 8.dp.toPx() }
-                                            val boxHeightPx = latestTerminalSize?.height?.toFloat()
-                                            val aboveY = topRow * charHeight - toolbarHeightPx - margin
-                                            // Was: aboveY < 0 (not enough room above the
-                                            // selection's top row) always fell through to
-                                            // placing the toolbar BELOW the selection instead.
-                                            // That's fine while dragging top-to-bottom (topRow
-                                            // only grows, so this branch is only ever hit once,
-                                            // right at the very start), but dragging
-                                            // bottom-to-top makes topRow shrink every frame as
-                                            // the selection grows upward - and topRow can't go
-                                            // negative, so once it hit the screen's first
-                                            // visible row it stayed there while the drag kept
-                                            // going, meaning aboveY stayed negative and the
-                                            // toolbar kept re-committing to the below-selection
-                                            // branch every single frame instead of ever
-                                            // switching back above. That's what read as the
-                                            // toolbar "refusing" to move up and sitting stuck
-                                            // below. Clamping aboveY to 0 (pinning the toolbar
-                                            // to the very top of the terminal's own area) rather
-                                            // than falling back below fixes that: with less than
-                                            // a full toolbar's height of room above the
-                                            // selection, sitting flush against the top edge is
-                                            // still "above" in the way that matters (out of the
-                                            // way of the text being selected), and keeps
-                                            // tracking topRow the same way the below-selection
-                                            // branch already did before this fix, instead of
-                                            // jumping to a different anchor (the selection's
-                                            // bottom) that isn't moving the same way the drag is.
-                                            val rawY = if (boxHeightPx != null && boxHeightPx > 0f &&
-                                                aboveY < 0f && (topRow * charHeight) > boxHeightPx / 2f
-                                            ) {
-                                                // Selection's top row is in the LOWER half of the
-                                                // screen but still too close to some other edge
-                                                // for the toolbar to fit above it (e.g. a very
-                                                // short selection right under the titlebar isn't
-                                                // this case - topRow*charHeight here is checked
-                                                // against the box's own vertical center, not 0,
-                                                // specifically so a selection near row 0 doesn't
-                                                // land here) - genuinely better placed below.
-                                                val bottomRow = maxOf(r1, r2)
-                                                (bottomRow + 1) * charHeight + margin
-                                            } else {
-                                                aboveY.coerceAtLeast(0f)
-                                            }
-                                            val y = if (boxHeightPx != null && boxHeightPx > 0f) {
-                                                rawY.coerceIn(0f, (boxHeightPx - toolbarHeightPx - margin).coerceAtLeast(0f))
-                                            } else {
-                                                rawY.coerceAtLeast(0f)
-                                            }
-                                            IntOffset(0, y.roundToInt())
-                                        } else {
-                                            IntOffset.Zero
+                                    // Android's own native floating toolbar (the same system
+                                    // bubble every app - Chrome, Termux, etc. - uses), not the
+                                    // app's custom-styled SelectionToolbar composable anymore.
+                                    // SelectionContainer already pops its own copy of this
+                                    // automatically the moment a selection exists, but only with
+                                    // Copy/Select All - there's no "editable target" for it to
+                                    // infer a Paste action from. Calling showMenu() ourselves
+                                    // here (after SelectionContainer's own call, since this
+                                    // LaunchedEffect fires on the same selectedTexts change)
+                                    // replaces that with an equivalent native bubble that also
+                                    // offers Paste. rect is an approximation - SelectionState
+                                    // doesn't expose per-row pixel bounds (see the toolbar-
+                                    // positioning comment this replaced), so this just anchors
+                                    // near the top of the terminal's own area rather than
+                                    // tracking exactly where the selection sits.
+                                    LaunchedEffect(selectionState.selectedTexts.isNotEmpty()) {
+                                        if (selectionState.selectedTexts.isEmpty()) {
+                                            textToolbar.hide()
+                                            return@LaunchedEffect
                                         }
-                                        // Animates toward the target position instead of
-                                        // snapping there instantly - a selection dragged
-                                        // upward (bottom-to-top) moves topRow every frame,
-                                        // which used to move the toolbar in an instant jump
-                                        // each time rather than a smooth follow. Explicit short
-                                        // tween (not the ~300ms spring default) because the
-                                        // default duration was itself the problem reported
-                                        // after adding this: the toolbar visibly lagged behind
-                                        // and sat in its old (lower) position for a beat right
-                                        // as an upward drag finished, before catching up to
-                                        // where the selection actually ended. 80ms is fast
-                                        // enough to read as "keeping up with your finger"
-                                        // rather than "animating to a static target" while
-                                        // still smoothing out the per-frame jumps that made the
-                                        // original instant-snap version feel jerky.
-                                        val animatedToolbarOffset by animateIntOffsetAsState(
-                                            targetValue = toolbarOffset,
-                                            animationSpec = tween(durationMillis = 80),
-                                            label = "selectionToolbarOffset"
-                                        )
-                                        SelectionToolbar(
-                                            modifier = Modifier
-                                                .align(Alignment.TopStart)
-                                                .offset { animatedToolbarOffset },
-                                            onCopy = {
+                                        val boxWidthPx = latestTerminalSize?.width?.toFloat() ?: 0f
+                                        textToolbar.showMenu(
+                                            rect = Rect(0f, 0f, boxWidthPx, 1f),
+                                            onCopyRequested = {
                                                 Log.d("KbDebug", "onCopy fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
-                                                val (r1, c1) = selectionStart!!
-                                                val (r2, c2) = selectionEnd!!
-                                                Log.d("SelDebug", "onCopy: raw selectionStart=($r1,$c1) selectionEnd=($r2,$c2) scrollOffset=${state.scrollOffset}")
-                                                val text = buffer?.selectedText(r1, c1, r2, c2, state.scrollOffset).orEmpty()
+                                                // selectedTexts is one AnnotatedString per Text
+                                                // composable the selection spans (i.e. one per
+                                                // terminal row in TerminalView's overlay) -
+                                                // Compose Foundation joins these with "\n" when
+                                                // multiple Text composables are involved (see the
+                                                // Compose 1.12 changelog), so this doesn't need to
+                                                // add its own line separators.
+                                                val text = selectionState.selectedTexts.joinToString("\n") { it.text }
                                                 Log.d("SelDebug", "onCopy: copied text=[$text] length=${text.length}")
                                                 if (text.isNotEmpty()) {
                                                     clipboardManager.setText(AnnotatedString(text))
                                                 }
-                                                selectionStart = null
-                                                selectionEnd = null
+                                                selectionState.clear()
+                                                textToolbar.hide()
                                                 // Tapping a toolbar button steals focus away from
                                                 // the hidden input field, which drops
                                                 // hiddenFieldFocused (and therefore keyboardOpen)
                                                 // to false - the soft keyboard would otherwise
                                                 // close itself right along with dismissing the
                                                 // selection, forcing the user to tap the terminal
-                                                // again just to keep typing after a Copy/Paste/
-                                                // Cancel. Restoring it here (only when the keyboard
-                                                // was actually open BEFORE the toolbar appeared -
+                                                // again just to keep typing after a Copy/Paste.
+                                                // Restoring it here (only when the keyboard was
+                                                // actually open BEFORE the toolbar appeared -
                                                 // keyboardWasOpenBeforeSelection, not the live
                                                 // keyboardOpen this button's own tap just raced
                                                 // against and possibly already flipped) brings it
                                                 // back immediately instead, and - just as
                                                 // importantly - does nothing when the keyboard was
-                                                // already closed, so tapping Copy/Paste/Cancel can't
+                                                // already closed, so tapping Copy/Paste can't
                                                 // spuriously pop the keyboard open on its own.
                                                 //
                                                 // requestFocus() alone is not reliable here: once
@@ -1474,8 +1261,8 @@ class MainActivity : ComponentActivity() {
                                                 // system to actually show its keyboard - a state
                                                 // Android can resolve either way depending on
                                                 // what still holds an active input connection,
-                                                // which is what made "closed -> tap Copy/Paste/
-                                                // Cancel -> opens anyway" intermittent instead of
+                                                // which is what made "closed -> tap Copy/Paste ->
+                                                // opens anyway" intermittent instead of
                                                 // consistently one behavior or the other.
                                                 //
                                                 // requestFocus() itself already fires its own IME
@@ -1518,7 +1305,7 @@ class MainActivity : ComponentActivity() {
                                                     lastKeyboardIntentOpen = false
                                                 }
                                             },
-                                            onPaste = {
+                                            onPasteRequested = {
                                                 Log.d("KbDebug", "onPaste fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 clipboardManager.getText()?.text?.let { pasted ->
                                                     if (pasted.isNotEmpty()) {
@@ -1540,17 +1327,15 @@ class MainActivity : ComponentActivity() {
                                                         viewModel.sendInput(pasted.replace('\n', '\r'))
                                                     }
                                                 }
-                                                selectionStart = null
-                                                selectionEnd = null
-                                                // See onCopy's comment above for why this reads
-                                                // keyboardWasOpenBeforeSelection rather than the
-                                                // live keyboardOpen, and defers show() to the next
-                                                // frame rather than calling it synchronously right
-                                                // after requestFocus().
+                                                selectionState.clear()
+                                                textToolbar.hide()
+                                                // See onCopyRequested's comment above for why this
+                                                // reads keyboardWasOpenBeforeSelection rather than
+                                                // the live keyboardOpen, and defers show() to the
+                                                // next frame rather than calling it synchronously
+                                                // right after requestFocus().
                                                 if (keyboardWasOpenBeforeSelection) {
                                                     focusRequester.requestFocus()
-                                                    // See onCopy's comment above for why this is
-                                                    // posted rather than called synchronously here.
                                                     currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
                                                     lastKeyboardIntentOpen = true
                                                 } else {
@@ -1558,38 +1343,6 @@ class MainActivity : ComponentActivity() {
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
                                                     lastKeyboardIntentOpen = false
                                                 }
-                                            },
-                                            onCancel = {
-                                                Log.d("KbDebug", "onCancel fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
-                                                selectionStart = null
-                                                selectionEnd = null
-                                                // See onCopy's comment above for why this reads
-                                                // keyboardWasOpenBeforeSelection rather than the
-                                                // live keyboardOpen, and defers show() to the next
-                                                // frame rather than calling it synchronously right
-                                                // after requestFocus().
-                                                if (keyboardWasOpenBeforeSelection) {
-                                                    focusRequester.requestFocus()
-                                                    // See onCopy's comment above for why this is
-                                                    // posted rather than called synchronously here.
-                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
-                                                    lastKeyboardIntentOpen = true
-                                                } else {
-                                                    focusManager.clearFocus()
-                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
-                                                    lastKeyboardIntentOpen = false
-                                                }
-                                            },
-                                            // Fast clone: no popup, unlike the titlebar "+"
-                                            // (QuickAddSessionPickerDialog) - see
-                                            // SelectionToolbar's onCloneClicked doc.
-                                            onCloneClicked = { viewModel.duplicateActiveSession() },
-                                            // Always available - exports the active session's
-                                            // full terminal output (screen + scrollback), not
-                                            // gated behind any toggle since there's no persisted
-                                            // log to opt in to anymore.
-                                            onSaveHistoryClicked = {
-                                                terminalExportLauncher.launch("terminal-output.txt")
                                             }
                                         )
                                     }
