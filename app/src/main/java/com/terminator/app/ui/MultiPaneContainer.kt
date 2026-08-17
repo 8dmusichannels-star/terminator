@@ -539,7 +539,7 @@ private fun PaneContent(
                     tint = Color.White.copy(alpha = 0.4f),
                     modifier = Modifier.size(14.dp)
                 )
-                Spacer(4.dp)
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.width(4.dp))
             }
             Text(
                 label,
@@ -662,11 +662,6 @@ private fun PaneContent(
             }
         }
     }
-}
-
-@Composable
-private fun Spacer(widthDp: Int) {
-    Box(modifier = Modifier.width(widthDp.dp))
 }
 
 /**
