@@ -242,6 +242,12 @@ class MainActivity : ComponentActivity() {
             // doc). The persistent RunnerToolbar bar above the terminal
             // that this setting used to also gate has been removed.
             val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
+            // Settings > Display > "Broadcast to all panes" - see
+            // MainViewModel.sendPaneInput's doc. Only consulted while
+            // multi-pane mode is on (state.panes non-empty); has no effect
+            // on the classic single/split-pane path's own separate
+            // broadcastInput flag.
+            val broadcastAllPanes by repo.flow(SettingsKeys.BROADCAST_ALL_PANES, false).collectAsState(initial = false)
             // Settings > Keyboard > Input Mode. See the keyboardOptions
             // wiring on the hidden input field below for what each mode
             // actually changes.
@@ -405,6 +411,12 @@ class MainActivity : ComponentActivity() {
                 // See onQuickAddClicked below for why "+" opens this instead
                 // of calling viewModel.duplicateActiveSession() directly.
                 var showQuickAddPicker by remember { mutableStateOf(false) }
+                // MultiPaneContainer's toolbar "+" button state: reuses the
+                // same running-session picker dialog as the titlebar "+",
+                // but wired to viewModel.addPaneSession instead of
+                // duplicateSession - see the dialog's call site near the
+                // bottom of this Scaffold for both usages side by side.
+                var showAddPanePicker by remember { mutableStateOf(false) }
                 // CTRL/ALT on the virtual key bar were pure no-ops before -
                 // sendSequence was "" and nothing ever consumed them. They're
                 // one-shot modifiers: tap CTRL/ALT, then type a regular
@@ -768,6 +780,50 @@ class MainActivity : ComponentActivity() {
                             }
 
                             Column(modifier = Modifier.fillMaxSize()) {
+                              // Multi-pane mode (see MainUiState.panes's doc) takes over this
+                              // entire Column's content whenever any panes are open, instead of
+                              // the classic single/split-pane rendering below. Kept as a single
+                              // top-level branch here (rather than threading a check through
+                              // every inner block) so the classic path underneath - including
+                              // its primary-pane gesture stack, virtual key bar and IME wiring -
+                              // stays completely untouched and byte-for-byte identical to before
+                              // whenever panes is empty (the common case).
+                              if (state.panes.isNotEmpty()) {
+                                MultiPaneContainer(
+                                    panes = state.panes,
+                                    mode = state.paneMode,
+                                    focusedRuntimeId = state.focusedPaneRuntimeId,
+                                    bufferVersion = state.bufferVersion,
+                                    bufferFor = { runtimeId -> viewModel.bufferFor(runtimeId) },
+                                    labelFor = { runtimeId ->
+                                        state.runningSessions.firstOrNull { it.runtimeId == runtimeId }?.label ?: "Terminal"
+                                    },
+                                    palette = terminalPalette,
+                                    fontFamily = terminalTypeface,
+                                    fontSizeSp = textSize,
+                                    onInput = { runtimeId, text ->
+                                        viewModel.sendPaneInput(text, broadcastAllPanes)
+                                        // sendPaneInput() only targets the focused pane (or every
+                                        // pane, if broadcasting) - it deliberately ignores which
+                                        // pane's OWN hidden field produced this call, matching
+                                        // "basarak focus etmek gerekir": typing into a pane that
+                                        // ISN'T focused shouldn't silently type there anyway; the
+                                        // tap that focused it already happened before the IME
+                                        // field could produce any text. runtimeId is accepted for
+                                        // signature symmetry with onFocusPane/onClosePane below
+                                        // but intentionally unused here.
+                                    },
+                                    onFocusPane = { runtimeId -> viewModel.bringPaneToFront(runtimeId) },
+                                    onClosePane = { runtimeId -> viewModel.removePane(runtimeId) },
+                                    onMovePane = { runtimeId, offset -> viewModel.movePane(runtimeId, offset) },
+                                    onResizePane = { runtimeId, size -> viewModel.resizePane(runtimeId, size) },
+                                    onResizeSessionPty = { runtimeId, cols, rws -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws) },
+                                    onSetMode = { mode -> viewModel.setPaneMode(mode) },
+                                    onAddPaneRequested = { showAddPanePicker = true },
+                                    onExitMultiPane = { viewModel.exitMultiPaneMode() },
+                                    modifier = Modifier.weight(1f)
+                                )
+                              } else {
                                 // Split-screen (see MainUiState.splitRuntimeId's doc). When
                                 // splitRuntimeId is null this block is a complete no-op - the
                                 // Box right after it keeps exactly its old weight(1f)/
@@ -1711,6 +1767,7 @@ class MainActivity : ComponentActivity() {
                                         onMenuClicked = { viewModel.setDrawerOpen(true) }
                                     )
                                 }
+                              }
                             }
 
                             // Edge-swipe-to-open: a narrow strip along the left edge that
@@ -1771,6 +1828,15 @@ class MainActivity : ComponentActivity() {
                                         if (state.splitRuntimeId == runtimeId) null else runtimeId
                                     )
                                 },
+                                // Multi-pane mode: which rows already show as
+                                // panes, and adding a row calls addPaneSession
+                                // directly - it already handles "not in
+                                // multi-pane mode yet" (auto-enters it seeded
+                                // with the active session + this one) and
+                                // "already a pane" (bring-to-front) itself,
+                                // see its doc.
+                                paneRuntimeIds = state.panes.map { it.runtimeId }.toSet(),
+                                onAddPaneSession = { runtimeId -> viewModel.addPaneSession(runtimeId) },
                                 onSettingsClicked = {
                                     startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                                 },
@@ -1792,6 +1858,26 @@ class MainActivity : ComponentActivity() {
                                         showQuickAddPicker = false
                                     },
                                     onDismissRequest = { showQuickAddPicker = false }
+                                )
+                            }
+
+                            // MultiPaneContainer's toolbar "+" popup - same
+                            // dialog, but picking a session here adds it as a
+                            // pane (viewModel.addPaneSession) instead of
+                            // cloning it. Only running sessions not already
+                            // shown as a pane are worth offering here, so
+                            // they're filtered out rather than letting the
+                            // user pick a session that's already visible.
+                            if (showAddPanePicker) {
+                                QuickAddSessionPickerDialog(
+                                    runningSessions = state.runningSessions.filterNot { r ->
+                                        state.panes.any { it.runtimeId == r.runtimeId }
+                                    },
+                                    onSessionPicked = { runtimeId ->
+                                        viewModel.addPaneSession(runtimeId)
+                                        showAddPanePicker = false
+                                    },
+                                    onDismissRequest = { showAddPanePicker = false }
                                 )
                             }
                         }

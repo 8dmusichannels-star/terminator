@@ -90,10 +90,60 @@ data class MainUiState(
     val splitRuntimeId: String? = null,
     val splitOrientation: SplitOrientation = SplitOrientation.Horizontal,
     val splitRatio: Float = 0.5f,
-    val broadcastInput: Boolean = false
+    val broadcastInput: Boolean = false,
+    // Multi-pane mode (see MultiPaneContainer.kt). Empty means "off" - the
+    // classic single-pane (optionally split-screen, above) rendering path
+    // is used untouched. Non-empty means MainActivity switches over to
+    // MultiPaneContainer instead: an arbitrary number of independent panes,
+    // each bound to its own running session, either auto-arranged in a
+    // grid (Tiling) or freely dragged/resized by the user (Floating).
+    // Deliberately a fully separate system from splitRuntimeId rather than
+    // trying to unify the two - splitRuntimeId's 2-pane path is small,
+    // well-tested and used by most people who only ever want a single
+    // side-by-side pane; multi-pane is opt-in for people who explicitly
+    // ask for more than that, reached only via enterMultiPaneMode().
+    val panes: List<PaneState> = emptyList(),
+    val paneMode: PaneMode = PaneMode.Tiling,
+    // Which pane currently receives typed input when broadcastAllPanes
+    // (Settings > Display) is off. Tapping a pane's terminal focuses it -
+    // see MultiPaneContainer's tap handling. Null only when panes is empty.
+    val focusedPaneRuntimeId: String? = null
 )
 
 enum class SplitOrientation { Horizontal, Vertical }
+
+/** Tiling: panes auto-arranged in a grid, sized only by dragging the
+ *  dividers between them (each pane's own [PaneState.floatOffset]/
+ *  [PaneState.floatSize] are ignored in this mode). Floating: every pane is
+ *  a free-floating window at its own [PaneState.floatOffset]/[floatSize],
+ *  draggable anywhere and independently resizable, panes may overlap. */
+enum class PaneMode { Tiling, Floating }
+
+/**
+ * One pane in multi-pane mode - a running session plus its own floating
+ * geometry. floatOffset/floatSize are only meaningful in [PaneMode.Floating]
+ * (ignored by the tiling grid layout) but are kept on every pane
+ * regardless of the currently active mode, so switching Tiling -> Floating
+ * -> Tiling doesn't lose a manually-placed window's position. Per the "user
+ * sınırı belirlesin, session bazlı hatırlansın" requirement, floatOffset/
+ * floatSize are seeded from (and persisted back to) SessionRepository's
+ * per-entryId floating-geometry store - see PaneGeometryStore - keyed by
+ * entryId (the saved session definition) rather than runtimeId (a fresh
+ * value every relaunch), so a session's floating window really does come
+ * back where it was last left, across relaunches and even across app
+ * restarts.
+ */
+data class PaneState(
+    val runtimeId: String,
+    // Top-left corner, in dp, relative to the multi-pane container's own
+    // origin. Clamped on every drag/restore to keep at least a corner of
+    // the pane reachable on screen - see MultiPaneContainer's clamping.
+    val floatOffset: androidx.compose.ui.geometry.Offset = androidx.compose.ui.geometry.Offset(24f, 24f),
+    val floatSize: androidx.compose.ui.geometry.Size = androidx.compose.ui.geometry.Size(360f, 480f),
+    // Floating-mode stacking order - higher draws on top and is what a tap
+    // brings to front, same as any desktop floating window manager.
+    val zIndex: Float = 0f
+)
 
 class MainViewModel(
     private val app: TerminatorApp,
@@ -142,6 +192,18 @@ class MainViewModel(
     // really on screen instead of a fixed guess.
     private var columns = 80
     private var rows = 24
+
+    // Persists/restores each session's last floating-mode pane geometry -
+    // see PaneGeometryStore's own doc and PaneState's doc for why this is
+    // keyed by entryId rather than runtimeId.
+    private val paneGeometryStore = PaneGeometryStore
+
+    // Per-pane last-applied size, so multi-pane's per-runtimeId resize
+    // below can skip a no-op resize() call the same way updateTerminalSize
+    // does for the classic shared-size path - each pane's own size,
+    // independent of the shared columns/rows pair above and of every other
+    // pane's size.
+    private val paneColumnsRows = mutableMapOf<String, Pair<Int, Int>>()
 
     init {
         viewModelScope.launch {
@@ -431,6 +493,8 @@ class MainViewModel(
     fun killSession(runtimeId: String) {
         liveSessions.remove(runtimeId)?.kill()
         liveEntries.remove(runtimeId)
+        paneColumnsRows.remove(runtimeId)
+        val wasPaned = _uiState.value.panes.any { it.runtimeId == runtimeId }
         _uiState.value = _uiState.value.copy(
             runningSessions = _uiState.value.runningSessions.filterNot { it.runtimeId == runtimeId },
             sessionTextSizes = _uiState.value.sessionTextSizes - runtimeId,
@@ -443,6 +507,14 @@ class MainViewModel(
             splitRuntimeId = _uiState.value.splitRuntimeId?.takeUnless { it == runtimeId },
             broadcastInput = if (_uiState.value.splitRuntimeId == runtimeId) false else _uiState.value.broadcastInput
         )
+        // Same cleanup as splitRuntimeId above, but for multi-pane mode -
+        // a dead session's pane is removed rather than left showing a
+        // permanently frozen/empty screen. Goes through removePane so the
+        // "last pane closed -> exit multi-pane mode" and focus-reassignment
+        // logic there applies here too, not just to user-initiated closes.
+        if (wasPaned) {
+            removePane(runtimeId)
+        }
     }
 
     /** Flips one session's wakeUp flag - see TerminatorApp.requestToggleWakeUp
@@ -562,6 +634,221 @@ class MainViewModel(
         _uiState.value = _uiState.value.copy(splitOrientation = orientation)
     }
 
+    // ---- Multi-pane mode (Tiling / Floating) ----------------------------
+    // See MainUiState.panes's doc for why this is a fully separate system
+    // from splitRuntimeId above rather than unifying the two.
+
+    /**
+     * Turns multi-pane mode on, seeded with the currently active session as
+     * the first pane, entering the given mode (default Tiling - the safer
+     * of the two to land in, since Floating panes can end up wherever they
+     * were last dragged including potentially off the visible area on a
+     * different-sized screen). No-op if multi-pane mode is already on.
+     */
+    fun enterMultiPaneMode(mode: PaneMode = PaneMode.Tiling) {
+        if (_uiState.value.panes.isNotEmpty()) return
+        val activeId = _uiState.value.activeSessionId ?: return
+        viewModelScope.launch {
+            val geometry = paneGeometryStore.geometryFor(app, liveEntries[activeId]?.id)
+            _uiState.value = _uiState.value.copy(
+                panes = listOf(PaneState(runtimeId = activeId, floatOffset = geometry.first, floatSize = geometry.second)),
+                paneMode = mode,
+                focusedPaneRuntimeId = activeId,
+                // The classic split (if one was open) and multi-pane are
+                // mutually exclusive rendering paths - close the former so
+                // MainActivity's "which container do I draw" check (panes
+                // empty vs non-empty) is unambiguous.
+                splitRuntimeId = null,
+                broadcastInput = false
+            )
+        }
+    }
+
+    /** Leaves multi-pane mode entirely, returning to the classic single-
+     *  pane (optionally split-screen) rendering path. The session that was
+     *  focused becomes the classic view's active session. Panes' floating
+     *  geometry stays persisted (per entryId) for next time. */
+    fun exitMultiPaneMode() {
+        val focused = _uiState.value.focusedPaneRuntimeId ?: _uiState.value.activeSessionId
+        _uiState.value = _uiState.value.copy(
+            panes = emptyList(),
+            focusedPaneRuntimeId = null,
+            activeSessionId = focused
+        )
+    }
+
+    /**
+     * Adds a running session as a new pane. If it's already a pane, this
+     * only focuses/raises it (no duplicate panes for the same runtimeId -
+     * there is only ever at most one pane per running session). Auto-enters
+     * multi-pane mode if it wasn't already on, so this single function
+     * covers both "start a multi-pane session" and "add one more" call
+     * sites (drawer row action either way).
+     */
+    fun addPaneSession(runtimeId: String) {
+        if (liveSessions[runtimeId]?.isAlive() != true) return
+        val state = _uiState.value
+        // No pane group yet: seeded below (inside the launch block) with
+        // BOTH the current active session and the one just requested,
+        // rather than dropping the active session on the floor - opening
+        // pane mode from the drawer's "add to panes" action on a second
+        // session should read as "show these two together".
+        if (state.panes.any { it.runtimeId == runtimeId }) {
+            bringPaneToFront(runtimeId)
+            return
+        }
+        viewModelScope.launch {
+            val entryId = liveEntries[runtimeId]?.id
+            val geometry = paneGeometryStore.geometryFor(app, entryId)
+            val current = _uiState.value
+            val basePanes = if (current.panes.isEmpty()) {
+                val activeId = current.activeSessionId
+                if (activeId != null && activeId != runtimeId && liveSessions[activeId]?.isAlive() == true) {
+                    val activeGeometry = paneGeometryStore.geometryFor(app, liveEntries[activeId]?.id)
+                    listOf(PaneState(runtimeId = activeId, floatOffset = activeGeometry.first, floatSize = activeGeometry.second))
+                } else {
+                    emptyList()
+                }
+            } else {
+                current.panes
+            }
+            val nextZ = (basePanes.maxOfOrNull { it.zIndex } ?: 0f) + 1f
+            val newPane = PaneState(
+                runtimeId = runtimeId,
+                floatOffset = geometry.first,
+                floatSize = geometry.second,
+                zIndex = nextZ
+            )
+            _uiState.value = current.copy(
+                panes = basePanes + newPane,
+                focusedPaneRuntimeId = runtimeId,
+                splitRuntimeId = null,
+                broadcastInput = false
+            )
+        }
+    }
+
+    /** Removes one pane (its "x" close button) without killing the
+     *  underlying session - it keeps running and reappears in the drawer's
+     *  Running list, same as closing a split used to just close the split.
+     *  Leaving the last pane closes multi-pane mode entirely rather than
+     *  leaving a permanently-empty pane container on screen. */
+    fun removePane(runtimeId: String) {
+        val state = _uiState.value
+        val remaining = state.panes.filterNot { it.runtimeId == runtimeId }
+        if (remaining.isEmpty()) {
+            exitMultiPaneMode()
+            return
+        }
+        val nextFocused = if (state.focusedPaneRuntimeId == runtimeId) {
+            remaining.maxByOrNull { it.zIndex }?.runtimeId
+        } else {
+            state.focusedPaneRuntimeId
+        }
+        _uiState.value = state.copy(panes = remaining, focusedPaneRuntimeId = nextFocused)
+    }
+
+    /** Tap-to-focus: makes this pane the target of typed input (when the
+     *  broadcast-all-panes setting is off) and, in Floating mode, raises it
+     *  to the top of the stack - same as clicking any desktop window. */
+    fun bringPaneToFront(runtimeId: String) {
+        val state = _uiState.value
+        if (state.panes.none { it.runtimeId == runtimeId }) return
+        val topZ = (state.panes.maxOfOrNull { it.zIndex } ?: 0f)
+        _uiState.value = state.copy(
+            panes = state.panes.map {
+                if (it.runtimeId == runtimeId) it.copy(zIndex = topZ + 1f) else it
+            },
+            focusedPaneRuntimeId = runtimeId
+        )
+    }
+
+    /** Floating-mode drag: updates one pane's on-screen offset (dp), then
+     *  persists it (per entryId, not runtimeId - see PaneState's doc) so it
+     *  comes back in the same place next time this session is floated. */
+    fun movePane(runtimeId: String, offset: androidx.compose.ui.geometry.Offset) {
+        val state = _uiState.value
+        val pane = state.panes.firstOrNull { it.runtimeId == runtimeId } ?: return
+        _uiState.value = state.copy(
+            panes = state.panes.map { if (it.runtimeId == runtimeId) it.copy(floatOffset = offset) else it }
+        )
+        val entryId = liveEntries[runtimeId]?.id ?: return
+        viewModelScope.launch {
+            paneGeometryStore.saveGeometry(app, entryId, offset, pane.floatSize)
+        }
+    }
+
+    /** Floating-mode resize handle: updates one pane's size (dp), clamped
+     *  by the caller before this is invoked so a drag can never shrink a
+     *  pane down to an unusable sliver - persisted the same way movePane
+     *  persists position. */
+    fun resizePane(runtimeId: String, size: androidx.compose.ui.geometry.Size) {
+        val state = _uiState.value
+        val pane = state.panes.firstOrNull { it.runtimeId == runtimeId } ?: return
+        _uiState.value = state.copy(
+            panes = state.panes.map { if (it.runtimeId == runtimeId) it.copy(floatSize = size) else it }
+        )
+        val entryId = liveEntries[runtimeId]?.id ?: return
+        viewModelScope.launch {
+            paneGeometryStore.saveGeometry(app, entryId, pane.floatOffset, size)
+        }
+    }
+
+    /** Tiling <-> Floating toggle. Per spec: switching INTO Floating always
+     *  resets every current pane to a fresh cascade/grid-derived starting
+     *  layout (rather than carrying over tiling's grid rects) - switching
+     *  back to Tiling is a no-op on geometry since tiling computes its own
+     *  rects from scratch every time regardless of floatOffset/floatSize. */
+    fun setPaneMode(mode: PaneMode) {
+        val state = _uiState.value
+        if (mode == state.paneMode) return
+        if (mode == PaneMode.Floating) {
+            val cascadeStepDp = 32f
+            val baseSize = androidx.compose.ui.geometry.Size(360f, 480f)
+            val relaid = state.panes.mapIndexed { index, pane ->
+                pane.copy(
+                    floatOffset = androidx.compose.ui.geometry.Offset(
+                        24f + (index % 5) * cascadeStepDp,
+                        24f + (index % 5) * cascadeStepDp
+                    ),
+                    floatSize = baseSize,
+                    zIndex = index.toFloat()
+                )
+            }
+            _uiState.value = state.copy(panes = relaid, paneMode = mode)
+            relaid.forEach { pane ->
+                val entryId = liveEntries[pane.runtimeId]?.id ?: return@forEach
+                viewModelScope.launch {
+                    paneGeometryStore.saveGeometry(app, entryId, pane.floatOffset, pane.floatSize)
+                }
+            }
+        } else {
+            _uiState.value = state.copy(paneMode = mode)
+        }
+    }
+
+    /**
+     * Routes typed input while in multi-pane mode: to every visible pane at
+     * once when Settings > Display > "Broadcast to all panes"
+     * (broadcastAllPanes) is on, or only to [MainUiState.focusedPaneRuntimeId]
+     * when it's off - matching "bu ayar aktifse hepsine yazabilsin,
+     * değilse basarak focus etmek gerekir". Fire-and-forget on every
+     * target, same reasoning as sendInput()'s classic-split broadcast: none
+     * of these are meant to block on each other. Reuses sendInputTo() above
+     * as the single-target primitive rather than writing to liveSessions
+     * directly here.
+     */
+    fun sendPaneInput(text: String, broadcastAllPanes: Boolean) {
+        val state = _uiState.value
+        if (state.panes.isEmpty()) return
+        if (broadcastAllPanes) {
+            state.panes.forEach { pane -> sendInputTo(pane.runtimeId, text) }
+        } else {
+            val target = state.focusedPaneRuntimeId ?: return
+            sendInputTo(target, text)
+        }
+    }
+
     /** Clamped well away from 0/1 so neither pane can be dragged down to an
      *  unusable sliver - matches the drag handle's own min-size guard in
      *  SplitScreenContainer, kept here too since this is also reachable
@@ -662,6 +949,28 @@ class MainViewModel(
         bumpVersion()
     }
 
+    /**
+     * Multi-pane's own per-session resize - unlike [updateTerminalSize]
+     * above (which resizes EVERY live session to one shared size, correct
+     * for the classic single/split-pane view where at most one full-size
+     * pane and one split partner are ever on screen), each multi-pane pane
+     * has its own independent on-screen size, so it needs its own
+     * independent pty size instead of inheriting the classic path's shared
+     * columns/rows. Never touches the classic columns/rows fields or any
+     * other session's size - switching back to the classic single-pane
+     * view (exitMultiPaneMode) re-applies updateTerminalSize's shared size
+     * to the now-single active session on its next measured layout pass,
+     * same as it always has.
+     */
+    fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int) {
+        if (newColumns <= 0 || newRows <= 0) return
+        val current = paneColumnsRows[runtimeId]
+        if (current != null && current.first == newColumns && current.second == newRows) return
+        paneColumnsRows[runtimeId] = newColumns to newRows
+        liveSessions[runtimeId]?.resize(newColumns, newRows)
+        bumpVersion()
+    }
+
     fun setDrawerOpen(open: Boolean) {
         _uiState.value = _uiState.value.copy(drawerOpen = open)
     }
@@ -684,6 +993,14 @@ class MainViewModel(
             runningSessions = _uiState.value.runningSessions.filterNot { it.entryId == entry.id },
             sessionTextSizes = _uiState.value.sessionTextSizes - runtimeIds.toSet()
         )
+        // Same "don't leave a pane pointing at a dead session" cleanup as
+        // killSession - a deleted session's own runtime instances (if any
+        // were showing as panes) need to go too.
+        runtimeIds.forEach { runtimeId ->
+            if (_uiState.value.panes.any { it.runtimeId == runtimeId }) {
+                removePane(runtimeId)
+            }
+        }
         repository.delete(entry.id)
     }
 

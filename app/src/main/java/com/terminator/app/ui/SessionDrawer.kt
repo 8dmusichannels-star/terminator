@@ -40,6 +40,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -101,6 +102,17 @@ fun SessionDrawer(
     // (to open one) but none of them render as "already the partner".
     splitRuntimeId: String? = null,
     onToggleSplitSession: (String) -> Unit = {},
+    // Multi-pane mode: runtimeIds currently shown as panes (see
+    // MainUiState.panes's doc) and the callback to add a given running
+    // session to that group (or bring it to front if it's already in it) -
+    // MainViewModel.addPaneSession handles both cases, same one-function-
+    // covers-add-or-focus shape as onToggleSplitSession does for split.
+    // Empty paneRuntimeIds means multi-pane mode is off, in which case
+    // every row's button still shows (tapping one starts multi-pane mode
+    // seeded with the active session + this one) but none render as
+    // "already a pane".
+    paneRuntimeIds: Set<String> = emptySet(),
+    onAddPaneSession: (String) -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -211,7 +223,9 @@ fun SessionDrawer(
                                     { onToggleSplitSession(running.runtimeId) }
                                 } else {
                                     null
-                                }
+                                },
+                                isPaneMember = running.runtimeId in paneRuntimeIds,
+                                onAddPaneClick = { onAddPaneSession(running.runtimeId) }
                             )
                         }
                         item(key = "running-divider") {
@@ -281,7 +295,16 @@ private fun RunningSessionRow(
     // save toggle is off, matching how onSplitClick == null already hides
     // the split icon here for the active row.
     onSaveClick: (() -> Unit)? = null,
-    onSplitClick: (() -> Unit)? = null
+    onSplitClick: (() -> Unit)? = null,
+    // Multi-pane mode: whether this row is currently one of the open panes
+    // (highlights the icon, same "already active" treatment isSplitPartner
+    // gets above) and the callback to add/bring-to-front it as a pane - see
+    // SessionDrawer's paneRuntimeIds/onAddPaneSession doc. Unlike
+    // onSplitClick, this is never null/hidden - multi-pane mode has no
+    // "only one other session" restriction, any running session (including
+    // the active one) can join the pane group.
+    isPaneMember: Boolean = false,
+    onAddPaneClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -341,6 +364,16 @@ private fun RunningSessionRow(
                     tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
                 )
             }
+        }
+        // Multi-pane mode toggle for this row - see this function's
+        // isPaneMember/onAddPaneClick doc above. Always shown (unlike the
+        // split button, no active-row restriction).
+        IconButton(onClick = onAddPaneClick) {
+            Icon(
+                Icons.Filled.GridView,
+                contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
+                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+            )
         }
         // Exports this specific running session's terminal output (screen +
         // scrollback) directly from the drawer row - see SessionDrawer's

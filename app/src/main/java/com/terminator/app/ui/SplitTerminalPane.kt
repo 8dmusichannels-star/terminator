@@ -21,15 +21,16 @@
 package com.terminator.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.SyncAlt
@@ -38,6 +39,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,10 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.terminator.emulator.TerminalBuffer
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
@@ -119,7 +118,14 @@ fun SplitTerminalPane(
     onInput: (String) -> Unit,
     onClose: () -> Unit
 ) {
-    var inputText by remember(runtimeId) { mutableStateOf("") }
+    // Direct-tap-to-type, no separate "Type here..." input box - tapping
+    // the terminal area itself focuses it and brings up the keyboard, same
+    // mechanism MultiPaneContainer's panes use (see HiddenPaneInputField's
+    // doc) rather than the primary pane's own always-focused hidden field,
+    // since this secondary pane isn't always the one the user is typing
+    // into. isFocused starts true so the split partner is immediately
+    // typable the moment it opens, without requiring an extra tap first.
+    var isFocused by remember(runtimeId) { mutableStateOf(true) }
 
     Box(modifier = modifier.background(Color.Black)) {
         androidx.compose.foundation.layout.Column(modifier = Modifier.fillMaxWidth().fillMaxHeight()) {
@@ -135,7 +141,7 @@ fun SplitTerminalPane(
                 Text(
                     "Split pane",
                     style = MaterialTheme.typography.labelSmall,
-                    color = Color.White.copy(alpha = 0.6f)
+                    color = if (isFocused) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Broadcast toggle lives here (not in Settings) because
@@ -167,16 +173,36 @@ fun SplitTerminalPane(
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 if (buffer != null) {
-                    TerminalView(
-                        buffer = buffer,
-                        palette = palette,
-                        fontFamily = fontFamily,
-                        fontSizeSp = fontSizeSp,
-                        bufferVersion = bufferVersion,
-                        backgroundAlpha = 1f,
-                        scrollOffset = 0,
-                        modifier = Modifier.fillMaxWidth().fillMaxHeight()
-                    )
+                    // Own native selection state (see TerminalView's
+                    // selectionState param doc) - independent of the
+                    // primary pane's, long-press/drag selection works on
+                    // this pane using the OS's own selection UI same as
+                    // the primary pane, no separate toolbar wiring needed.
+                    val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
+                    LaunchedEffect(runtimeId) { paneSelectionState.clear() }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(runtimeId) {
+                                detectTapGestures(onTap = { isFocused = true })
+                            }
+                    ) {
+                        TerminalView(
+                            buffer = buffer,
+                            palette = palette,
+                            fontFamily = fontFamily,
+                            fontSizeSp = fontSizeSp,
+                            bufferVersion = bufferVersion,
+                            backgroundAlpha = 1f,
+                            scrollOffset = 0,
+                            selectionState = paneSelectionState,
+                            modifier = Modifier.fillMaxWidth().fillMaxHeight()
+                        )
+                        HiddenPaneInputField(
+                            active = isFocused,
+                            onText = { text -> onInput(text) }
+                        )
+                    }
                 } else {
                     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                         Text(
@@ -187,26 +213,6 @@ fun SplitTerminalPane(
                     }
                 }
             }
-
-            // Plain text input row - intentionally not the primary pane's
-            // hidden-field + soft-keyboard-tracking setup (see this file's
-            // header doc). Enter sends the line plus a newline, matching
-            // what pressing Enter in a real terminal does.
-            androidx.compose.material3.OutlinedTextField(
-                value = inputText,
-                onValueChange = { inputText = it },
-                modifier = Modifier.fillMaxWidth().padding(4.dp),
-                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp, color = Color.White),
-                placeholder = { Text("Type here...", style = MaterialTheme.typography.bodySmall) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Send),
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                    onSend = {
-                        onInput(inputText + "\n")
-                        inputText = ""
-                    }
-                )
-            )
         }
     }
 }

@@ -113,6 +113,14 @@ object SettingsKeys {
     // regardless, unaffected by this.
     val SHOW_RUNNER_TOOLBAR_SAVE = booleanPreferencesKey("show_runner_toolbar_save")
 
+    // Display > Multi-pane > "Broadcast to all panes". Off (default):
+    // typed input goes only to whichever pane is currently focused (tap a
+    // pane to focus it) - see MainViewModel.sendPaneInput's doc. On: every
+    // keystroke is mirrored to every visible pane at once, same idea as the
+    // classic split's own broadcastInput toggle but covering the whole
+    // pane group instead of just one partner.
+    val BROADCAST_ALL_PANES = booleanPreferencesKey("broadcast_all_panes")
+
     // Keyboard
     val SOFT_KEYBOARD = booleanPreferencesKey("soft_keyboard")
     val VIRTUAL_KEYS = booleanPreferencesKey("virtual_keys")

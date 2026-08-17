@@ -45,6 +45,7 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
     val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
     val horizontalModeEnabled by repo.flow(SettingsKeys.HORIZONTAL_MODE, true).collectAsState(initial = true)
     val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
+    val broadcastAllPanes by repo.flow(SettingsKeys.BROADCAST_ALL_PANES, false).collectAsState(initial = false)
 
     Scaffold(
         topBar = {
@@ -80,7 +81,17 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
                 scope.launch { repo.set(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, it) }
             }
             Text(
-                "The runner toolbar above the terminal is always shown. This only shows/hides its Save button.",
+                "Shows/hides the Save (export) icon on each running session's row in the drawer.",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            SwitchRow("Broadcast to all panes", broadcastAllPanes) {
+                scope.launch { repo.set(SettingsKeys.BROADCAST_ALL_PANES, it) }
+            }
+            Text(
+                "When multiple panes are open (multi-pane mode), typing reaches every visible pane at once. " +
+                    "When off, typing only reaches whichever pane you last tapped to focus.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
