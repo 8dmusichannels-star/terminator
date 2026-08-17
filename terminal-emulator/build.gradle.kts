@@ -7,12 +7,14 @@
 
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "com.terminator.emulator"
-    compileSdk = 35
+    // 37: required by Compose 1.12 / compose-bom 2026.08.00 below - see
+    // this module's own dependencies block, and app/build.gradle.kts.
+    compileSdk = 37
 
     defaultConfig {
         minSdk = 33
@@ -38,26 +40,24 @@ android {
         compose = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
-    }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // No kotlinOptions block needed: AGP 9's built-in Kotlin support
+    // defaults jvmTarget to compileOptions.targetCompatibility.
 }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
 
-    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    // 2026.08.00 (Compose 1.12): brings native edge-auto-scroll-while-
+    // selecting to SelectionContainer, used by TerminalView's selection
+    // overlay below instead of hand-rolled scroll-while-dragging math.
+    implementation(platform("androidx.compose:compose-bom:2026.08.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-text")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.runtime:runtime")
 }

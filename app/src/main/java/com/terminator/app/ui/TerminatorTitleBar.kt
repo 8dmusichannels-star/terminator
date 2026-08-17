@@ -20,17 +20,26 @@
 
 package com.terminator.app.ui
 
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
 
 /**
  * Typical titlebar: hamburger (opens the session drawer, same as swipe
@@ -41,10 +50,43 @@ import androidx.compose.ui.graphics.Color
 @Composable
 fun TerminatorTitleBar(
     onMenuClicked: () -> Unit,
-    onQuickAddClicked: () -> Unit
+    onQuickAddClicked: () -> Unit,
+    // Optional picture from the active session's SessionEntry.imageUri -
+    // see that field's doc. Purely cosmetic: when null/blank, the titlebar
+    // renders exactly as before (just the hamburger + centered title).
+    // Reflecting it here is opt-in in the sense that it only shows up at
+    // all if the user bothered to set a picture on the session in
+    // Settings > Sessions - nothing forces every session to have one.
+    activeSessionImageUri: String? = null
 ) {
     TopAppBar(
-        title = { Text("TERMINATOR") },
+        title = {
+            if (!activeSessionImageUri.isNullOrBlank()) {
+                // See SessionImage.kt's doc - this adds SVG support
+                // alongside the raster formats BitmapFactory already
+                // handled, instead of a bare BitmapFactory.decodeStream
+                // call that silently returned null for an SVG picture.
+                val bitmap = rememberSessionImage(activeSessionImageUri)
+                if (bitmap != null) {
+                    androidx.compose.foundation.layout.Row(
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.size(28.dp).clip(CircleShape)
+                        )
+                        androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
+                        Text("TERMINATOR")
+                    }
+                } else {
+                    Text("TERMINATOR")
+                }
+            } else {
+                Text("TERMINATOR")
+            }
+        },
         navigationIcon = {
             IconButton(onClick = onMenuClicked) {
                 Icon(Icons.Filled.Menu, contentDescription = "Open sessions")
@@ -55,17 +97,19 @@ fun TerminatorTitleBar(
                 Icon(Icons.Filled.Add, contentDescription = "Quick session select")
             }
         },
-        // Material3's default TopAppBar tints its container with a translucent
-        // primary-color overlay ("tonal elevation") once the surface scrolls
-        // under it - that's the unwanted blue wash at the top of the window.
-        // Pin every state to flat black so the titlebar always matches the
-        // rest of the flat-black theme.
+        // Kept flat black - see the comment on `colors` below for why the
+        // container itself stays pinned. Text/icon color, however, now
+        // follows the active Material color scheme (onBackground) instead
+        // of a hardcoded Color.White, so it stays readable against
+        // whatever theme (including AMOLED/light variants of Material)
+        // the user has picked in Settings > Theme rather than assuming
+        // dark-on-black always applies.
         colors = TopAppBarDefaults.topAppBarColors(
             containerColor = Color.Black,
             scrolledContainerColor = Color.Black,
-            titleContentColor = Color.White,
-            navigationIconContentColor = Color.White,
-            actionIconContentColor = Color.White
+            titleContentColor = MaterialTheme.colorScheme.onBackground,
+            navigationIconContentColor = MaterialTheme.colorScheme.onBackground,
+            actionIconContentColor = MaterialTheme.colorScheme.onBackground
         )
     )
 }

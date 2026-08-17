@@ -177,6 +177,13 @@ class TerminalSession(
             } catch (_: IOException) {
                 // process ended / pty closed
             } finally {
+                // Flush any grapheme cluster append() was still holding
+                // open (see TerminalEmulator.pendingCluster's doc) - the
+                // pty has genuinely closed at this point, so "wait for the
+                // next chunk to see if this cluster keeps extending" no
+                // longer applies; render whatever was captured instead of
+                // silently dropping the last partial sequence.
+                emulator.flushPendingCluster()
                 alive = false
                 markExited()
             }

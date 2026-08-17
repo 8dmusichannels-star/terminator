@@ -1,28 +1,74 @@
-# Changelog
+# Terminator — Multi Split Screen & Native Copy/Paste Updates
 
-All notable changes to this project are documented in this file.
+This release includes major updates to the terminal session interface and Android's native copy/paste system.
 
-## [v0.3.6] - 2026-08-14
+## ✨ Highlights
 
-### Fixed
+### Experimental Multi Split Screen
 
-* Fixed blue highlight/selection behavior while scrolling.
-* Fixed toolbar copy, paste, and close actions.
-* Fixed long text field issues.
-* Fixed a crash related to the terminal buffer in the lock screen.
-* Added a toolbar barrier to prevent unintended interactions.
-* Fixed virtual keyboard swipe gestures for left/right navigation.
+Added an experimental **Multi Split Screen** system that allows multiple terminal sessions to be displayed and managed simultaneously.
 
-### Improved
+* Added multi-pane terminal support.
+* Added pane focus management.
+* Added pane resizing and repositioning.
+* Added support for adding and removing terminal sessions from the multi-pane layout.
+* Added multi-pane session management.
+* Added an option to broadcast keyboard input to all visible panes.
+* Added experimental multi-pane UI and controls.
+* Added support for switching between different pane modes.
+* Added pane-specific terminal sizing.
+* Existing single/split terminal behavior remains available when multi-pane mode is inactive.
 
-* Improved terminal stability and lock-screen buffer handling.
-* Improved text selection and clipboard interactions.
-* Improved virtual keyboard gesture handling.
-* Improved popup runner session selection.
-* General stability and usability improvements.
+Commit: [80bb2e7](https://github.com/8dmusichannels-star/terminator/commit/80bb2e7)
 
-### Commits
+---
 
-* [`db87f71`](commit/db87f71) — Bump version 0.3.6
-* [`d9678ae`](commit/d9678ae) — Fix scrolled blue highlighting/selection, toolbar copy/paste/close, and long text field issues
-* [`c91a447`](commit/c91a447) — Fix lock terminal buffer crash, toolbar barrier, copy/paste/close, virtual keyboard swipe gestures, and popup runner session selection
+## 📋 Native Android Copy/Paste API
+
+Terminator has been migrated to the **native Android copy/paste API system**.
+
+### Changes
+
+* Reworked the Android text selection and copy/paste implementation.
+* Added native Android selection toolbar integration.
+* Removed the previous custom copy/paste handling where no longer required.
+* Improved compatibility with Android's native text selection behavior.
+* Improved interaction between terminal selection and the Android system.
+* Updated terminal selection handling across the application.
+* Continued cleanup and transition toward Android's native clipboard APIs.
+
+Commit: [0dc8396](https://github.com/8dmusichannels-star/terminator/commit/0dc8396)
+
+---
+
+## 🔧 Native Copy/Paste API Transition
+
+The initial transition to the native Android copy/paste system has been completed.
+
+* Native Android copy/paste API is now used by the terminal.
+* Updated terminal text selection behavior.
+* Improved compatibility with Android system selection controls.
+* Removed legacy copy/paste behavior where applicable.
+* Prepared the terminal UI for the newer native Android selection workflow.
+
+Commit: [3b4bd00](https://github.com/8dmusichannels-star/terminator/commit/3b4bd00)
+
+---
+
+## 🧪 Experimental
+
+The **Multi Split Screen** functionality is currently experimental.
+
+Some UI behavior, pane management, and interaction details may change in future releases as the feature continues to be developed and stabilized.
+
+## 🔗 Commits
+
+* [80bb2e7](https://github.com/8dmusichannels-star/terminator/commit/80bb2e7) — Experimental Multi Split Screen
+* [0dc8396](https://github.com/8dmusichannels-star/terminator/commit/0dc8396) — Native Android Copy/Paste API transition and fixes
+* [3b4bd00](https://github.com/8dmusichannels-star/terminator/commit/3b4bd00) — Initial native Android Copy/Paste API implementation
+
+## 📱 Project
+
+**Terminator** is an Android terminal emulator focused on a compact, customizable terminal experience with multiple session support.
+
+More information is available in the [repository](https://github.com/8dmusichannels-star/terminator).

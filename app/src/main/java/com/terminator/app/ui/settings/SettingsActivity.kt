@@ -34,7 +34,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
+import com.terminator.app.TerminatorApp
+import com.terminator.app.settings.SettingsKeys
 import com.terminator.app.ui.theme.TerminatorTheme
 
 /**
@@ -45,7 +48,23 @@ class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            TerminatorTheme {
+            // Was TerminatorTheme {} with no argument, which always
+            // defaulted amoledBlack to false - Settings > Theme > AMOLED
+            // Black could be switched on and MainActivity's terminal
+            // screen would follow it correctly, but Settings itself (this
+            // screen and everything under it: Sessions, Appearance, Theme,
+            // Sound, Display, Keyboard, Storage) stayed on the plain
+            // Material You scheme regardless, since nothing here ever read
+            // the setting. Reading it the same way MainActivity and
+            // ThemeSettingsScreen already do and passing it through makes
+            // AMOLED Black an app-wide setting instead of one that only
+            // visibly did anything on the terminal screen.
+            val settingsRepo = remember {
+                (applicationContext as TerminatorApp).settingsRepository
+            }
+            val amoledBlack by settingsRepo.flow(SettingsKeys.AMOLED_BLACK, false)
+                .collectAsState(initial = false)
+            TerminatorTheme(amoledBlack = amoledBlack) {
                 SettingsRoot()
             }
         }

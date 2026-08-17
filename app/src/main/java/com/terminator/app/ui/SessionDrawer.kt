@@ -27,6 +27,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -35,17 +36,25 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.VerticalSplit
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -75,6 +84,35 @@ fun SessionDrawer(
     onRunningSessionSelected: (String) -> Unit = {},
     onKillRunningSession: (String) -> Unit = {},
     onToggleWakeUpRunningSession: (String) -> Unit = {},
+    onCloneRunningSession: (String) -> Unit = {},
+    // Exports this specific running session's terminal output (screen +
+    // scrollback) - see MainViewModel.exportSessionOutput's doc. Placed
+    // right in front of each row's own Clone ("+") icon, per-session,
+    // rather than only existing as a single save button for whichever
+    // session happens to be active - see RunningSessionRow's doc for why.
+    onSaveRunningSession: (String) -> Unit = {},
+    // Settings > Display > "Show runner toolbar save button"
+    // (SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE). False hides the Save icon
+    // on every running-session row entirely (not shown-but-disabled).
+    showRunnerSaveButtons: Boolean = true,
+    // Split-screen: which runtimeId (if any) is currently the split
+    // partner, and the callback to toggle a given running session in/out
+    // of that role - see MainViewModel.setSplitSession's doc. Null means
+    // no split is open, in which case the per-row split button still shows
+    // (to open one) but none of them render as "already the partner".
+    splitRuntimeId: String? = null,
+    onToggleSplitSession: (String) -> Unit = {},
+    // Multi-pane mode: runtimeIds currently shown as panes (see
+    // MainUiState.panes's doc) and the callback to add a given running
+    // session to that group (or bring it to front if it's already in it) -
+    // MainViewModel.addPaneSession handles both cases, same one-function-
+    // covers-add-or-focus shape as onToggleSplitSession does for split.
+    // Empty paneRuntimeIds means multi-pane mode is off, in which case
+    // every row's button still shows (tapping one starts multi-pane mode
+    // seeded with the active session + this one) but none render as
+    // "already a pane".
+    paneRuntimeIds: Set<String> = emptySet(),
+    onAddPaneSession: (String) -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -162,10 +200,32 @@ fun SessionDrawer(
                         ) { running ->
                             RunningSessionRow(
                                 running = running,
+                                // Session pictures are stored on the saved SessionEntry
+                                // (Settings > Sessions), not the RunningSession itself -
+                                // look it up by entryId so a running row shows the same
+                                // picture as its profile, if one was set.
+                                imageUri = sessions.firstOrNull { it.id == running.entryId }?.imageUri,
                                 isActive = running.runtimeId == activeSessionId,
+                                isSplitPartner = running.runtimeId == splitRuntimeId,
                                 onClick = { onRunningSessionSelected(running.runtimeId) },
                                 onKillClick = { onKillRunningSession(running.runtimeId) },
-                                onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) }
+                                onWakeUpClick = { onToggleWakeUpRunningSession(running.runtimeId) },
+                                onCloneClick = { onCloneRunningSession(running.runtimeId) },
+                                onSaveClick = if (showRunnerSaveButtons) {
+                                    { onSaveRunningSession(running.runtimeId) }
+                                } else {
+                                    null
+                                },
+                                // Split only makes sense between two DISTINCT running
+                                // sessions - hidden on the active row itself (there'd be
+                                // nothing else to show alongside it).
+                                onSplitClick = if (running.runtimeId != activeSessionId) {
+                                    { onToggleSplitSession(running.runtimeId) }
+                                } else {
+                                    null
+                                },
+                                isPaneMember = running.runtimeId in paneRuntimeIds,
+                                onAddPaneClick = { onAddPaneSession(running.runtimeId) }
                             )
                         }
                         item(key = "running-divider") {
@@ -222,10 +282,29 @@ fun SessionDrawer(
 @Composable
 private fun RunningSessionRow(
     running: RunningSession,
+    imageUri: String? = null,
     isActive: Boolean,
+    isSplitPartner: Boolean = false,
     onClick: () -> Unit,
     onKillClick: () -> Unit = {},
-    onWakeUpClick: () -> Unit = {}
+    onWakeUpClick: () -> Unit = {},
+    onCloneClick: () -> Unit = {},
+    // Exports this row's own running session's terminal output - see
+    // SessionDrawer's onSaveRunningSession doc. Null (rather than a
+    // disabled button) hides the icon entirely when the runner-toolbar
+    // save toggle is off, matching how onSplitClick == null already hides
+    // the split icon here for the active row.
+    onSaveClick: (() -> Unit)? = null,
+    onSplitClick: (() -> Unit)? = null,
+    // Multi-pane mode: whether this row is currently one of the open panes
+    // (highlights the icon, same "already active" treatment isSplitPartner
+    // gets above) and the callback to add/bring-to-front it as a pane - see
+    // SessionDrawer's paneRuntimeIds/onAddPaneSession doc. Unlike
+    // onSplitClick, this is never null/hidden - multi-pane mode has no
+    // "only one other session" restriction, any running session (including
+    // the active one) can join the pane group.
+    isPaneMember: Boolean = false,
+    onAddPaneClick: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -235,6 +314,22 @@ private fun RunningSessionRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (!imageUri.isNullOrBlank()) {
+            // See SessionImage.kt's doc - adds SVG support alongside the
+            // raster formats BitmapFactory already handled.
+            val bitmap = rememberSessionImage(imageUri)
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+            }
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 running.label,
@@ -252,6 +347,59 @@ private fun RunningSessionRow(
                     color = Color(0xFFBF616A)
                 )
             }
+        }
+        // Split-screen toggle for this specific running session - only
+        // shown for OTHER running sessions (never the currently active
+        // one, since split needs two distinct sessions). Tapping opens it
+        // as the split secondary pane; tapping again while it's already
+        // the split partner closes the split - see MainViewModel.
+        // setSplitSession's doc. Null onSplitClick (only passed for the
+        // active row) hides the button entirely rather than showing it
+        // disabled.
+        if (onSplitClick != null) {
+            IconButton(onClick = onSplitClick) {
+                Icon(
+                    Icons.Filled.VerticalSplit,
+                    contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
+                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                )
+            }
+        }
+        // Multi-pane mode toggle for this row - see this function's
+        // isPaneMember/onAddPaneClick doc above. Always shown (unlike the
+        // split button, no active-row restriction).
+        IconButton(onClick = onAddPaneClick) {
+            Icon(
+                Icons.Filled.GridView,
+                contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
+                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+            )
+        }
+        // Exports this specific running session's terminal output (screen +
+        // scrollback) directly from the drawer row - see SessionDrawer's
+        // onSaveRunningSession doc. Placed immediately before the Clone
+        // ("+") icon per the request ("+ onune save buttonu"). Gated
+        // per-row by onSaveClick being null (icon isn't rendered at all)
+        // rather than shown-disabled, same pattern as onSplitClick above.
+        if (onSaveClick != null) {
+            IconButton(onClick = onSaveClick) {
+                Icon(
+                    Icons.Filled.Save,
+                    contentDescription = "Save session output",
+                    tint = Color.White.copy(alpha = 0.6f)
+                )
+            }
+        }
+        // Clones this exact running session directly - no picker popup,
+        // unlike the titlebar "+" (QuickAddSessionPickerDialog) which asks
+        // which running session to duplicate. This one already knows: it's
+        // this row's own session.
+        IconButton(onClick = onCloneClick) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = "Clone session",
+                tint = Color.White.copy(alpha = 0.6f)
+            )
         }
         // Wake-up toggle: raises this session's background-survival
         // priority (see TerminatorApp.requestToggleWakeUp) without opening
@@ -292,6 +440,25 @@ private fun SessionRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        // Only renders when the session actually has a picture set - no
+        // placeholder/initial circle is shown for sessions without one, so
+        // rows without a photo just skip straight to the name/star.
+        if (!session.imageUri.isNullOrBlank()) {
+            // See SessionImage.kt's doc - adds SVG support alongside the
+            // raster formats BitmapFactory already handled.
+            val bitmap = rememberSessionImage(session.imageUri)
+            bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+            }
+        }
         // combinedClickable lives ONLY on this column now, not on the
         // whole row. It was on the outer Row before, which meant its
         // press-gesture handling covered the star IconButton's area too -

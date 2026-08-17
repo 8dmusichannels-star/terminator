@@ -115,6 +115,7 @@ class SessionRepository(private val context: Context) {
             o.put("isFavorite", e.isFavorite)
             o.put("isDefault", e.isDefault)
             o.put("allowMultipleInstances", e.allowMultipleInstances)
+            o.put("imageUri", e.imageUri ?: JSONObject.NULL)
             arr.put(o)
         }
         return arr.toString()
@@ -137,7 +138,10 @@ class SessionRepository(private val context: Context) {
                 useRoot = o.optBoolean("useRoot", false),
                 isFavorite = o.optBoolean("isFavorite", false),
                 isDefault = o.optBoolean("isDefault", false),
-                allowMultipleInstances = o.optBoolean("allowMultipleInstances", false)
+                allowMultipleInstances = o.optBoolean("allowMultipleInstances", false),
+                imageUri = if (o.has("imageUri"))
+                    o.optString("imageUri").takeIf { o.get("imageUri") != JSONObject.NULL }
+                else null
             )
         }
     }

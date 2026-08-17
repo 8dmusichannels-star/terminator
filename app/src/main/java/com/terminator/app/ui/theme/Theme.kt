@@ -30,6 +30,8 @@ import androidx.compose.ui.platform.LocalContext
 
 // TERMINATOR base palette: flat black, no gradients/tint. A thin accent
 // color is used for selection/highlights only - everything else is black.
+// Used only as the pre-Android-12 fallback, where there's no Material You
+// wallpaper-derived palette to AMOLED-ify (see TerminatorTheme below).
 private val AccentBlue = Color(0xFF7EC8FF)
 private val FlatBlack = Color(0xFF000000)
 private val FlatBlackSurface = Color(0xFF0A0A0A) // barely-there separation for rows/dividers
@@ -55,15 +57,54 @@ fun TerminatorTheme(
     amoledBlack: Boolean = false,
     content: @Composable () -> Unit
 ) {
-    // Previously both branches were identical flat black, so this toggle
-    // did nothing regardless of what Settings > Theme > AMOLED Black was
-    // set to. Now: ON keeps the pure-black AMOLED scheme; OFF follows the
-    // device's Material You wallpaper-derived colors (Android 12+), with a
-    // plain dark scheme as the fallback on older versions.
+    // AMOLED Black is an *override* on top of Material You, not a
+    // replacement for it: it was previously a completely separate
+    // hardcoded palette (TerminatorFlatScheme), so turning it on threw
+    // away the device's wallpaper-derived colors entirely - accents,
+    // tints, everything went flat blue-on-black regardless of wallpaper.
+    //
+    // OFF = the dynamic scheme completely untouched, exactly as the
+    // system provides it (normal Material You).
+    //
+    // ON = every neutral/surface slot pushed to pure black - not just
+    // background/surface/surfaceVariant like before, which left
+    // surfaceContainer/surfaceContainerHigh/surfaceContainerHighest (cards,
+    // dialogs, menus, the settings list's own row backgrounds) and
+    // inverseSurface sitting at Material You's dark-gray tones instead of
+    // true black, so "AMOLED Black" only affected part of the screen and
+    // the rest stayed visibly dark-gray. Every hue slot (primary/
+    // secondary/tertiary/error and their on-/container pairs, all of
+    // which Material You actually derives from the wallpaper) is left
+    // alone either way - AMOLED Black only ever touches neutrals, never
+    // the accent colors that make it "Material You" in the first place.
+    //
+    // Pre-Android-12 has no dynamic palette to work from, so both states
+    // fall back to the old hardcoded schemes there.
     val context = LocalContext.current
     val colorScheme = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val dynamic = dynamicDarkColorScheme(context)
+            if (amoledBlack) {
+                dynamic.copy(
+                    background = FlatBlack,
+                    surface = FlatBlack,
+                    surfaceVariant = FlatBlackSurface,
+                    surfaceBright = FlatBlackSurface,
+                    surfaceDim = FlatBlack,
+                    surfaceContainer = FlatBlackSurface,
+                    surfaceContainerLow = FlatBlack,
+                    surfaceContainerLowest = FlatBlack,
+                    surfaceContainerHigh = FlatBlackSurface,
+                    surfaceContainerHighest = FlatBlackSurface,
+                    inverseSurface = Color(0xFFE6E6E6),
+                    inverseOnSurface = FlatBlack,
+                    scrim = Color.Black
+                )
+            } else {
+                dynamic
+            }
+        }
         amoledBlack -> TerminatorFlatScheme
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicDarkColorScheme(context)
         else -> TerminatorDarkFallbackScheme
     }
     MaterialTheme(

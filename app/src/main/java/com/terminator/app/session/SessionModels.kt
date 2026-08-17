@@ -46,7 +46,13 @@ data class SessionEntry(
     val useRoot: Boolean = false,
     val isFavorite: Boolean = false,
     val isDefault: Boolean = false,
-    val allowMultipleInstances: Boolean = false
+    val allowMultipleInstances: Boolean = false,
+    // Optional session picture, set in Settings > Sessions > edit session.
+    // Purely cosmetic - null/blank means "no image", which is the default
+    // for every session including the built-in shell. When present, the
+    // drawer's running-session rows and (if the user wants) the titlebar
+    // may show it, but nothing about session behavior depends on it.
+    val imageUri: String? = null
 ) {
     fun resolvedExecutable(): String = when (type) {
         SessionType.COMMAND_ARG -> commandPath ?: "/system/bin/sh"

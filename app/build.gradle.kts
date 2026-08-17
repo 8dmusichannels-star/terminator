@@ -1,10 +1,12 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 android {
     namespace = "com.terminator.app"
-    compileSdk = 35
+    // 37: required by Compose 1.12 / compose-bom 2026.08.00 below, which
+    // Compose always targets against the latest compileSdk.
+    compileSdk = 37
 
     dependenciesInfo {
         includeInApk = false
@@ -15,22 +17,19 @@ android {
         applicationId = "com.terminator.app"
         minSdk = 33
         targetSdk = 37
-        versionCode = 8
-        versionName = "0.3.6"
+        versionCode = 12
+        versionName = "0.7.0"
     }
     buildFeatures {
         compose = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    // No kotlinOptions block needed: with AGP 9's built-in Kotlin support,
+    // kotlin.compilerOptions.jvmTarget defaults to
+    // android.compileOptions.targetCompatibility automatically.
     val keystorePath = System.getenv("KEYSTORE_PATH")
     signingConfigs {
         if (keystorePath != null) {
@@ -107,7 +106,12 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("com.google.android.material:material:1.12.0")
-    implementation(platform("androidx.compose:compose-bom:2025.02.00"))
+    // 2026.08.00 (Compose 1.12): brings native edge-auto-scroll-while-
+    // selecting and rememberSelectionState()/SelectionState to
+    // SelectionContainer - what TerminalView's selection overlay
+    // (terminal-emulator module) now relies on instead of the app's old
+    // hand-rolled long-press/drag selection + Copy plumbing.
+    implementation(platform("androidx.compose:compose-bom:2026.08.00"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
@@ -115,5 +119,18 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.2")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // SVG rendering for session picture support (Settings > Sessions > edit
+    // session > picture, plus the titlebar picture - see
+    // TerminatorTitleBar.kt). AndroidSVG (Apache 2.0) rather than pulling in
+    // a full image-loading library like Coil/Glide just for this one format:
+    // it's a small, pure-Kotlin/Java, no-native-code library that parses an
+    // SVG document straight to an Android Canvas/Picture, which is exactly
+    // what's needed here since every other session-picture format already
+    // goes through plain BitmapFactory. Picked over the AOSP
+    // androidx.graphics.shapes / VectorDrawable path because those require
+    // an SVG to be precompiled to a VectorDrawable XML at build time - not
+    // usable here, where the SVG is an arbitrary file the user picks at
+    // runtime via a content picker, not a bundled app resource.
+    implementation("com.caverock:androidsvg-aar:1.4")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

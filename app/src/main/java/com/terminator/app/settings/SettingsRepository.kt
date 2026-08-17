@@ -44,7 +44,16 @@ object SettingsKeys {
     val FONT_URI = stringPreferencesKey("font_uri") // used when FONT_FAMILY == "Custom"
     val TEXT_SIZE = floatPreferencesKey("text_size")
     val COLUMNS = floatPreferencesKey("columns")
-    val BLUR_ALPHA = floatPreferencesKey("blur_alpha")
+    val BLUR_ALPHA = floatPreferencesKey("blur_alpha") // legacy key, kept for migration - see BACKGROUND_ALPHA
+    // Appearance > wallpaper background: alpha and blur are now two
+    // independent sliders instead of one value driving both. BACKGROUND_ALPHA
+    // controls how transparent the wallpaper/terminal background is;
+    // BACKGROUND_BLUR controls how blurred the wallpaper image itself is
+    // (0 = sharp, higher = blurrier). Both default to BLUR_ALPHA's old
+    // default (0.3) / no blur (0f) respectively so existing installs don't
+    // visually jump on upgrade.
+    val BACKGROUND_ALPHA = floatPreferencesKey("background_alpha")
+    val BACKGROUND_BLUR = floatPreferencesKey("background_blur")
     val WALLPAPER_URI = stringPreferencesKey("wallpaper_uri")
 
     // Theme
@@ -52,6 +61,39 @@ object SettingsKeys {
     val COLOR_SCHEME_MODE = stringPreferencesKey("color_scheme_mode")
     val CUSTOM_FG = intPreferencesKey("custom_fg")
     val CUSTOM_BG = intPreferencesKey("custom_bg")
+
+    // Theme > Material color override. Off (default): Material only fills
+    // in fg/bg for colorless output, same as before - any ANSI palette the
+    // running program sets (or CUSTOM_FG/CUSTOM_BG/Nord/imported themes)
+    // is left alone. On: Material's dynamic palette is also mapped onto
+    // the terminal's 16 ANSI slots, overriding whatever palette would
+    // otherwise apply - see TerminalPalette.materialOverride().
+    val MATERIAL_COLOR_OVERRIDE = booleanPreferencesKey("material_color_override")
+
+    // Theme > separate error/status colors, independent of whichever
+    // COLOR_SCHEME_MODE/MATERIAL_COLOR_OVERRIDE is active. When enabled,
+    // ANSI red (1/9, conventionally "error") and yellow (3/11,
+    // conventionally "warning/status") are pinned to these two RGB values
+    // regardless of what the rest of the palette resolves to.
+    val STATUS_COLORS_ENABLED = booleanPreferencesKey("status_colors_enabled")
+    val STATUS_ERROR_COLOR = intPreferencesKey("status_error_color")
+    val STATUS_WARNING_COLOR = intPreferencesKey("status_warning_color")
+
+    // Theme > "Custom Palette" mode - a real 16-slot termcolor palette
+    // (distinct from CUSTOM_FG/CUSTOM_BG above, which only ever override
+    // the default text/background pair and leave the 16 ANSI accent colors
+    // fixed). Stored as a JSON array of 16 ARGB ints, index 0-15 in
+    // standard ANSI order (black, red, green, yellow, blue, magenta, cyan,
+    // white, then the bright variants) - see PaletteThemes.kt for parsing/
+    // encoding and the bundled Solarized/Gruvbox/Dracula presets.
+    val CUSTOM_PALETTE_COLORS = stringPreferencesKey("custom_palette_colors")
+    val CUSTOM_PALETTE_FG = intPreferencesKey("custom_palette_fg")
+    val CUSTOM_PALETTE_BG = intPreferencesKey("custom_palette_bg")
+
+    // Appearance > pinch-to-zoom on/off. On by default (existing
+    // behaviour). Off disables the two-finger pinch gesture entirely -
+    // font size then only changes via the Text Size slider.
+    val ZOOM_ENABLED = booleanPreferencesKey("zoom_enabled")
 
     // Sound
     val BELL_ENABLED = booleanPreferencesKey("bell_enabled")
@@ -62,6 +104,22 @@ object SettingsKeys {
     val SHOW_STATUSBAR = booleanPreferencesKey("show_statusbar")
     val SHOW_TITLEBAR = booleanPreferencesKey("show_titlebar")
     val HORIZONTAL_MODE = booleanPreferencesKey("horizontal_mode")
+    // Display > "Show runner toolbar save button". Controls whether the
+    // per-session Save/export icon is rendered on each running-session row
+    // in SessionDrawer (see SessionDrawer.kt's onSaveRunningSession doc).
+    // Default true so existing installs see the Save icon appear the same
+    // way a new feature normally would. The same Save action remains
+    // reachable via the long-press selection toolbar's own save icon
+    // regardless, unaffected by this.
+    val SHOW_RUNNER_TOOLBAR_SAVE = booleanPreferencesKey("show_runner_toolbar_save")
+
+    // Display > Multi-pane > "Broadcast to all panes". Off (default):
+    // typed input goes only to whichever pane is currently focused (tap a
+    // pane to focus it) - see MainViewModel.sendPaneInput's doc. On: every
+    // keystroke is mirrored to every visible pane at once, same idea as the
+    // classic split's own broadcastInput toggle but covering the whole
+    // pane group instead of just one partner.
+    val BROADCAST_ALL_PANES = booleanPreferencesKey("broadcast_all_panes")
 
     // Keyboard
     val SOFT_KEYBOARD = booleanPreferencesKey("soft_keyboard")

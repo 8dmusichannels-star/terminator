@@ -138,19 +138,61 @@ class TerminalEmulator(
             codePoint in SKIN_TONE_MODIFIER_LOW..SKIN_TONE_MODIFIER_HIGH
     }
 
+    // Holds a grapheme cluster (emoji + trailing ZWJ/variation-selector/
+    // skin-tone bytes) that was still "open" - i.e. could plausibly keep
+    // extending - when a previous append() call ran out of chars. The pty
+    // reader (see TerminalSession.start) decodes UTF-8 into a fixed 4096-
+    // char buffer per InputStreamReader.read() and hands each read straight
+    // to append() as its own chunk; a compound emoji sequence (family/
+    // couple/flag sequences run well past 10 UTF-16 chars once several ZWJs
+    // are involved) landing across that 4096-char boundary used to get torn
+    // in half - the first half rendered immediately as its own (wrong,
+    // partial) glyph by the old code below, and the second half arrived in
+    // the *next* append() call with nothing to tell it those chars were
+    // actually a continuation rather than a new cluster. That's the split-
+    // across-reads case scanGraphemeCluster's own forward-only scan could
+    // never catch, since it only ever looked within the single CharSequence
+    // it was given. Carrying the trailing open cluster over here - instead
+    // of writing it - and prepending it to whatever text the next append()
+    // call brings in lets the scan see the whole sequence as one contiguous
+    // run again, the same as if the pty read had never split it.
+    private val pendingCluster = StringBuilder()
+
     /** Feed a chunk of decoded output text from the child process into the emulator. */
     fun append(text: CharSequence) {
+        // Re-attach whatever cluster was left hanging off the end of the
+        // previous chunk (see pendingCluster's doc) before scanning this
+        // one, so a ZWJ sequence split across two pty reads is seen here as
+        // a single contiguous run rather than two unrelated fragments.
+        val effectiveText: CharSequence = if (pendingCluster.isEmpty()) {
+            text
+        } else {
+            val combined = pendingCluster.toString() + text
+            pendingCluster.clear()
+            combined
+        }
         var i = 0
-        while (i < text.length) {
-            val ch = text[i]
+        while (i < effectiveText.length) {
+            val ch = effectiveText[i]
             // Only NORMAL-state printable characters can ever start a
             // grapheme cluster - escape/CSI/OSC sequences are pure ASCII,
             // so this is only attempted when we're about to hand a
             // printable character to writeChar (handleNormal's `else`
             // branch would otherwise take it one Char at a time).
-            if (state == State.NORMAL && ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate()) {
-                val end = scanGraphemeCluster(text, i)
-                writeChar(text.subSequence(i, end).toString())
+            if (state == State.NORMAL && ch.isHighSurrogate() && i + 1 < effectiveText.length && effectiveText[i + 1].isLowSurrogate()) {
+                val (end, stillOpen) = scanGraphemeCluster(effectiveText, i)
+                if (stillOpen) {
+                    // Ran off the end of this chunk mid-cluster (e.g. right
+                    // after a ZWJ, waiting on the codepoint it joins to) -
+                    // hold the whole thing back rather than rendering a
+                    // truncated glyph now. It'll be completed (or, in the
+                    // rare case the process output genuinely ends there,
+                    // flushed as-is) the next time append() runs.
+                    pendingCluster.append(effectiveText.subSequence(i, end))
+                    i = end
+                    continue
+                }
+                writeChar(effectiveText.subSequence(i, end).toString())
                 i = end
                 continue
             }
@@ -167,14 +209,19 @@ class TerminalEmulator(
      * into a compound one - families, couples, profession sequences, the
      * rainbow/trans/etc pride flags), a trailing variation selector, or a
      * skin-tone modifier. Returns the exclusive end index of the whole
-     * cluster. Without this, TerminalBuffer.Cell (see its own doc) still
-     * only ever held a single codepoint's surrogate pair, so a ZWJ sequence
-     * rendered as several adjacent glyphs (e.g. an adult, a joiner glyph,
-     * and a child, instead of one family emoji) rather than the intended
-     * single grapheme - Cell.text being a String already made it capable of
+     * cluster, plus whether the scan stopped because it ran out of chars
+     * while still in a state that could extend further (true) versus
+     * stopping because it found a definitive non-continuing character
+     * (false) - see append()'s pendingCluster handling, which only holds
+     * a cluster back in the first case. Without the cluster-extension scan
+     * itself, TerminalBuffer.Cell (see its own doc) still only ever held a
+     * single codepoint's surrogate pair, so a ZWJ sequence rendered as
+     * several adjacent glyphs (e.g. an adult, a joiner glyph, and a child,
+     * instead of one family emoji) rather than the intended single
+     * grapheme - Cell.text being a String already made it capable of
      * holding the rest once this scan feeds it in.
      */
-    private fun scanGraphemeCluster(text: CharSequence, start: Int): Int {
+    private fun scanGraphemeCluster(text: CharSequence, start: Int): Pair<Int, Boolean> {
         var i = start + 2 // past the initial confirmed surrogate pair
         while (i < text.length) {
             val ch = text[i]
@@ -185,11 +232,22 @@ class TerminalEmulator(
                 // ZWJ must be followed by another full codepoint (either a
                 // surrogate pair or a plain BMP one, e.g. some flag
                 // sequences join BMP regional-indicator-adjacent symbols)
-                // to mean anything - a trailing/dangling ZWJ with nothing
-                // after it isn't part of a cluster and is left for the
-                // normal per-char path to drop or render on its own.
-                ch == ZWJ && i + 1 < text.length -> {
+                // to mean anything. If the chunk ends exactly on the ZWJ (or
+                // one char past it, with no way yet to tell whether that
+                // lone char is the whole joined codepoint or just the high
+                // surrogate of a pair still arriving), that's the open,
+                // held-back case - a dangling ZWJ with genuinely nothing
+                // ever coming after it (chunk ends, process exits) still
+                // eventually gets flushed by the pendingCluster fallback
+                // below, same as before.
+                ch == ZWJ && i + 1 >= text.length -> return i + 1 to true
+                ch == ZWJ -> {
                     val next = text[i + 1]
+                    if (next.isHighSurrogate() && i + 2 >= text.length) {
+                        // High surrogate with its low half not arrived yet -
+                        // stay open rather than guessing.
+                        return i + 2 to true
+                    }
                     i += if (next.isHighSurrogate() && i + 2 < text.length && text[i + 2].isLowSurrogate()) {
                         3 // ZWJ + surrogate pair
                     } else {
@@ -197,13 +255,32 @@ class TerminalEmulator(
                     }
                 }
                 // Skin-tone modifier directly following the base emoji (no
-                // ZWJ needed for this one per the Unicode emoji spec).
-                ch.isHighSurrogate() && i + 1 < text.length && text[i + 1].isLowSurrogate() &&
+                // ZWJ needed for this one per the Unicode emoji spec). A
+                // lone trailing high surrogate here (pair not complete yet)
+                // is also held open rather than treated as "no modifier".
+                ch.isHighSurrogate() && i + 1 >= text.length -> return i + 1 to true
+                ch.isHighSurrogate() && text[i + 1].isLowSurrogate() &&
                     isSkinToneModifier(Character.toCodePoint(ch, text[i + 1])) -> i += 2
-                else -> return i
+                else -> return i to false
             }
         }
-        return i
+        return i to false
+    }
+
+    /**
+     * Flushes any grapheme cluster still held open by [pendingCluster] -
+     * called when a session ends (see TerminalSession's exit handling) so a
+     * dangling ZWJ/partial sequence that was genuinely the last output the
+     * process ever produced (chunk ended, pty then closed - not just
+     * "next read is still coming") still renders whatever it has rather
+     * than silently vanishing.
+     */
+    fun flushPendingCluster() {
+        if (pendingCluster.isEmpty()) return
+        val text = pendingCluster.toString()
+        pendingCluster.clear()
+        writeChar(text)
+        listener.onContentChanged()
     }
 
     private fun processChar(ch: Char) {

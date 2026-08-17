@@ -202,6 +202,69 @@ class TerminalBuffer(
     val maxScrollOffset: Int get() = lock.withLock { scrollback.size }
 
     /**
+     * [row]'s on-screen text, respecting [scrollOffset] the same way
+     * [lineAt] does - but, unlike [selectedText] and [fullText],
+     * deliberately NOT trimmed of trailing spaces. This backs
+     * TerminalView's native-selection overlay: an invisible row of real
+     * text stacked directly on top of the Canvas-painted glyph grid, used
+     * so Android's own SelectionContainer can own long-press/drag
+     * selection and Copy instead of the app hand-tracking (row, col)
+     * pairs. Every character in that overlay row has to land at the same
+     * col*charWidth X position the Canvas below it painted that column
+     * at - trimming here would shorten some rows more than others and
+     * throw that alignment off for every column after the trim point.
+     */
+    fun rowPlainText(row: Int, scrollOffset: Int): String = lock.withLock {
+        val sb = StringBuilder(columns)
+        for (col in 0 until columns) {
+            sb.append(lineAt(row, col, scrollOffset).text)
+        }
+        sb.toString()
+    }
+
+    /**
+     * The session's entire visible output as plain text: everything still
+     * in scrollback (oldest first) followed by the current on-screen grid,
+     * each row trimmed of trailing padding the same way [selectedText]
+     * trims a selection. Used by the runner toolbar's save/export button -
+     * "everything the terminal has shown", not just what got selected and
+     * copied by hand. Bounded by however much scrollback is actually kept
+     * (MAX_SCROLLBACK_LINES) - older output that already scrolled out
+     * isn't recoverable here, same limit selectedText()/lineAt() already
+     * have.
+     */
+    fun fullText(): String = lock.withLock {
+        val lines = mutableListOf<String>()
+        val totalScrollback = scrollback.size
+        // lineAt(row, col, scrollOffset) only resolves scrollback rows when
+        // scrollOffset > 0 (offset 0 is always just the live grid - see its
+        // own doc). To read scrollback line `idx` (0 = oldest), the
+        // equivalent view is "row 0 at scrollOffset = totalScrollback - idx"
+        // - i.e. walk scrollOffset down from its max toward 0 as idx
+        // increases, which lands on row 0 of that offset's window each
+        // time rather than trying to address scrollback with a negative
+        // row number (which cellAt() - what scrollOffset=0 falls through
+        // to - doesn't support; it just returns a blank Cell for anything
+        // outside the visible [0, rows) range.
+        for (idx in 0 until totalScrollback) {
+            val sb = StringBuilder()
+            val offset = totalScrollback - idx
+            for (col in 0 until columns) {
+                sb.append(lineAt(0, col, scrollOffset = offset).text)
+            }
+            lines.add(sb.toString().trimEnd(' '))
+        }
+        for (row in 0 until rows) {
+            val sb = StringBuilder()
+            for (col in 0 until columns) {
+                sb.append(lineAt(row, col, scrollOffset = 0).text)
+            }
+            lines.add(sb.toString().trimEnd(' '))
+        }
+        lines.joinToString("\n")
+    }
+
+    /**
      * Plain text between two screen positions (row, col), as currently
      * rendered - i.e. respecting [scrollOffset] the same way [lineAt] does,
      * so selecting into scrollback and copying grabs what's actually on
@@ -211,6 +274,25 @@ class TerminalBuffer(
      * (the common terminal-copy convention - unwritten cells are blank
      * padding, not real content) but a run of spaces in the *middle* of a
      * line is preserved untouched. Multi-row selections are newline-joined.
+     *
+     * Trailing fully-blank rows are dropped from the result (but never
+     * leading ones - see below). The drag-to-extend-selection gesture has
+     * no equivalent of the long-press start point's snap-to-last-real-
+     * content behavior (MainActivity's lastNonBlankColumn call, used only
+     * when a selection is first created): every frame it just floors the
+     * raw finger position to a (row, col), so a drag that runs past the
+     * last line of real output into the blank terminal space below the
+     * prompt - extremely easy to do, since that blank space is most of the
+     * screen after only a couple lines of output - extended the selection
+     * across those empty rows too. Each contributed its own empty string,
+     * still joined by "\n" like any other row, so Copy produced trailing
+     * blank lines the user never meant to grab ("kopyalama yaparken
+     * boşluklar oluşuyor bazen"). Only trimming from the end (not the
+     * start) matters here: a selection's start point already went through
+     * that snap-to-content logic when it was first placed, so a genuinely
+     * blank *first* row only happens if the user deliberately long-pressed
+     * on empty space with no real content anywhere on that row - in which
+     * case leaving it alone is correct, there's nothing to snap to.
      */
     fun selectedText(startRow: Int, startCol: Int, endRow: Int, endCol: Int, scrollOffset: Int): String = lock.withLock {
         var r1 = startRow; var c1 = startCol
@@ -253,6 +335,14 @@ class TerminalBuffer(
                 sb.append(lineAt(row, col, scrollOffset).text)
             }
             lines.add(sb.toString().trimEnd(' '))
+        }
+        // Drop trailing blank rows picked up by an over-drag past the last
+        // real line - see this function's doc. Keeps at least one line so
+        // a selection that is genuinely all blank (single row, or the user
+        // really did drag across nothing but empty space) still copies as
+        // an empty string rather than throwing an index exception here.
+        while (lines.size > 1 && lines.last().isEmpty()) {
+            lines.removeAt(lines.size - 1)
         }
         lines.joinToString("\n")
     }

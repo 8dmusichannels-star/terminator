@@ -21,14 +21,26 @@
 package com.terminator.emulator
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.SelectionState
+import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.sp
 import android.graphics.Paint
 import android.graphics.Typeface
 
@@ -41,7 +53,16 @@ import android.graphics.Typeface
 class TerminalPalette(
     val ansiColors: IntArray, // 16 base colors, index -> ARGB int
     val defaultForeground: Int,
-    val defaultBackground: Int
+    val defaultBackground: Int,
+    // Independent of ansiColors/defaultForeground/defaultBackground above -
+    // see Settings > Theme > "Separate error/status colors". When non-null,
+    // these pin ANSI red (indices 1 and 9) and yellow (indices 3 and 11)
+    // to a fixed RGB regardless of what the rest of the palette resolves
+    // to (Material, Nord, custom RGB, imported theme...), so a program's
+    // own red/yellow SGR codes always read as "error"/"status" the same
+    // way even if the surrounding palette changes.
+    val statusErrorColor: Int? = null,
+    val statusWarningColor: Int? = null
 ) {
     fun resolve(index: Int): Int = when {
         // Index 15 doubles as "default foreground" (see TerminalBuffer.
@@ -54,9 +75,23 @@ class TerminalPalette(
         // do nothing. Mirrors the same special-casing already done for
         // DEFAULT_BACKGROUND (index 0) in drawTerminal() below.
         index == TerminalBuffer.DEFAULT_FOREGROUND -> defaultForeground
+        // Checked before the general ansiColors branch below so a pinned
+        // status color always wins over whatever red/yellow the active
+        // palette (Material override included) would otherwise resolve to.
+        statusErrorColor != null && (index == 1 || index == 9) -> statusErrorColor
+        statusWarningColor != null && (index == 3 || index == 11) -> statusWarningColor
         index in ansiColors.indices -> ansiColors[index]
         else -> defaultForeground
     }
+
+    /** Returns a copy with the same ansiColors/fg/bg but the given status
+     *  override colors applied (or cleared, if either is null) - lets the
+     *  caller layer Settings > Theme > "Separate error/status colors" on
+     *  top of whatever base palette (Material, Nord, Custom RGB, Material
+     *  override...) was already chosen, without duplicating that base
+     *  palette's own construction logic. */
+    fun withStatusColors(errorColor: Int?, warningColor: Int?): TerminalPalette =
+        TerminalPalette(ansiColors, defaultForeground, defaultBackground, errorColor, warningColor)
 
     companion object {
         /** A Nord-inspired default palette as a sane out-of-the-box theme. */
@@ -98,6 +133,88 @@ class TerminalPalette(
             )
             return TerminalPalette(colors, foreground, background)
         }
+
+        /**
+         * Settings > Theme > "Custom Palette" mode - all 16 ANSI slots plus
+         * fg/bg, either hand-picked by the user or seeded from one of
+         * PalettePresets (Solarized, Gruvbox, Dracula, Nord...). Distinct
+         * from [custom], which only ever varies fg/bg and keeps a fixed
+         * accent set; this is a real termcolor-style palette where every
+         * slot is independently defined.
+         */
+        fun fromPalette(colors: IntArray, foreground: Int, background: Int): TerminalPalette {
+            require(colors.size == 16) { "fromPalette requires exactly 16 colors, got ${colors.size}" }
+            return TerminalPalette(colors.copyOf(), foreground, background)
+        }
+
+        /**
+         * Settings > Theme > "Material color override" toggle, ON state.
+         * Unlike [custom] (which only ever touches defaultForeground/
+         * defaultBackground and leaves the 16 ANSI accent colors fixed),
+         * this maps Material's own dynamic scheme onto all 16 ANSI slots -
+         * so a program's own SGR color codes (red, green, blue...) render
+         * in Material-derived hues too, instead of the fixed Nord-style
+         * accents every other mode keeps for readability. Whether this or
+         * [custom] is used for "Material" mode is decided by the caller
+         * reading MATERIAL_COLOR_OVERRIDE - this function only builds the
+         * palette, it doesn't read settings itself.
+         *
+         * Standard ANSI ordering: 0 black, 1 red, 2 green, 3 yellow,
+         * 4 blue, 5 magenta, 6 cyan, 7 white, 8-15 the bright variants.
+         * Material's tonal roles don't map 1:1 onto 8 hues, so this picks
+         * the closest-fitting role for each slot and derives the bright
+         * variant by leaning on the "inverse"/"container" counterpart
+         * Material already computes, rather than inventing new colors.
+         */
+        fun materialOverride(
+            primary: Int,
+            error: Int,
+            tertiary: Int,
+            secondary: Int,
+            onBackground: Int,
+            background: Int,
+            primaryContainer: Int,
+            errorContainer: Int,
+            tertiaryContainer: Int,
+            secondaryContainer: Int
+        ): TerminalPalette {
+            val colors = intArrayOf(
+                background,          // 0 black
+                error,                // 1 red
+                tertiary,             // 2 green (closest "positive" role Material exposes)
+                secondary,            // 3 yellow/status
+                primary,              // 4 blue
+                secondary,            // 5 magenta
+                tertiary,             // 6 cyan
+                onBackground,         // 7 white
+                background,           // 8 bright black
+                errorContainer,       // 9 bright red
+                tertiaryContainer,    // 10 bright green
+                secondaryContainer,   // 11 bright yellow
+                primaryContainer,     // 12 bright blue
+                secondaryContainer,   // 13 bright magenta
+                tertiaryContainer,    // 14 bright cyan
+                onBackground          // 15 bright white / default foreground
+            )
+            // Also seed statusErrorColor/statusWarningColor with the same
+            // Material error/secondary this palette already used for ANSI
+            // slots 1/9 and 3/11 above. Without this, "Override ANSI colors
+            // too" only touched the general 16-slot palette - a program's
+            // own SGR red/yellow still landed on index 1/3 and looked
+            // identical to before, because Material's error red is close
+            // enough to the existing Nord-style red that the change wasn't
+            // visible. Status colors are checked first in resolve(), so
+            // seeding them here (rather than leaving them null) is what
+            // actually makes the override read as "error/warning now follow
+            // Material" instead of doing nothing. MainActivity's separate
+            // "Separate error/status colors" + RGB picker layer still wins
+            // when the user turns that on explicitly - see withStatusColors().
+            return TerminalPalette(
+                colors, onBackground, background,
+                statusErrorColor = error,
+                statusWarningColor = secondary
+            )
+        }
     }
 }
 
@@ -117,22 +234,93 @@ fun TerminalView(
     // 0 = showing the live screen (normal). >0 = the user has dragged the
     // terminal down to look at scrollback history, this many lines back.
     scrollOffset: Int = 0,
-    // Long-press-to-select range, in (row, col) screen space - null when
-    // nothing is selected. Order doesn't matter (start can be after end,
-    // e.g. dragging upward); the highlight and the copied text both
-    // normalize it the same way.
-    selectionStart: Pair<Int, Int>? = null,
-    selectionEnd: Pair<Int, Int>? = null,
+    // Hoisted by the caller (MainActivity) so its own Copy/Paste/Close
+    // toolbar can read selectionState.selectedTexts and call .clear() -
+    // see that file's SelectionToolbar wiring. Callers that don't need to
+    // observe/drive selection themselves (SplitTerminalPane's panes) can
+    // just leave the default, which still gets full native long-press/
+    // drag selection - they just don't read anything back out of it.
+    selectionState: SelectionState = rememberSelectionState(),
     modifier: Modifier = Modifier
 ) {
-    // bufferVersion is bumped by the caller's ViewModel on every
-    // TerminalEmulator.Listener callback (cursor move / content change).
-    // Reading it here (even though drawTerminal reads straight from
-    // `buffer`) is what makes Compose actually recompose on new output.
-    Canvas(modifier = modifier.fillMaxSize()) {
-        @Suppress("UNUSED_EXPRESSION")
-        bufferVersion
-        drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectionStart, selectionEnd)
+    val density = LocalDensity.current
+    // Same px math drawTerminal uses below (sp -> px via density * fontScale,
+    // then Paint's own font metrics) computed once here too, so the invisible
+    // selection overlay's row height/column width in dp lines up with the
+    // actual glyph grid the Canvas paints. Recomputed only when one of the
+    // inputs that could change it actually changes, not on every frame.
+    val (charWidthPx, charHeightPx) = remember(fontFamily, fontSizeSp, density.density, density.fontScale) {
+        val measuringPaint = Paint().apply {
+            typeface = fontFamily
+            textSize = fontSizeSp * density.density * density.fontScale
+        }
+        measuringPaint.measureText("M") to measuringPaint.fontSpacing
+    }
+
+    Box(modifier = modifier) {
+        // bufferVersion is bumped by the caller's ViewModel on every
+        // TerminalEmulator.Listener callback (cursor move / content change).
+        // Reading it here (even though drawTerminal reads straight from
+        // `buffer`) is what makes Compose actually recompose on new output.
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            @Suppress("UNUSED_EXPRESSION")
+            bufferVersion
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset)
+        }
+
+        // Native text-selection overlay (requires Compose BOM 2026.08.00 /
+        // Compose Foundation 1.12+, which added edge auto-scroll-while-
+        // selecting to SelectionContainer - see build.gradle.kts). This is
+        // an invisible, real-text row stack positioned exactly over the
+        // Canvas above it. Long-press-to-select, drag-to-extend, the
+        // system's own selection handles, auto-scroll past the viewport
+        // edge, and the floating Copy/Select All toolbar are now all
+        // Android's job via SelectionContainer - none of it is hand-rolled
+        // pointerInput math anymore (see MainActivity's gesture loop,
+        // which no longer starts a selection on long-press for exactly
+        // this reason). The Canvas above still owns everything actually
+        // painted (ANSI colors, bold/italic, the block cursor); this layer
+        // only has to carry the right characters in the right on-screen
+        // positions for selection/copy to work correctly - text color is
+        // fully transparent so it never visually doubles the glyphs
+        // Canvas already drew. It intentionally uses FontFamily.Monospace
+        // rather than the caller's own `fontFamily` Typeface: Compose's
+        // font APIs don't take an android.graphics.Typeface directly, and
+        // since this layer is invisible its glyph shapes don't matter -
+        // only that it stays reasonably monospaced so column positions
+        // (and therefore where a drag lands / where handles appear) stay
+        // close to the Canvas grid underneath. bufferVersion is read via
+        // the enclosing composable's own recomposition (see the Canvas
+        // comment above) rather than a second explicit read here.
+        SelectionContainer(state = selectionState) {
+            androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
+                android.util.Log.d("SelDebug", "TerminalView: selectedTexts changed, count=${selectionState.selectedTexts.size}")
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onGloballyPositioned { coords ->
+                        android.util.Log.d("SelDebug", "TerminalView: overlay Column size=${coords.size}")
+                    }
+            ) {
+                val rowHeightDp = with(density) { charHeightPx.toDp() }
+                val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
+                for (row in 0 until buffer.rows) {
+                    BasicText(
+                        text = buffer.rowPlainText(row, scrollOffset),
+                        style = TextStyle(
+                            color = Color.Transparent,
+                            fontSize = fontSizeSp.sp,
+                            fontFamily = FontFamily.Monospace
+                        ),
+                        softWrap = false,
+                        modifier = Modifier
+                            .height(rowHeightDp)
+                            .width(rowWidthDp)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -142,9 +330,7 @@ private fun DrawScope.drawTerminal(
     fontFamily: Typeface,
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
-    scrollOffset: Int = 0,
-    selectionStart: Pair<Int, Int>? = null,
-    selectionEnd: Pair<Int, Int>? = null
+    scrollOffset: Int = 0
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -171,66 +357,12 @@ private fun DrawScope.drawTerminal(
 
     drawRect(color = Color(palette.defaultBackground).copy(alpha = backgroundAlpha.coerceIn(0f, 1f)), size = size)
 
-    // Selection highlight, drawn before glyphs so text stays legible on top
-    // of it. Normalized the same way TerminalBuffer.selectedText() does -
-    // start/end can be given in either order (dragging up vs down) - so the
-    // two stay visually and textually consistent with each other.
-    if (selectionStart != null && selectionEnd != null) {
-        var (r1, c1) = selectionStart
-        var (r2, c2) = selectionEnd
-        if (r1 > r2 || (r1 == r2 && c1 > c2)) {
-            val tr = r1; val tc = c1
-            r1 = r2; c1 = c2
-            r2 = tr; c2 = tc
-        }
-        val highlightColor = Color(0xFF4A90D9).copy(alpha = 0.45f)
-        for (row in r1..r2) {
-            // NOT `if (row !in 0 until buffer.rows) continue`. Same reason
-            // as TerminalBuffer.selectedText()'s matching loop (see its
-            // own doc): r1/r2 are screen-space rows meant to be resolved
-            // together with scrollOffset via buffer.lineAt(), and a
-            // selection's stationary endpoint can legitimately sit outside
-            // [0, buffer.rows) once auto-scroll-while-dragging has shifted
-            // scrollOffset underneath it. Filtering those rows out here
-            // used to truncate the highlight at the top/bottom edge of the
-            // visible screen even though selectedText() - once it also
-            // stopped filtering them - kept including that same text in
-            // what Copy actually produced, so the blue highlight and what
-            // got copied silently disagreed. buffer.lineAt() already
-            // bounds-checks internally, so there's nothing to guard here.
-            val fromCol = (if (row == r1) c1 else 0).coerceIn(0, buffer.columns - 1)
-            val rawToCol = (if (row == r2) c2 else buffer.columns - 1).coerceIn(0, buffer.columns - 1)
-
-            // Trailing blank cells on a row (columns never written to, or
-            // cleared back to a space) aren't real content - selectedText()
-            // already trims them from what actually gets copied. The
-            // highlight used to always paint out to the row's raw toCol
-            // (the far edge of the screen for every row except the last),
-            // so dragging a selection down past a couple lines of real
-            // text into the blank rows below it painted a solid full-width
-            // bar across all that empty space - looking like one giant
-            // block instead of just the two or three lines actually
-            // selected. Clamping to the row's last non-space character
-            // keeps the highlight's shape matching what Copy will actually
-            // produce.
-            val lastNonBlankCol = buffer.lastNonBlankColumn(row, scrollOffset)
-            // Only clamp the *end* of the row's highlighted range - the
-            // drag's start column (fromCol, on r1) is always where the
-            // user actually put their finger, so it's left untouched even
-            // if that lands past the last real character.
-            val toCol = if (lastNonBlankCol != null) rawToCol.coerceAtMost(lastNonBlankCol) else -1
-            if (toCol < fromCol) continue
-
-            val x = fromCol * charWidth
-            val y = (row + 1) * charHeight
-            val width = (toCol - fromCol + 1) * charWidth
-            drawRect(
-                color = highlightColor,
-                topLeft = Offset(x, y - charHeight),
-                size = androidx.compose.ui.geometry.Size(width, charHeight)
-            )
-        }
-    }
+    // Selection highlight used to be drawn here by hand (blue rect per
+    // row, normalized/clamped against buffer.lastNonBlankColumn) - removed
+    // now that selection is owned by TerminalView's native
+    // SelectionContainer overlay, which draws its own highlight behind the
+    // (invisible) text it manages. That overlay sits directly on top of
+    // this Canvas, so nothing here needs to paint a highlight anymore.
 
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {
