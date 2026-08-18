@@ -819,7 +819,22 @@ class MainActivity : ComponentActivity() {
                                     onResizePane = { runtimeId, size -> viewModel.resizePane(runtimeId, size) },
                                     onResizeSessionPty = { runtimeId, cols, rws -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws) },
                                     onSetMode = { mode -> viewModel.setPaneMode(mode) },
-                                    onAddPaneRequested = { showAddPanePicker = true },
+                                    onAddPaneRequested = {
+                                        // Same "don't pop up an empty list"
+                                        // fallback as the titlebar "+" - see
+                                        // spawnAndAddPane's doc. Only offer
+                                        // the picker when there's actually a
+                                        // running-but-not-yet-paned session
+                                        // to choose from.
+                                        val pickableSessions = state.runningSessions.filterNot { r ->
+                                            state.panes.any { it.runtimeId == r.runtimeId }
+                                        }
+                                        if (pickableSessions.isNotEmpty()) {
+                                            showAddPanePicker = true
+                                        } else {
+                                            viewModel.spawnAndAddPane()
+                                        }
+                                    },
                                     onExitMultiPane = { viewModel.exitMultiPaneMode() },
                                     modifier = Modifier.weight(1f)
                                 )

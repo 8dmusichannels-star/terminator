@@ -40,7 +40,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -336,10 +338,6 @@ private fun RunningSessionRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (isActive) MaterialTheme.colorScheme.primary else Color.White
             )
-            // Shown once the process is confirmed gone (natural exit,
-            // SIGTERM, or the trash-can/Ctrl+D SIGKILL below) - the row
-            // stays visible instead of vanishing, so it's clear the
-            // process is dead rather than just idle.
             if (running.exited) {
                 Text(
                     "Session exited",
@@ -348,39 +346,36 @@ private fun RunningSessionRow(
                 )
             }
         }
-        // Split-screen toggle for this specific running session - only
-        // shown for OTHER running sessions (never the currently active
-        // one, since split needs two distinct sessions). Tapping opens it
-        // as the split secondary pane; tapping again while it's already
-        // the split partner closes the split - see MainViewModel.
-        // setSplitSession's doc. Null onSplitClick (only passed for the
-        // active row) hides the button entirely rather than showing it
-        // disabled.
-        if (onSplitClick != null) {
-            IconButton(onClick = onSplitClick) {
+
+        // Extra actions (split / pane) revealed via a "···" toggle so the
+        // row doesn't overflow with 4+ icons by default. The toggle itself
+        // is always visible; the extra icons animate in/out next to it.
+        var actionsExpanded by remember { mutableStateOf(false) }
+        if (actionsExpanded) {
+            if (onSplitClick != null) {
+                IconButton(onClick = onSplitClick) {
+                    Icon(
+                        Icons.Filled.VerticalSplit,
+                        contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
+                        tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                    )
+                }
+            }
+            IconButton(onClick = { onAddPaneClick(); actionsExpanded = false }) {
                 Icon(
-                    Icons.Filled.VerticalSplit,
-                    contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
-                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                    Icons.Filled.GridView,
+                    contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
+                    tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
                 )
             }
         }
-        // Multi-pane mode toggle for this row - see this function's
-        // isPaneMember/onAddPaneClick doc above. Always shown (unlike the
-        // split button, no active-row restriction).
-        IconButton(onClick = onAddPaneClick) {
+        IconButton(onClick = { actionsExpanded = !actionsExpanded }) {
             Icon(
-                Icons.Filled.GridView,
-                contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
-                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                if (actionsExpanded) Icons.Filled.ExpandLess else Icons.Filled.MoreVert,
+                contentDescription = if (actionsExpanded) "Collapse actions" else "More actions",
+                tint = Color.White.copy(alpha = 0.5f)
             )
         }
-        // Exports this specific running session's terminal output (screen +
-        // scrollback) directly from the drawer row - see SessionDrawer's
-        // onSaveRunningSession doc. Placed immediately before the Clone
-        // ("+") icon per the request ("+ onune save buttonu"). Gated
-        // per-row by onSaveClick being null (icon isn't rendered at all)
-        // rather than shown-disabled, same pattern as onSplitClick above.
         if (onSaveClick != null) {
             IconButton(onClick = onSaveClick) {
                 Icon(

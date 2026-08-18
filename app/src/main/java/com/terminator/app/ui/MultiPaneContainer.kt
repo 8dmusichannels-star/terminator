@@ -410,6 +410,18 @@ private fun FloatingLayout(
             val clampedX = pane.floatOffset.x.coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f)
             val clampedY = pane.floatOffset.y.coerceIn(0f, containerHeightDp - 32f)
 
+            // Fixed reference point for the CURRENT drag/resize gesture -
+            // captured once when a gesture starts (see PaneContent's
+            // cumulative-delta doc) rather than read fresh from `pane` on
+            // every frame. `pane` itself only reflects the latest
+            // committed state, which lags a frame or more behind the
+            // in-progress gesture once movePane/resizePane round-trips
+            // through the ViewModel and back - computing "start + running
+            // total" against a value captured once avoids compounding that
+            // lag into visible jitter.
+            var dragStartOffset by remember(pane.runtimeId) { androidx.compose.runtime.mutableStateOf(pane.floatOffset) }
+            var resizeStartSize by remember(pane.runtimeId) { androidx.compose.runtime.mutableStateOf(pane.floatSize) }
+
             Box(
                 modifier = Modifier
                     .offset { IntOffset((clampedX * density).roundToInt(), (clampedY * density).roundToInt()) }
@@ -430,18 +442,24 @@ private fun FloatingLayout(
                     onMeasuredSize = { cols, rws -> onResizeSessionPty(pane.runtimeId, cols, rws) },
                     fontDensity = density,
                     showDragHandle = true,
-                    onHeaderDrag = { deltaPx ->
+                    onDragStart = {
+                        dragStartOffset = pane.floatOffset
+                        resizeStartSize = pane.floatSize
+                    },
+                    onHeaderDrag = { cumulativeDeltaPx ->
                         onFocusPane(pane.runtimeId)
                         val newOffset = Offset(
-                            (clampedX + deltaPx.x / density).coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f),
-                            (clampedY + deltaPx.y / density).coerceIn(0f, containerHeightDp - 32f)
+                            (dragStartOffset.x + cumulativeDeltaPx.x / density)
+                                .coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f),
+                            (dragStartOffset.y + cumulativeDeltaPx.y / density)
+                                .coerceIn(0f, containerHeightDp - 32f)
                         )
                         onMovePane(pane.runtimeId, newOffset)
                     },
-                    onResizeDrag = { deltaPx ->
+                    onResizeDrag = { cumulativeDeltaPx ->
                         val newSize = Size(
-                            (pane.floatSize.width + deltaPx.x / density).coerceAtLeast(MIN_PANE_WIDTH.value),
-                            (pane.floatSize.height + deltaPx.y / density).coerceAtLeast(MIN_PANE_HEIGHT.value)
+                            (resizeStartSize.width + cumulativeDeltaPx.x / density).coerceAtLeast(MIN_PANE_WIDTH.value),
+                            (resizeStartSize.height + cumulativeDeltaPx.y / density).coerceAtLeast(MIN_PANE_HEIGHT.value)
                         )
                         onResizePane(pane.runtimeId, newSize)
                     },
@@ -475,6 +493,7 @@ private fun PaneContent(
     onMeasuredSize: (columns: Int, rows: Int) -> Unit,
     fontDensity: Float,
     showDragHandle: Boolean,
+    onDragStart: () -> Unit = {},
     onHeaderDrag: (Offset) -> Unit = {},
     onResizeDrag: (Offset) -> Unit = {},
     modifier: Modifier = Modifier
@@ -515,11 +534,33 @@ private fun PaneContent(
                 .let { base ->
                     if (showDragHandle) {
                         base.pointerInput(runtimeId) {
+                            // Accumulates the running total of the drag
+                            // gesture, reset at the start of every new drag -
+                            // NOT the single per-frame dragAmount. Compose's
+                            // pointer-input coroutine runs independently of
+                            // recomposition, so a callback fed only the raw
+                            // per-frame delta and adding it on top of a
+                            // composable-scope value (pane.floatOffset, which
+                            // only updates once recomposition catches up)
+                            // was applying that same tiny delta to a stale
+                            // base repeatedly - the visible symptom being the
+                            // pane jittering in place instead of following
+                            // the finger. Sending the cumulative total lets
+                            // the caller compute newOffset = dragStartOffset
+                            // + total once per frame, which is stable
+                            // regardless of how many recompositions land
+                            // mid-gesture.
+                            var accumulated = Offset.Zero
                             detectDragGestures(
-                                onDragStart = { onFocus() },
+                                onDragStart = {
+                                    accumulated = Offset.Zero
+                                    onDragStart()
+                                    onFocus()
+                                },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
-                                    onHeaderDrag(dragAmount)
+                                    accumulated += dragAmount
+                                    onHeaderDrag(accumulated)
                                 }
                             )
                         }
@@ -646,10 +687,22 @@ private fun PaneContent(
                         .align(Alignment.BottomEnd)
                         .size(24.dp)
                         .pointerInput(runtimeId) {
-                            detectDragGestures { change, dragAmount ->
-                                change.consume()
-                                onResizeDrag(dragAmount)
-                            }
+                            // Same cumulative-total fix as the header drag
+                            // above - see its comment for why per-frame
+                            // dragAmount alone caused jitter instead of a
+                            // smooth resize.
+                            var accumulated = Offset.Zero
+                            detectDragGestures(
+                                onDragStart = {
+                                    accumulated = Offset.Zero
+                                    onDragStart()
+                                },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    accumulated += dragAmount
+                                    onResizeDrag(accumulated)
+                                }
+                            )
                         }
                 ) {
                     Icon(

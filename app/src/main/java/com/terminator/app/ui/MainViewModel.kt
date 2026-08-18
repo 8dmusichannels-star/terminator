@@ -350,6 +350,27 @@ class MainViewModel(
         launchLiveSession(runtimeId = newRuntimeId(entry.id), entry = entry)
     }
 
+    /**
+     * Backs MultiPaneContainer's toolbar "+" when there is no already-
+     * running session left to offer (every running session is already a
+     * pane, or nothing is running at all) - QuickAddSessionPickerDialog
+     * would otherwise pop up with an empty list and nothing to tap, same
+     * "don't show a useless empty popup" reasoning as
+     * duplicateActiveSession's own fallback for the titlebar "+". Spawns a
+     * fresh copy of the active session (or the default session if nothing
+     * is active) and adds THAT new instance straight to the pane group,
+     * skipping the picker entirely since there was nothing to pick between.
+     */
+    fun spawnAndAddPane() {
+        val activeEntry = _uiState.value.activeSessionId?.let { liveEntries[it] }
+            ?: _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+            ?: return
+        val newId = newRuntimeId(activeEntry.id)
+        launchLiveSession(runtimeId = newId, entry = activeEntry)
+        addPaneSession(newId)
+    }
+
     /** Switches to an already-running instance without spawning anything new. */
     fun openRunningSession(runtimeId: String) {
         if (liveSessions[runtimeId]?.isAlive() == true) {
