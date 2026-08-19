@@ -40,9 +40,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -104,6 +102,13 @@ fun SessionDrawer(
     // (to open one) but none of them render as "already the partner".
     splitRuntimeId: String? = null,
     onToggleSplitSession: (String) -> Unit = {},
+    // Settings > Display > "Split screen visibility"
+    // (SettingsKeys.SPLIT_SCREEN_VISIBLE). False hides the split icon on
+    // every running-session row entirely (not shown-but-disabled), same
+    // "hidden not disabled" treatment showRunnerSaveButtons gets above.
+    // Independent of whether a split is currently open - see that
+    // setting's own doc.
+    showSplitButtons: Boolean = true,
     // Multi-pane mode: runtimeIds currently shown as panes (see
     // MainUiState.panes's doc) and the callback to add a given running
     // session to that group (or bring it to front if it's already in it) -
@@ -220,14 +225,17 @@ fun SessionDrawer(
                                 },
                                 // Split only makes sense between two DISTINCT running
                                 // sessions - hidden on the active row itself (there'd be
-                                // nothing else to show alongside it).
-                                onSplitClick = if (running.runtimeId != activeSessionId) {
+                                // nothing else to show alongside it) - and hidden
+                                // everywhere when showSplitButtons is off (Settings >
+                                // Display > "Split screen visibility").
+                                onSplitClick = if (running.runtimeId != activeSessionId && showSplitButtons) {
                                     { onToggleSplitSession(running.runtimeId) }
                                 } else {
                                     null
                                 },
                                 isPaneMember = running.runtimeId in paneRuntimeIds,
-                                onAddPaneClick = { onAddPaneSession(running.runtimeId) }
+                                onAddPaneClick = { onAddPaneSession(running.runtimeId) },
+                                showPaneButton = showSplitButtons
                             )
                         }
                         item(key = "running-divider") {
@@ -306,7 +314,13 @@ private fun RunningSessionRow(
     // "only one other session" restriction, any running session (including
     // the active one) can join the pane group.
     isPaneMember: Boolean = false,
-    onAddPaneClick: () -> Unit = {}
+    onAddPaneClick: () -> Unit = {},
+    // When false, hides the GridView (add-to-pane) icon entirely — same
+    // "hidden not disabled" treatment onSplitClick == null gives the split
+    // icon. Controlled by showSplitButtons (Settings > Display > Split
+    // screen visibility) so both split and pane icons appear/disappear
+    // together. Default true keeps existing callers unaffected.
+    showPaneButton: Boolean = true
 ) {
     Row(
         modifier = Modifier
@@ -347,34 +361,29 @@ private fun RunningSessionRow(
             }
         }
 
-        // Extra actions (split / pane) revealed via a "···" toggle so the
-        // row doesn't overflow with 4+ icons by default. The toggle itself
-        // is always visible; the extra icons animate in/out next to it.
-        var actionsExpanded by remember { mutableStateOf(false) }
-        if (actionsExpanded) {
-            if (onSplitClick != null) {
-                IconButton(onClick = onSplitClick) {
-                    Icon(
-                        Icons.Filled.VerticalSplit,
-                        contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
-                        tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
-                    )
-                }
-            }
-            IconButton(onClick = { onAddPaneClick(); actionsExpanded = false }) {
+        // Split / add-to-pane icons now show directly on the row, same as
+        // Save/Clone/Wake/Kill below - no more "···" (MoreVert/ExpandLess)
+        // toggle gating them behind an extra tap. That toggle used to hide
+        // these two behind a collapse/expand step; removed per request so
+        // nothing sits in front of the running session's own action row
+        // anymore.
+        if (onSplitClick != null) {
+            IconButton(onClick = onSplitClick) {
                 Icon(
-                    Icons.Filled.GridView,
-                    contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
-                    tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                    Icons.Filled.VerticalSplit,
+                    contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
+                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
                 )
             }
         }
-        IconButton(onClick = { actionsExpanded = !actionsExpanded }) {
+        if (showPaneButton) {
+        IconButton(onClick = onAddPaneClick) {
             Icon(
-                if (actionsExpanded) Icons.Filled.ExpandLess else Icons.Filled.MoreVert,
-                contentDescription = if (actionsExpanded) "Collapse actions" else "More actions",
-                tint = Color.White.copy(alpha = 0.5f)
+                Icons.Filled.GridView,
+                contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
+                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
             )
+        }
         }
         if (onSaveClick != null) {
             IconButton(onClick = onSaveClick) {

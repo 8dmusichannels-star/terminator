@@ -32,8 +32,16 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.selection.SelectionState
 import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.TextToolbar
+import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
@@ -43,6 +51,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.sp
 import android.graphics.Paint
 import android.graphics.Typeface
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.text.contextmenu.provider.LocalTextContextMenuDropdownProvider
+import androidx.compose.foundation.text.contextmenu.provider.LocalTextContextMenuToolbarProvider
+import androidx.compose.foundation.text.contextmenu.provider.TextContextMenuDataProvider
+import androidx.compose.foundation.text.contextmenu.provider.TextContextMenuProvider
 
 /**
  * Renders a TerminalBuffer to a Compose Canvas using a monospace font.
@@ -241,7 +254,13 @@ fun TerminalView(
     // just leave the default, which still gets full native long-press/
     // drag selection - they just don't read anything back out of it.
     selectionState: SelectionState = rememberSelectionState(),
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // Debug-only tag prefixed onto this instance's SelDebug/ToolbarDebug
+    // logcat lines so a log spanning both the primary pane's TerminalView
+    // and the split pane's TerminalView (both log under the same tags)
+    // can actually be told apart. "primary" is MainActivity's default;
+    // SplitTerminalPane passes "split" explicitly.
+    debugLabel: String = "primary"
 ) {
     val density = LocalDensity.current
     // Same px math drawTerminal uses below (sp -> px via density * fontScale,
@@ -292,35 +311,177 @@ fun TerminalView(
         // close to the Canvas grid underneath. bufferVersion is read via
         // the enclosing composable's own recomposition (see the Canvas
         // comment above) rather than a second explicit read here.
-        SelectionContainer(state = selectionState) {
-            androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
-                android.util.Log.d("SelDebug", "TerminalView: selectedTexts changed, count=${selectionState.selectedTexts.size}")
-            }
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .onGloballyPositioned { coords ->
-                        android.util.Log.d("SelDebug", "TerminalView: overlay Column size=${coords.size}")
+        // See NoOpTextToolbar's doc above: this is what stops
+        // SelectionContainer's platform fallback bubble from ever
+        // starting alongside ActionModeController's own bubble. remember()
+        // (not a shared object/companion) so each TerminalView instance -
+        // primary pane and split pane each render their own - tracks its
+        // own independent shown/hidden status rather than one instance's
+        // selection state leaking into the other's.
+        val noOpTextToolbar = remember { NoOpTextToolbar() }
+        CompositionLocalProvider(
+            LocalTextToolbar provides noOpTextToolbar,
+            // Blocks the newer contextmenu-package path too - see
+            // NoOpTextContextMenuProvider's doc above for why the old
+            // LocalTextToolbar override alone left a second native bubble
+            // able to fire during an active selection drag.
+            LocalTextContextMenuToolbarProvider provides NoOpTextContextMenuProvider,
+            LocalTextContextMenuDropdownProvider provides NoOpTextContextMenuProvider,
+        ) {
+            SelectionContainer(state = selectionState) {
+                androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
+                    android.util.Log.d("SelDebug", "TerminalView[$debugLabel]: selectedTexts changed, count=${selectionState.selectedTexts.size}")
+                }
+                // Freeze the row text this overlay shows while a selection is
+                // active. Without this, every bufferVersion bump (i.e. every
+                // burst of new terminal output - the textbook case: the user
+                // starts a long-press selection while a command is still
+                // producing output) recomposes this whole TerminalView
+                // function body, which re-reads buffer.rowPlainText(row,
+                // scrollOffset) for every row right under SelectionContainer.
+                // That handed the SAME row Composable slots DIFFERENT text
+                // mid-drag - exactly the "row slots get different text"
+                // problem this file's LaunchedEffect(state.scrollOffset) doc
+                // (in MainActivity) already describes for scrollOffset
+                // changes, just triggered by ordinary new output instead.
+                // SelectionContainer has no way to reconcile that: it found
+                // its selection pointing at text that's no longer there and
+                // silently collapsed it to empty (visible in logcat as
+                // selectedTexts changed, count=0 with no scrollOffset change
+                // anywhere near it - the actual bug report this fixes).
+                // remember + a manual snapshot, rather than reading
+                // buffer.rowPlainText directly in the loop below, means once
+                // a selection starts this Column keeps showing exactly the
+                // text it started with regardless of how many more
+                // bufferVersion bumps arrive - new output still lands on the
+                // Canvas (which isn't frozen and doesn't need to be, it owns
+                // no selection state), just not on this invisible text layer
+                // until the selection ends. isNotEmpty() re-snapshots on
+                // every recomposition while a selection is active so drag-
+                // to-extend still grows into freshly-frozen rows as the
+                // selection itself grows - only the "new output changed
+                // rows the user isn't touching" case is what's actually
+                // being guarded against here, not selection growth itself.
+                val frozenRowText = remember(debugLabel) { mutableStateOf<List<String>?>(null) }
+                if (selectionState.selectedTexts.isEmpty()) {
+                    frozenRowText.value = null
+                } else if (frozenRowText.value == null) {
+                    frozenRowText.value = (0 until buffer.rows).map { row -> buffer.rowPlainText(row, scrollOffset) }
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .onGloballyPositioned { coords ->
+                            android.util.Log.d("SelDebug", "TerminalView[$debugLabel]: overlay Column size=${coords.size}")
+                        }
+                ) {
+                    val rowHeightDp = with(density) { charHeightPx.toDp() }
+                    val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
+                    val frozen = frozenRowText.value
+                    for (row in 0 until buffer.rows) {
+                        BasicText(
+                            text = frozen?.getOrNull(row) ?: buffer.rowPlainText(row, scrollOffset),
+                            style = TextStyle(
+                                color = Color.Transparent,
+                                fontSize = fontSizeSp.sp,
+                                fontFamily = FontFamily.Monospace
+                            ),
+                            softWrap = false,
+                            modifier = Modifier
+                                .height(rowHeightDp)
+                                .width(rowWidthDp)
+                        )
                     }
-            ) {
-                val rowHeightDp = with(density) { charHeightPx.toDp() }
-                val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
-                for (row in 0 until buffer.rows) {
-                    BasicText(
-                        text = buffer.rowPlainText(row, scrollOffset),
-                        style = TextStyle(
-                            color = Color.Transparent,
-                            fontSize = fontSizeSp.sp,
-                            fontFamily = FontFamily.Monospace
-                        ),
-                        softWrap = false,
-                        modifier = Modifier
-                            .height(rowHeightDp)
-                            .width(rowWidthDp)
-                    )
                 }
             }
         }
+    }
+}
+
+/**
+ * SelectionContainer's default behavior, when no [LocalTextToolbar] is
+ * provided, is to fall back to the platform's own AndroidTextToolbar -
+ * which calls the View's default `startActionMode` with the system's
+ * stock Copy/Select All items the moment a selection becomes non-empty.
+ * That fires independently of - and at the same time as -
+ * ActionModeController's own bar in MainActivity (see
+ * SelectionOverrideToolbar.kt), so two unrelated selection UIs were racing
+ * on the same selection: the platform's stock bubble and this app's Copy/
+ * Paste/More bubble both showing at once ("android kendi native toolbar
+ * menu secenekleri bizim copy paste more menumuzle ayni anda devreye
+ * giriyor").
+ *
+ * NoOpTextToolbar replaces that fallback with a toolbar that never shows
+ * anything. SelectionContainer still owns everything it's supposed to -
+ * long-press-to-select, drag handles, drag-to-extend, edge auto-scroll -
+ * none of that goes through TextToolbar at all, it's a separate internal
+ * mechanism. TextToolbar is *only* the "show a Copy/Paste bubble" call,
+ * so suppressing it leaves selection itself fully intact and simply stops
+ * the platform from ever starting its own competing bubble.
+ * ActionModeController (SelectionActionBar) remains the only Copy/Paste UI
+ * that's ever shown for this selection.
+ */
+private class NoOpTextToolbar : TextToolbar {
+    // status is pinned permanently to Shown, never Hidden - not tied to
+    // whether showMenu()/hide() were actually called. The previous version
+    // tracked a real shown/hidden flag (flipping to Shown only inside
+    // showMenu()), on the theory that SelectionContainer reads this status
+    // back to decide whether it believes a toolbar is already up. In
+    // practice the native bubble still appeared on finger-up: showMenu()
+    // is only one of the internal paths SelectionContainer can take on
+    // selection-finalize, and on this Foundation version (1.12,
+    // compose-bom:2026.08.00) that finalize step doesn't reliably call
+    // showMenu() at all before falling back - so a flag that only flips on
+    // showMenu() stayed Hidden right through the moment the fallback
+    // check ran. Reporting Shown unconditionally, from the moment this
+    // toolbar exists, removes that race entirely: whichever internal path
+    // SelectionContainer takes, its "is a toolbar already showing"
+    // check sees Shown and never reaches for its own default bubble.
+    override val status: TextToolbarStatus
+        get() = TextToolbarStatus.Shown
+    override fun showMenu(
+        rect: Rect,
+        onCopyRequested: (() -> Unit)?,
+        onPasteRequested: (() -> Unit)?,
+        onCutRequested: (() -> Unit)?,
+        onSelectAllRequested: (() -> Unit)?
+    ) {
+        // Intentionally renders nothing - ActionModeController/
+        // SelectionActionBar (in MainActivity) is the real, visible bar.
+        android.util.Log.d("ToolbarDebug", "NoOpTextToolbar.showMenu called - suppressing (no-op)")
+    }
+    override fun hide() {
+        android.util.Log.d("ToolbarDebug", "NoOpTextToolbar.hide called (no-op, status stays Shown)")
+    }
+}
+
+/**
+ * The second, independent toolbar path that made "iki tane toolbar" (two
+ * toolbars) possible even with NoOpTextToolbar above fully wired up and
+ * MainActivity.onWindowStartingActionMode() blocking every ActionMode:
+ * this Compose Foundation version (1.12 / compose-bom:2026.08.00) ships
+ * its own newer text-context-menu system - androidx.compose.foundation.
+ * text.contextmenu.* - added around Foundation 1.9, which SelectionContainer
+ * on this version goes through directly for its in-drag/finalize bubble,
+ * separately from (and in addition to) the older LocalTextToolbar path
+ * NoOpTextToolbar targets above. It has its own pair of composition
+ * locals - LocalTextContextMenuToolbarProvider and
+ * LocalTextContextMenuDropdownProvider - each expecting a
+ * TextContextMenuProvider. Its default Android implementation
+ * (AndroidTextContextMenuToolbarProvider) is what was still calling
+ * View.startActionMode() during an active drag on this path, racing our
+ * own SelectionActionBar exactly the way the old fallback used to before
+ * NoOpTextToolbar existed. showTextContextMenu() simply never opening a
+ * session is this path's equivalent of NoOpTextToolbar.showMenu() being
+ * empty - SelectionActionBar (driven off selectionState directly, same as
+ * before) remains the only Copy/Paste UI that can ever appear.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+private object NoOpTextContextMenuProvider : TextContextMenuProvider {
+    override suspend fun showTextContextMenu(dataProvider: TextContextMenuDataProvider) {
+        android.util.Log.d("ToolbarDebug", "NoOpTextContextMenuProvider.showTextContextMenu called - suppressing (no-op)")
+        // Intentionally never opens a menu session - ActionModeController/
+        // SelectionActionBar is the real, visible bar.
     }
 }
 

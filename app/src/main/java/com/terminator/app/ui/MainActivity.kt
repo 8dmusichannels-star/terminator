@@ -28,16 +28,15 @@ import android.util.Log
 import androidx.compose.animation.core.tween
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.foundation.text.selection.rememberSelectionState
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalTextToolbar
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -61,6 +60,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -103,6 +103,33 @@ class MainActivity : ComponentActivity() {
                 MainViewModel(app, app.sessionRepository, filesDir, app.settingsRepository, app.terminfoDir)
             }
         }
+    }
+
+    // SelectionOverrideToolbar.kt's own doc says this is required
+    // alongside the Compose-level NoOpTextToolbar block ("some
+    // compose-foundation versions still go through real ActionMode
+    // during an active drag, and that path needs the Activity-level
+    // block too") - but it was never actually written, which is exactly
+    // why the native bubble kept winning the race: LocalTextToolbar only
+    // intercepts Compose's *own* fallback path, it has no say over a
+    // real android.view.ActionMode started straight off the underlying
+    // View, and that's a second, independent path into the same native
+    // bubble. Returning null from both overloads refuses to let the
+    // window start ANY ActionMode (primary or floating) for as long as
+    // this Activity is up, so there's nothing left to race
+    // ActionModeController/SelectionActionBar - ours is the only
+    // Copy/Paste UI that can ever show, full stop.
+    override fun onWindowStartingActionMode(callback: android.view.ActionMode.Callback?): android.view.ActionMode? {
+        android.util.Log.d("ToolbarDebug", "onWindowStartingActionMode(callback) blocked - refusing native ActionMode")
+        return null
+    }
+
+    override fun onWindowStartingActionMode(
+        callback: android.view.ActionMode.Callback?,
+        type: Int
+    ): android.view.ActionMode? {
+        android.util.Log.d("ToolbarDebug", "onWindowStartingActionMode(callback, type=$type) blocked - refusing native ActionMode")
+        return null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -150,7 +177,14 @@ class MainActivity : ComponentActivity() {
         // (and only shows its notification) while a session genuinely is.
         handleNotificationIntent(intent)
 
-        setContent {
+        val gatingComposeView = ComposeView(this)
+        // Same lifecycle-driven disposal ComponentActivity.setContent(...)
+        // would normally set up automatically - required here since this
+        // ComposeView is being created and attached manually instead.
+        gatingComposeView.setViewCompositionStrategy(
+            ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+        )
+        gatingComposeView.setContent {
             val app = application as TerminatorApp
             val repo = app.settingsRepository
 
@@ -242,6 +276,12 @@ class MainActivity : ComponentActivity() {
             // doc). The persistent RunnerToolbar bar above the terminal
             // that this setting used to also gate has been removed.
             val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
+            // Settings > Display > "Split screen visibility" - gates whether
+            // a dedicated split-screen button/option is offered anywhere
+            // (SessionDrawer's per-row split icon, the selection bar's More
+            // popup). Doesn't affect an already-open split - see
+            // SettingsKeys.SPLIT_SCREEN_VISIBLE's doc.
+            val splitScreenVisible by repo.flow(SettingsKeys.SPLIT_SCREEN_VISIBLE, true).collectAsState(initial = true)
             // Settings > Display > "Broadcast to all panes" - see
             // MainViewModel.sendPaneInput's doc. Only consulted while
             // multi-pane mode is on (state.panes non-empty); has no effect
@@ -425,6 +465,21 @@ class MainActivity : ComponentActivity() {
                 // literally.
                 var ctrlActive by remember { mutableStateOf(false) }
                 var altActive by remember { mutableStateOf(false) }
+
+                // Which pane VirtualKeyBar's key presses / keymaps / long-text
+                // page should actually send to. Previously the bar was wired
+                // unconditionally to viewModel.sendInput (the primary pane's
+                // session), so tapping into the split partner and using the
+                // key bar (CTRL/ALT/arrows/keymaps) silently kept typing into
+                // the primary pane instead - the split pane's own touch/mouse
+                // gesture handling worked (SplitTerminalPane has its own
+                // pointerInput loop), but the shared key bar never followed
+                // focus onto it. Defaults to false (primary) and flips to
+                // true only while the split pane reports itself focused (see
+                // SplitTerminalPane's isFocused, wired below) - tapping back
+                // into the primary pane's own hidden input field flips it
+                // back via the existing hiddenFieldFocused callback.
+                var splitPaneFocused by remember { mutableStateOf(false) }
 
                 // Bell was previously visual-only (bellFlash was set but
                 // never read anywhere) - this actually plays the configured
@@ -659,8 +714,54 @@ class MainActivity : ComponentActivity() {
                             // session's screen can never linger.
                             val selectionState = rememberSelectionState()
                             LaunchedEffect(activeSessionId) { selectionState.clear() }
+                            // Clears any active selection the instant state.scrollOffset
+                            // changes (dragging into scrollback, or back toward the live
+                            // screen) - see TerminalView's row loop doc: each row is a
+                            // fixed Composable slot that gets DIFFERENT text handed to it
+                            // as scrollOffset changes, which SelectionContainer has no
+                            // reliable way to track (native selection is only well-defined
+                            // when the text under a given node stays the same - see
+                            // Compose's own "undefined behavior" warning on lazy layouts
+                            // for the same underlying reason, just triggered here without
+                            // a lazy layout at all). Previously the highlight would freeze
+                            // on whatever was selected before the scroll, but silently stop
+                            // tracking real text underneath it and the Copy/Paste toolbar
+                            // would go stale or never reappear - explicitly clearing here
+                            // makes the cutoff clean and immediate instead of leaving a
+                            // highlight on screen that no longer corresponds to anything
+                            // selectable. Keyed on the value itself (not Unit/a boolean) so
+                            // every distinct offset - including scrolling back to exactly
+                            // where a selection started - reruns this.
+                            // isEdgeAutoScroll guard: edge-auto-scroll-while-selecting
+                            // (the pointerInput block below, PointerEventPass.Initial)
+                            // calls adjustScrollOffset() specifically so the user can
+                            // extend a selection into scrollback by dragging a handle
+                            // to the top/bottom edge. Clearing the selection on every
+                            // scrollOffset change unconditionally - as this used to do -
+                            // deleted the selection on the very first auto-scroll tick,
+                            // defeating the feature it was meant to support (see
+                            // MainViewModel.lastScrollWasEdgeAutoScroll's doc). Free
+                            // drag-to-pan / pinch-zoom still clear as before: those
+                            // aren't driven by an active selection, so there's nothing
+                            // worth preserving and the row-slot-reuse problem this
+                            // effect exists for (see below) still applies.
+                            LaunchedEffect(state.scrollOffset) {
+                                if (!viewModel.lastScrollWasEdgeAutoScroll) {
+                                    selectionState.clear()
+                                }
+                            }
                             val clipboardManager = LocalClipboardManager.current
-                            val textToolbar = LocalTextToolbar.current
+                            // Copy/Paste/More bar - a plain Compose popup
+                            // (SelectionActionBar), not a native android.view.ActionMode or a
+                            // TextToolbar override, since this app's Compose Foundation
+                            // version doesn't reliably route SelectionContainer's own menu
+                            // through either of those - see SelectionOverrideToolbar.kt's doc
+                            // for the full story. actionModeController.show()/hide() are
+                            // called from the selectedTexts LaunchedEffect further down;
+                            // moreVisible is flipped on by SelectionActionBar's own "More"
+                            // button click, via the onMore lambda passed to show().
+                            val actionModeController = rememberActionModeController()
+                            var moreVisible by remember(activeSessionId) { mutableStateOf(false) }
                             // Snapshot of keyboardOpen taken the instant a selection starts -
                             // see the doc further down (onCopy) for why the toolbar's Copy/
                             // Paste/Cancel callbacks read this instead of live keyboardOpen.
@@ -728,6 +829,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 metricsPaint.measureText("M") to metricsPaint.fontSpacing
                             }
+                            val latestCharMetrics = rememberUpdatedState(charMetrics)
 
                             // Recomputes cols/rows from the current pixel size and char metrics,
                             // then pushes them to the pty (SIGWINCH). Normally cols stays pinned
@@ -789,6 +891,14 @@ class MainActivity : ComponentActivity() {
                               // stays completely untouched and byte-for-byte identical to before
                               // whenever panes is empty (the common case).
                               if (state.panes.isNotEmpty()) {
+                                // Multi-pane mode wraps MultiPaneContainer + VirtualKeyBar in
+                                // its own Column so the bar is always visible here, independent
+                                // of the else-branch bar below (which is split/single-pane only).
+                                // Previously the bar lived entirely inside the else branch and
+                                // was never rendered when panes.isNotEmpty() — the bar simply
+                                // didn't exist in multi-pane mode. Routes key presses to the
+                                // focused pane via viewModel.sendPaneInput (same path as typing).
+                                Column(modifier = Modifier.weight(1f).fillMaxWidth()) {
                                 MultiPaneContainer(
                                     panes = state.panes,
                                     mode = state.paneMode,
@@ -836,8 +946,73 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     onExitMultiPane = { viewModel.exitMultiPaneMode() },
+                                    onWantsMouseEvents = { runtimeId -> viewModel.sessionWantsMouseEvents(runtimeId) },
+                                    onMouseEvent = { runtimeId, kind, col, row -> viewModel.sendMouseEventTo(runtimeId, kind, col, row) },
+                                    onCloneSession = { runtimeId -> viewModel.duplicateSession(runtimeId) },
+                                    onToggleWakeUp = { runtimeId -> viewModel.toggleWakeUp(runtimeId) },
+                                    wakeUpActiveFor = { runtimeId ->
+                                        state.runningSessions.firstOrNull { it.runtimeId == runtimeId }?.wakeUp == true
+                                    },
+                                    onSaveSession = { runtimeId ->
+                                        pendingSaveRuntimeId = runtimeId
+                                        terminalExportLauncher.launch("terminator-session.txt")
+                                    },
                                     modifier = Modifier.weight(1f)
                                 )
+                                // VirtualKeyBar for multi-pane mode. Shows whenever any pane is
+                                // focused (focusedPaneRuntimeId != null) or the IME is visible,
+                                // same reasoning as splitPaneFocused in the else branch below.
+                                // Routes to the focused pane via sendPaneInput — no CTRL/ALT
+                                // state here, key presses go straight as sequences.
+                                if (virtualKeysEnabled && (!softKeyboardEnabled || keyboardOpen || state.focusedPaneRuntimeId != null)) {
+                                    VirtualKeyBar(
+                                        ctrlActive = ctrlActive,
+                                        altActive = altActive,
+                                        keymaps = keymaps,
+                                        onKeymapTriggered = { entry ->
+                                            var pendingCtrl = false
+                                            var pendingAlt = false
+                                            val sequence = StringBuilder()
+                                            entry.keys.forEach { keyName ->
+                                                val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
+                                                when (vk) {
+                                                    VirtualKey.CTRL -> pendingCtrl = true
+                                                    VirtualKey.ALT -> pendingAlt = true
+                                                    null -> {}
+                                                    else -> {
+                                                        var seq = vk.sendSequence
+                                                        if (pendingCtrl) { seq = seq.map(::applyCtrl).joinToString(""); pendingCtrl = false }
+                                                        if (pendingAlt) { seq = "\u001B$seq"; pendingAlt = false }
+                                                        sequence.append(seq)
+                                                    }
+                                                }
+                                            }
+                                            if (sequence.isNotEmpty()) viewModel.sendPaneInput(sequence.toString(), broadcastAllPanes)
+                                        },
+                                        onTextSubmitted = { text -> viewModel.sendPaneInput(text, broadcastAllPanes) },
+                                        onTextFieldFocusChanged = { focused -> textPageFieldFocused = focused },
+                                        onTextEntryClosed = {
+                                            if (settledKeyboardOpen) {
+                                                currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
+                                                lastKeyboardIntentOpen = true
+                                            }
+                                        },
+                                        onKeyPressed = { key ->
+                                            when (key) {
+                                                VirtualKey.CTRL -> ctrlActive = !ctrlActive
+                                                VirtualKey.ALT -> altActive = !altActive
+                                                else -> if (key.sendSequence.isNotEmpty()) {
+                                                    var seq = key.sendSequence
+                                                    if (ctrlActive) { seq = seq.map(::applyCtrl).joinToString(""); ctrlActive = false }
+                                                    if (altActive) { seq = "\u001B$seq"; altActive = false }
+                                                    viewModel.sendPaneInput(seq, broadcastAllPanes)
+                                                }
+                                            }
+                                        },
+                                        onMenuClicked = { viewModel.setDrawerOpen(true) }
+                                    )
+                                }
+                                } // end multi-pane Column
                               } else {
                                 // Split-screen (see MainUiState.splitRuntimeId's doc). When
                                 // splitRuntimeId is null this block is a complete no-op - the
@@ -877,6 +1052,55 @@ class MainActivity : ComponentActivity() {
                                             resizeDebounceJob = coroutineScope.launch {
                                                 delay(120)
                                                 applyResize()
+                                            }
+                                        }
+                                        // Edge-scroll while selecting: when the user drags a
+                                        // selection handle to the top or bottom 15% of the
+                                        // terminal area, automatically scroll the scrollback
+                                        // so they can extend the selection into history.
+                                        // Uses PointerEventPass.Initial so we read the pointer
+                                        // position BEFORE SelectionContainer gets the event and
+                                        // consumes it — without Initial pass the handle drag
+                                        // events are invisible to this block entirely.
+                                        // Never consumes anything itself: it only observes
+                                        // position and drives adjustScrollOffset as a side
+                                        // effect, leaving SelectionContainer fully in charge
+                                        // of the actual drag/handle/highlight mechanics.
+                                        .pointerInput(activeSessionId) {
+                                            val edgeFraction = 0.15f
+                                            // Scroll speed: lines per frame at full edge
+                                            val maxLinesPerFrame = 1.5f
+                                            awaitPointerEventScope {
+                                                while (true) {
+                                                    // Observe every pointer event at Initial pass
+                                                    // (before children consume) without consuming.
+                                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                    // Only act when a selection is active and the
+                                                    // session is not in alternate screen (where
+                                                    // scrollback doesn't apply).
+                                                    if (selectionState.selectedTexts.isEmpty()) continue
+                                                    if (viewModel.activeSessionInAlternateScreen()) continue
+                                                    val pointer = event.changes.firstOrNull() ?: continue
+                                                    if (!pointer.pressed) continue
+                                                    val h = size.height.toFloat()
+                                                    if (h <= 0f) continue
+                                                    val y = pointer.position.y
+                                                    val edgePx = h * edgeFraction
+                                                    val (_, charHeight) = latestCharMetrics.value
+                                                    if (charHeight <= 0f) continue
+                                                    when {
+                                                        // Top edge — scroll up into scrollback
+                                                        y < edgePx -> {
+                                                            val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
+                                                            viewModel.adjustScrollOffset(strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                        }
+                                                        // Bottom edge — scroll back toward live output
+                                                        y > h - edgePx -> {
+                                                            val strength = ((y - (h - edgePx)) / edgePx).coerceIn(0f, 1f)
+                                                            viewModel.adjustScrollOffset(-strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
@@ -1034,17 +1258,37 @@ class MainActivity : ComponentActivity() {
                                                     }
 
                                                     if (pointerCount >= 2 && zoomEnabled) {
-                                                        // Pinch: two (or more) fingers down -
-                                                        // compute zoom from the ratio of current
-                                                        // to previous distance between the first
-                                                        // two pointers. Gated on Settings >
-                                                        // Appearance > "Pinch to zoom" - when off,
-                                                        // this whole branch is skipped so a second
-                                                        // finger touching down doesn't resize text,
-                                                        // it just falls through untouched.
+                                                        // Two fingers: when a selection is active,
+                                                        // treat as a scroll so the user can extend
+                                                        // a selection into scrollback — place one
+                                                        // finger on the selection handle to hold it
+                                                        // and use a second finger to scroll up/down
+                                                        // into history, then drag the handle further.
+                                                        // When no selection is active, this is the
+                                                        // usual pinch-to-zoom. Gated on zoomEnabled
+                                                        // (Settings > Appearance > Pinch to zoom) —
+                                                        // when off the branch is skipped entirely so
+                                                        // two fingers don't resize text; the
+                                                        // selection-scroll sub-branch is unaffected
+                                                        // because it doesn't resize anything.
+                                                        val selectionActive = selectionState.selectedTexts.isNotEmpty()
                                                         val p1 = changes.getOrNull(0)
                                                         val p2 = changes.getOrNull(1)
-                                                        if (p1 != null && p2 != null) {
+                                                        if (selectionActive && p1 != null && p2 != null) {
+                                                            // Average vertical delta of both fingers
+                                                            // → scroll scrollback, same unit as the
+                                                            // single-finger scroll path above.
+                                                            if (!viewModel.activeSessionInAlternateScreen()) {
+                                                                val (_, charHeight) = charMetrics
+                                                                if (charHeight > 0f) {
+                                                                    val avgDy = ((p1.position.y - p1.previousPosition.y) +
+                                                                        (p2.position.y - p2.previousPosition.y)) / 2f
+                                                                    if (kotlin.math.abs(avgDy) > 0f) {
+                                                                        viewModel.adjustScrollOffset(avgDy / charHeight)
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else if (!selectionActive && p1 != null && p2 != null) {
                                                             val prevDist = (p1.previousPosition - p2.previousPosition).getDistance()
                                                             val curDist = (p1.position - p2.position).getDistance()
                                                             if (prevDist > 0f) {
@@ -1235,6 +1479,13 @@ class MainActivity : ComponentActivity() {
                                     }
 
                                     if (buffer != null) {
+                                        // TerminalView provides its own LocalTextToolbar
+                                        // override internally (NoOpTextToolbar, wrapping its
+                                        // SelectionContainer directly) - wrapping it again out
+                                        // here would just be a second, outer CompositionLocalProvider
+                                        // that TerminalView's own inner one immediately
+                                        // overrides anyway, so it's not done here to avoid two
+                                        // toolbar instances existing for the same subtree.
                                         TerminalView(
                                             buffer = buffer,
                                             palette = terminalPalette,
@@ -1259,30 +1510,40 @@ class MainActivity : ComponentActivity() {
                                             .background(Color.Black.copy(alpha = 0.12f))
                                     )
 
-                                    // Android's own native floating toolbar (the same system
-                                    // bubble every app - Chrome, Termux, etc. - uses), not the
-                                    // app's custom-styled SelectionToolbar composable anymore.
-                                    // SelectionContainer already pops its own copy of this
-                                    // automatically the moment a selection exists, but only with
-                                    // Copy/Select All - there's no "editable target" for it to
-                                    // infer a Paste action from. Calling showMenu() ourselves
-                                    // here (after SelectionContainer's own call, since this
-                                    // LaunchedEffect fires on the same selectedTexts change)
-                                    // replaces that with an equivalent native bubble that also
-                                    // offers Paste. rect is an approximation - SelectionState
-                                    // doesn't expose per-row pixel bounds (see the toolbar-
-                                    // positioning comment this replaced), so this just anchors
-                                    // near the top of the terminal's own area rather than
-                                    // tracking exactly where the selection sits.
-                                    LaunchedEffect(selectionState.selectedTexts.isNotEmpty()) {
+                                    // Native Copy/Paste/More bar (ActionModeController, see
+                                    // SelectionOverrideToolbar.kt) - fires the instant
+                                    // selectedTexts goes non-empty. No rect/anchor math needed
+                                    // here anymore: an android.view.ActionMode with
+                                    // TYPE_FLOATING positions itself against the real selection
+                                    // the same way the platform's own default bubble always did
+                                    // - that's the actual fix for the toolbar "jumping too high"
+                                    // (a Compose-side Rect approximation is no longer in the
+                                    // picture at all) and for it feeling delayed (no more
+                                    // waiting on a LocalTextToolbar round-trip that wasn't being
+                                    // honored).
+                                    // Keyed on the full selectedTexts list (not just
+                                    // isNotEmpty()) - see SplitTerminalPane's identical
+                                    // LaunchedEffect for why: isNotEmpty() is a Boolean, so
+                                    // it only re-fires on a false<->true edge. Scrolling far
+                                    // in either direction while a selection is active feeds
+                                    // TerminalView's per-row BasicText composables new text
+                                    // at the same slot (see TerminalView's row loop), which
+                                    // can re-anchor or briefly empty selectedTexts and
+                                    // repopulate it within the same recomposition - isNotEmpty()
+                                    // never actually toggled, so this effect never re-ran and
+                                    // the toolbar was left stale (or never shown at all) even
+                                    // though the mavi highlight itself was still visible.
+                                    LaunchedEffect(selectionState.selectedTexts.toList()) {
+                                        android.util.Log.d(
+                                            "ToolbarDebug",
+                                            "primary LaunchedEffect fired, isEmpty=${selectionState.selectedTexts.isEmpty()} splitRuntimeId=${state.splitRuntimeId} count=${selectionState.selectedTexts.size}"
+                                        )
                                         if (selectionState.selectedTexts.isEmpty()) {
-                                            textToolbar.hide()
+                                            actionModeController.hide()
                                             return@LaunchedEffect
                                         }
-                                        val boxWidthPx = latestTerminalSize?.width?.toFloat() ?: 0f
-                                        textToolbar.showMenu(
-                                            rect = Rect(0f, 0f, boxWidthPx, 1f),
-                                            onCopyRequested = {
+                                        actionModeController.show(
+                                            onCopy = {
                                                 Log.d("KbDebug", "onCopy fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 // selectedTexts is one AnnotatedString per Text
                                                 // composable the selection spans (i.e. one per
@@ -1297,7 +1558,7 @@ class MainActivity : ComponentActivity() {
                                                     clipboardManager.setText(AnnotatedString(text))
                                                 }
                                                 selectionState.clear()
-                                                textToolbar.hide()
+                                                actionModeController.hide()
                                                 // Tapping a toolbar button steals focus away from
                                                 // the hidden input field, which drops
                                                 // hiddenFieldFocused (and therefore keyboardOpen)
@@ -1376,7 +1637,7 @@ class MainActivity : ComponentActivity() {
                                                     lastKeyboardIntentOpen = false
                                                 }
                                             },
-                                            onPasteRequested = {
+                                            onPaste = {
                                                 Log.d("KbDebug", "onPaste fired: keyboardOpen=$keyboardOpen keyboardWasOpenBeforeSelection=$keyboardWasOpenBeforeSelection")
                                                 clipboardManager.getText()?.text?.let { pasted ->
                                                     if (pasted.isNotEmpty()) {
@@ -1399,12 +1660,12 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                                 selectionState.clear()
-                                                textToolbar.hide()
-                                                // See onCopyRequested's comment above for why this
-                                                // reads keyboardWasOpenBeforeSelection rather than
-                                                // the live keyboardOpen, and defers show() to the
-                                                // next frame rather than calling it synchronously
-                                                // right after requestFocus().
+                                                actionModeController.hide()
+                                                // See onCopy's comment above for why this reads
+                                                // keyboardWasOpenBeforeSelection rather than the
+                                                // live keyboardOpen, and defers show() to the next
+                                                // frame rather than calling it synchronously right
+                                                // after requestFocus().
                                                 if (keyboardWasOpenBeforeSelection) {
                                                     focusRequester.requestFocus()
                                                     currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
@@ -1414,9 +1675,27 @@ class MainActivity : ComponentActivity() {
                                                     insetsController.hide(WindowInsetsCompat.Type.ime())
                                                     lastKeyboardIntentOpen = false
                                                 }
+                                            },
+                                            onMore = if (activeSessionId != null) {
+                                                {
+                                                    // Opens MoreActionsPopup (rendered further
+                                                    // down). This deliberately does NOT call
+                                                    // actionModeController.hide() here, so the
+                                                    // selection + SelectionActionBar both stay
+                                                    // alive underneath the popup.
+                                                    moreVisible = true
+                                                }
+                                            } else {
+                                                null
                                             }
                                         )
                                     }
+
+                                    // The Copy/Paste/More bar itself - see
+                                    // SelectionOverrideToolbar.kt's top doc for why this is a
+                                    // Compose popup driven off actionModeController's state
+                                    // rather than a native ActionMode/TextToolbar bubble.
+                                    SelectionActionBar(actionModeController)
 
                                     // Invisible field that actually captures IME input and
                                     // forwards it to the active session, one keystroke at a time.
@@ -1596,6 +1875,11 @@ class MainActivity : ComponentActivity() {
                                             .focusRequester(focusRequester)
                                             .onFocusChanged {
                                                 hiddenFieldFocused = it.isFocused
+                                                // Primary pane's own hidden input field just
+                                                // claimed focus (tap back into the primary
+                                                // terminal) - hand VirtualKeyBar's routing back
+                                                // to it. See splitPaneFocused's doc above.
+                                                if (it.isFocused) splitPaneFocused = false
                                                 Log.d("KbDebug", "hiddenField onFocusChanged: isFocused=${it.isFocused}")
                                                 // Collapsing back to the bare placeholder on focus
                                                 // regain (rather than after every keystroke) is a
@@ -1611,6 +1895,69 @@ class MainActivity : ComponentActivity() {
                                                     )
                                                 }
                                             }
+                                    )
+                                }
+
+                                // Popup opened by the native ActionMode's "More..." item
+                                // (moreVisible flips true from onMore in the LaunchedEffect
+                                // above) - clone, wake-up lock, split screen (open/close with
+                                // the active session as the primary side), and Save (identical
+                                // to SessionDrawer's per-row Save icon).
+                                activeSessionId?.let { runtimeId ->
+                                    MoreActionsPopup(
+                                        visible = moreVisible,
+                                        actions = MoreMenuActions(
+                                            onCloneSession = { viewModel.duplicateSession(runtimeId) },
+                                            onToggleWakeUp = { viewModel.toggleWakeUp(runtimeId) },
+                                            wakeUpActive = state.runningSessions
+                                                .firstOrNull { it.runtimeId == runtimeId }?.wakeUp == true,
+                                            onToggleSplitScreen = if (splitScreenVisible) {
+                                                {
+                                                    if (state.splitRuntimeId != null) {
+                                                        // Split is already open - this closes it,
+                                                        // same as before.
+                                                        viewModel.setSplitSession(null)
+                                                    } else {
+                                                        // Split is currently OFF and we're turning
+                                                        // it on. setSplitSession refuses to split a
+                                                        // session against itself (see its own doc),
+                                                        // so passing `runtimeId` (== activeSessionId)
+                                                        // here was always a silent no-op - this is
+                                                        // the actual bug: the "+"/split toggle in
+                                                        // the More menu never opened a split when
+                                                        // split screen wasn't already on, because it
+                                                        // never had a second, DIFFERENT session to
+                                                        // pass. Now it picks the most relevant other
+                                                        // running session as the partner (falling
+                                                        // back to cloning the active session itself
+                                                        // if nothing else is running yet) - same
+                                                        // "always do something useful" contract the
+                                                        // titlebar "+" already has via
+                                                        // duplicateActiveSession's fallback.
+                                                        val otherRunning = state.runningSessions
+                                                            .filterNot { it.runtimeId == runtimeId }
+                                                            .lastOrNull()
+                                                        if (otherRunning != null) {
+                                                            viewModel.setSplitSession(otherRunning.runtimeId)
+                                                        } else {
+                                                            viewModel.duplicateActiveSessionIntoSplit()
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                null
+                                            },
+                                            splitScreenActive = state.splitRuntimeId != null,
+                                            onSave = {
+                                                pendingSaveRuntimeId = runtimeId
+                                                terminalExportLauncher.launch("terminator-session.txt")
+                                            }
+                                        ),
+                                        onDismiss = {
+                                            moreVisible = false
+                                            selectionState.clear()
+                                            actionModeController.hide()
+                                        }
                                     )
                                 }
 
@@ -1648,7 +1995,41 @@ class MainActivity : ComponentActivity() {
                                         broadcastInput = state.broadcastInput,
                                         onToggleBroadcast = { viewModel.setBroadcastInput(!state.broadcastInput) },
                                         onInput = { text -> viewModel.sendInputTo(splitRuntimeId, text) },
-                                        onClose = { viewModel.setSplitSession(null) }
+                                        onClose = { viewModel.setSplitSession(null) },
+                                        onFocusChanged = { focused -> splitPaneFocused = focused },
+                                        wantsMouseEvents = { viewModel.sessionWantsMouseEvents(splitRuntimeId) },
+                                        onMouseEvent = { kind, col, row ->
+                                            viewModel.sendMouseEventTo(splitRuntimeId, kind, col, row)
+                                        },
+                                        scrollOffset = state.splitScrollOffset,
+                                        onScroll = { deltaLines -> viewModel.adjustSplitScrollOffset(deltaLines) },
+                                        onEdgeAutoScroll = { deltaLines ->
+                                            viewModel.adjustSplitScrollOffset(deltaLines, isEdgeAutoScroll = true)
+                                        },
+                                        wasLastScrollEdgeAutoScroll = { viewModel.lastSplitScrollWasEdgeAutoScroll },
+                                        // Supply More actions for the split pane's own
+                                        // selection toolbar — clone/wake-lock/save all
+                                        // target the split session. Split-screen toggle
+                                        // closes the split (already active by definition
+                                        // here). Null hides the More button entirely when
+                                        // splitScreenVisible is off (same hidden-not-
+                                        // disabled treatment as the primary pane's More).
+                                        moreMenuActions = MoreMenuActions(
+                                            onCloneSession = { viewModel.duplicateSession(splitRuntimeId) },
+                                            onToggleWakeUp = { viewModel.toggleWakeUp(splitRuntimeId) },
+                                            wakeUpActive = state.runningSessions
+                                                .firstOrNull { it.runtimeId == splitRuntimeId }?.wakeUp == true,
+                                            onToggleSplitScreen = if (splitScreenVisible) {
+                                                { viewModel.setSplitSession(null) }
+                                            } else {
+                                                null
+                                            },
+                                            splitScreenActive = true,
+                                            onSave = {
+                                                pendingSaveRuntimeId = splitRuntimeId
+                                                terminalExportLauncher.launch("terminator-session.txt")
+                                            }
+                                        )
                                     )
                                 }
 
@@ -1662,7 +2043,26 @@ class MainActivity : ComponentActivity() {
                                 // toggle. When the soft keyboard is disabled entirely, the bar
                                 // just follows the settings toggle as before.
                 androidx.compose.animation.AnimatedVisibility(
-                                    visible = virtualKeysEnabled && (!softKeyboardEnabled || keyboardOpen),
+                                    // While the split pane is focused, show the bar
+                                    // unconditionally rather than gating on keyboardOpen.
+                                    // keyboardOpen tracks WindowInsets.ime, which is a
+                                    // real system report - but it's driven by whichever
+                                    // field actually holds IME focus at the OS level, and
+                                    // the split pane's own HiddenPaneInputField (a second,
+                                    // independent focus target - see MultiPaneContainer's
+                                    // doc) requesting the IME while the primary pane's
+                                    // hidden field is mid-transition (or vice versa) is
+                                    // exactly the kind of focus race that doc already
+                                    // warns can silently lose. Concretely: the bar
+                                    // (self-vanishing right as the split pane opens, or
+                                    // never appearing when tapping into it) was keyboardOpen
+                                    // reading stale/false because the split pane's IME
+                                    // show request lost that race, not because the bar's
+                                    // own visibility logic was wrong for the primary pane.
+                                    // Once splitPaneFocused is true the user is actively in
+                                    // the split pane and needs the key bar regardless of
+                                    // whatever keyboardOpen currently reads.
+                                    visible = virtualKeysEnabled && (splitPaneFocused || !softKeyboardEnabled || keyboardOpen),
                                     // Was 220ms, which read as sluggish given how often this
                                     // bar toggles with the keyboard. 120ms + a snappier
                                     // easing keeps it visible but makes it feel immediate.
@@ -1715,10 +2115,26 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             }
                                             if (sequence.isNotEmpty()) {
-                                                viewModel.sendInput(sequence.toString())
+                                                // Route to whichever pane last reported focus -
+                                                // see splitPaneFocused's doc above. Without this,
+                                                // a keymap tapped while the split pane is focused
+                                                // silently landed in the primary session instead.
+                                                val targetSplitId = splitRuntimeId
+                                                if (splitPaneFocused && targetSplitId != null) {
+                                                    viewModel.sendInputTo(targetSplitId, sequence.toString())
+                                                } else {
+                                                    viewModel.sendInput(sequence.toString())
+                                                }
                                             }
                                         },
-                                        onTextSubmitted = { text -> viewModel.sendInput(text) },
+                                        onTextSubmitted = { text ->
+                                            val targetSplitId = splitRuntimeId
+                                            if (splitPaneFocused && targetSplitId != null) {
+                                                viewModel.sendInputTo(targetSplitId, text)
+                                            } else {
+                                                viewModel.sendInput(text)
+                                            }
+                                        },
                                         onTextFieldFocusChanged = { focused -> textPageFieldFocused = focused },
                                         // See VirtualKeyBar's onTextEntryClosed doc for why this is
                                         // needed - without it, swiping back to the key-rows page
@@ -1768,11 +2184,24 @@ class MainActivity : ComponentActivity() {
                                                         seq = "\u001B$seq"
                                                         altActive = false
                                                     }
+                                                    // Route to whichever pane last reported focus -
+                                                    // see splitPaneFocused's doc above. Previously
+                                                    // every key-bar press (arrows, CTRL/ALT combos,
+                                                    // ESC, etc.) went to the primary session even
+                                                    // while the split pane was the one focused/typed
+                                                    // into, so the key bar effectively didn't work
+                                                    // for the split pane at all.
+                                                    val targetSplitId = splitRuntimeId
                                                     // Same foreground-aware Ctrl+D rule as the real
                                                     // keyboard path, in case a future key row maps to
-                                                    // it too.
-                                                    if (seq == "\u0004") {
+                                                    // it too. Only applies to the primary session -
+                                                    // the split pane has no equivalent "kill hard"
+                                                    // entry point today, so Ctrl+D there just sends
+                                                    // the literal byte like any other key.
+                                                    if (seq == "\u0004" && !(splitPaneFocused && targetSplitId != null)) {
                                                         viewModel.killActiveSessionHard()
+                                                    } else if (splitPaneFocused && targetSplitId != null) {
+                                                        viewModel.sendInputTo(targetSplitId, seq)
                                                     } else {
                                                         viewModel.sendInput(seq)
                                                     }
@@ -1833,6 +2262,11 @@ class MainActivity : ComponentActivity() {
                                     terminalExportLauncher.launch("terminal-output.txt")
                                 },
                                 showRunnerSaveButtons = showRunnerToolbarSave,
+                                // Settings > Display > "Split screen visibility" - see
+                                // SettingsKeys.SPLIT_SCREEN_VISIBLE's doc. Hides the
+                                // per-row split icon entirely when off, same "hidden not
+                                // disabled" treatment showRunnerSaveButtons already gets.
+                                showSplitButtons = splitScreenVisible,
                                 // Toggling a row that's already the split partner closes
                                 // the split; toggling a different row switches the split
                                 // partner directly to it (setSplitSession just overwrites
@@ -1900,6 +2334,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        setContentView(gatingComposeView)
     }
 
     // With launchMode="singleTask" (see manifest), tapping the notification
