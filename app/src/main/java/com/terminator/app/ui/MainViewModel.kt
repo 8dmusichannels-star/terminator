@@ -79,6 +79,11 @@ data class MainUiState(
     // call sites - so the user is never silently stuck looking at history
     // while missing new output with no indication why nothing's updating.
     val scrollOffset: Int = 0,
+    // Same idea as scrollOffset above, but for the split-screen secondary
+    // pane's own scrollback position (see splitRuntimeId below) - kept
+    // separate so scrolling one pane never moves the other. Reset to 0
+    // whenever the split session changes - see setSplitSession.
+    val splitScrollOffset: Int = 0,
     // Split-screen (see SplitScreenContainer). Null splitRuntimeId means
     // split is off - the terminal renders as a single pane exactly as
     // before. When set, it names a second RunningSession (distinct from
@@ -273,7 +278,20 @@ class MainViewModel(
         if (!entry.allowMultipleInstances) {
             val existing = liveSessions[entry.id]
             if (existing != null && existing.isAlive()) {
-                _uiState.value = _uiState.value.copy(activeSessionId = entry.id, drawerOpen = false, scrollOffset = 0)
+                // If the chosen session is currently the split partner,
+                // closing the split and making it the sole primary is the
+                // cleanest outcome — showing the same session in both panes
+                // would be confusing, and the user explicitly tapped it to
+                // bring it front. We still clear splitRuntimeId so the
+                // split closes gracefully.
+                val wasSplitPartner = _uiState.value.splitRuntimeId == entry.id
+                _uiState.value = _uiState.value.copy(
+                    activeSessionId = entry.id,
+                    drawerOpen = false,
+                    scrollOffset = 0,
+                    splitRuntimeId = if (wasSplitPartner) null else _uiState.value.splitRuntimeId,
+                    broadcastInput = if (wasSplitPartner) false else _uiState.value.broadcastInput
+                )
                 return
             }
             launchLiveSession(runtimeId = entry.id, entry = entry)
@@ -299,6 +317,64 @@ class MainViewModel(
             ?: _uiState.value.sessions.firstOrNull()
             ?: return
         launchLiveSession(runtimeId = newRuntimeId(activeEntry.id), entry = activeEntry)
+    }
+
+    /**
+     * Same as [duplicateActiveSession], but for the More menu's split
+     * toggle when nothing else is running to split against yet (see that
+     * call site's doc) - clones the active session and immediately opens
+     * the clone as the split partner, instead of just switching the
+     * classic view over to it. launchLiveSession already sets the new
+     * clone as activeSessionId, so the ORIGINAL session's id has to be
+     * captured before calling it, or there would be nothing left to
+     * distinguish "primary" from "split partner" (setSplitSession refuses
+     * a session paired with itself, same guard that caused the bug this
+     * exists to work around).
+     */
+    fun duplicateActiveSessionIntoSplit() {
+        val activeId = _uiState.value.activeSessionId
+        val activeEntry = activeId?.let { liveEntries[it] }
+            ?: _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+            ?: return
+        val originalActiveId = activeId
+        val newId = newRuntimeId(activeEntry.id)
+        launchLiveSession(runtimeId = newId, entry = activeEntry)
+        // launchLiveSession just made `newId` the active session - put the
+        // ORIGINAL session back as active (so it stays the primary pane,
+        // matching what the user was already looking at) and the new
+        // clone becomes the split partner alongside it.
+        if (originalActiveId != null) {
+            _uiState.value = _uiState.value.copy(activeSessionId = originalActiveId)
+            setSplitSession(newId)
+        }
+    }
+
+    /**
+     * Backs the split pane's own "Clone session" More-menu row. Unlike
+     * [duplicateSession] (which activates the clone, replacing whatever
+     * the primary pane was showing - correct for the primary pane's own
+     * More menu, wrong here), this keeps the primary pane exactly as it
+     * was and swaps a fresh clone of the SPLIT session in as the new
+     * split partner - "clone session" in split's own More menu reads as
+     * "open a new split with a copy of this session", not "replace what
+     * I'm looking at". Mirrors [duplicateActiveSessionIntoSplit]'s own
+     * restore-then-set-split pattern, just cloning the split runtimeId
+     * given here instead of the active one.
+     */
+    fun duplicateSplitSessionIntoNewSplit(splitRuntimeId: String) {
+        val entry = liveEntries[splitRuntimeId] ?: return
+        val originalActiveId = _uiState.value.activeSessionId
+        val newId = newRuntimeId(entry.id)
+        launchLiveSession(runtimeId = newId, entry = entry)
+        // Same reasoning as duplicateActiveSessionIntoSplit: launchLiveSession
+        // just made `newId` the active session, which would have silently
+        // replaced the primary pane's content. Restore the original primary
+        // and put the fresh clone in as the split partner instead.
+        if (originalActiveId != null) {
+            _uiState.value = _uiState.value.copy(activeSessionId = originalActiveId)
+        }
+        setSplitSession(newId)
     }
 
     /**
@@ -348,6 +424,27 @@ class MainViewModel(
             return
         }
         launchLiveSession(runtimeId = newRuntimeId(entry.id), entry = entry)
+    }
+
+    /**
+     * Backs MultiPaneContainer's toolbar "+" when there is no already-
+     * running session left to offer (every running session is already a
+     * pane, or nothing is running at all) - QuickAddSessionPickerDialog
+     * would otherwise pop up with an empty list and nothing to tap, same
+     * "don't show a useless empty popup" reasoning as
+     * duplicateActiveSession's own fallback for the titlebar "+". Spawns a
+     * fresh copy of the active session (or the default session if nothing
+     * is active) and adds THAT new instance straight to the pane group,
+     * skipping the picker entirely since there was nothing to pick between.
+     */
+    fun spawnAndAddPane() {
+        val activeEntry = _uiState.value.activeSessionId?.let { liveEntries[it] }
+            ?: _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+            ?: return
+        val newId = newRuntimeId(activeEntry.id)
+        launchLiveSession(runtimeId = newId, entry = activeEntry)
+        addPaneSession(newId)
     }
 
     /** Switches to an already-running instance without spawning anything new. */
@@ -626,7 +723,11 @@ class MainViewModel(
             splitRuntimeId = safeRuntimeId,
             splitRatio = if (safeRuntimeId != null && _uiState.value.splitRuntimeId == null) 0.5f else _uiState.value.splitRatio,
             splitOrientation = if (safeRuntimeId != null && _uiState.value.splitRuntimeId == null) SplitOrientation.Horizontal else _uiState.value.splitOrientation,
-            broadcastInput = if (safeRuntimeId == null) false else _uiState.value.broadcastInput
+            broadcastInput = if (safeRuntimeId == null) false else _uiState.value.broadcastInput,
+            // New (or closed) split session means its scrollback position
+            // means nothing anymore - same "never silently stuck looking
+            // at stale history" reasoning as scrollOffset's own doc.
+            splitScrollOffset = 0
         )
     }
 
@@ -892,6 +993,25 @@ class MainViewModel(
      * of the gesture, it just spreads the actual scroll-offset changes out
      * more evenly instead of only firing on the frames with big jumps.
      */
+    /** Set true for the instant of an adjustScrollOffset() call that came
+     *  from the edge-auto-scroll-while-selecting gesture (MainActivity),
+     *  false for every other caller (free drag-to-pan, pinch-zoom, etc).
+     *  MainActivity's LaunchedEffect(state.scrollOffset) reads this right
+     *  after the state update to decide whether to clear selectionState -
+     *  edge-auto-scroll exists specifically to extend a selection into
+     *  scrollback, so wiping the selection the instant it moves scrollOffset
+     *  defeated the feature entirely (every auto-scroll tick deleted the
+     *  selection it was trying to grow). Free dragging still clears the
+     *  selection as before, since in that case the row slots genuinely get
+     *  handed different text with no continuity to preserve - see that
+     *  LaunchedEffect's own doc. Plain var, not part of MainUiState: it's a
+     *  same-frame signal read once immediately after the state write, not
+     *  something that should survive recomposition or be part of equality
+     *  checks on the UI state.
+     */
+    var lastScrollWasEdgeAutoScroll: Boolean = false
+        private set
+
     /** Returns the actual whole-line change applied (post-clamp, post-
      *  accumulator) - callers that track scroll-relative row coordinates
      *  (selection start/end while edge-auto-scrolling) need this to shift
@@ -899,7 +1019,7 @@ class MainViewModel(
      *  their on-screen row numbers silently point at different content
      *  than the instant before the scroll happened. See the edge-auto-
      *  scroll call site in MainActivity for why that matters. */
-    fun adjustScrollOffset(deltaLines: Float): Int {
+    fun adjustScrollOffset(deltaLines: Float, isEdgeAutoScroll: Boolean = false): Int {
         val buffer = activeBuffer() ?: return 0
         val current = _uiState.value.scrollOffset
         val combined = deltaLines + scrollFractionCarry
@@ -907,7 +1027,38 @@ class MainViewModel(
         scrollFractionCarry = combined - wholeLines
         val next = (current + wholeLines).coerceIn(0, buffer.maxScrollOffset)
         if (next != current) {
+            lastScrollWasEdgeAutoScroll = isEdgeAutoScroll
             _uiState.value = _uiState.value.copy(scrollOffset = next)
+        }
+        return next - current
+    }
+
+    // Carries the fractional part of adjustSplitScrollOffset's deltaLines
+    // across calls - same reasoning as scrollFractionCarry above, just a
+    // separate accumulator so a slow drag in one pane doesn't borrow
+    // leftover fraction from a slow drag that happened in the other.
+    private var splitScrollFractionCarry: Float = 0f
+
+    /** Same reasoning as [lastScrollWasEdgeAutoScroll], for the split
+     *  pane's own selection/scroll pair instead of the primary pane's. */
+    var lastSplitScrollWasEdgeAutoScroll: Boolean = false
+        private set
+
+    /** Same as [adjustScrollOffset], but for the split-screen secondary
+     *  pane's own scrollback (splitScrollOffset) against its own buffer,
+     *  rather than the active session's. See SplitTerminalPane's drag
+     *  gesture for the call site. */
+    fun adjustSplitScrollOffset(deltaLines: Float, isEdgeAutoScroll: Boolean = false): Int {
+        val runtimeId = _uiState.value.splitRuntimeId ?: return 0
+        val buffer = liveSessions[runtimeId]?.buffer ?: return 0
+        val current = _uiState.value.splitScrollOffset
+        val combined = deltaLines + splitScrollFractionCarry
+        val wholeLines = combined.toInt()
+        splitScrollFractionCarry = combined - wholeLines
+        val next = (current + wholeLines).coerceIn(0, buffer.maxScrollOffset)
+        if (next != current) {
+            lastSplitScrollWasEdgeAutoScroll = isEdgeAutoScroll
+            _uiState.value = _uiState.value.copy(splitScrollOffset = next)
         }
         return next - current
     }
@@ -929,6 +1080,25 @@ class MainViewModel(
 
     fun sendMouseEvent(kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
         liveSessions[_uiState.value.activeSessionId]?.sendMouseEvent(kind, col, row, button)
+    }
+
+    /** Same as [activeSessionWantsMouseEvents], but for an arbitrary
+     *  runtimeId rather than only the active session - needed so the
+     *  split-screen secondary pane (SplitTerminalPane) can support mouse
+     *  reporting for its OWN session too, not just whichever session
+     *  happens to be primary/active. Previously only the primary pane's
+     *  gesture loop ever consulted mouse mode at all, which is why
+     *  ncurses programs (mc, vim, htop...) running in the split partner
+     *  never got working mouse support - the split pane had no way to
+     *  even ask whether its session wanted mouse events. */
+    fun sessionWantsMouseEvents(runtimeId: String): Boolean =
+        liveSessions[runtimeId]?.emulator?.mouseMode != TerminalEmulator.MouseMode.NONE
+
+    /** Same as [sendMouseEvent], but targets an arbitrary runtimeId - see
+     *  [sessionWantsMouseEvents]'s doc for why the split pane needs this
+     *  rather than always going through the active session. */
+    fun sendMouseEventTo(runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
+        liveSessions[runtimeId]?.sendMouseEvent(kind, col, row, button)
     }
 
     /**

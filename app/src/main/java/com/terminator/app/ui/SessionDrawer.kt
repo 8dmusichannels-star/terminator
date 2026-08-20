@@ -102,6 +102,13 @@ fun SessionDrawer(
     // (to open one) but none of them render as "already the partner".
     splitRuntimeId: String? = null,
     onToggleSplitSession: (String) -> Unit = {},
+    // Settings > Display > "Split screen visibility"
+    // (SettingsKeys.SPLIT_SCREEN_VISIBLE). False hides the split icon on
+    // every running-session row entirely (not shown-but-disabled), same
+    // "hidden not disabled" treatment showRunnerSaveButtons gets above.
+    // Independent of whether a split is currently open - see that
+    // setting's own doc.
+    showSplitButtons: Boolean = true,
     // Multi-pane mode: runtimeIds currently shown as panes (see
     // MainUiState.panes's doc) and the callback to add a given running
     // session to that group (or bring it to front if it's already in it) -
@@ -218,14 +225,17 @@ fun SessionDrawer(
                                 },
                                 // Split only makes sense between two DISTINCT running
                                 // sessions - hidden on the active row itself (there'd be
-                                // nothing else to show alongside it).
-                                onSplitClick = if (running.runtimeId != activeSessionId) {
+                                // nothing else to show alongside it) - and hidden
+                                // everywhere when showSplitButtons is off (Settings >
+                                // Display > "Split screen visibility").
+                                onSplitClick = if (running.runtimeId != activeSessionId && showSplitButtons) {
                                     { onToggleSplitSession(running.runtimeId) }
                                 } else {
                                     null
                                 },
                                 isPaneMember = running.runtimeId in paneRuntimeIds,
-                                onAddPaneClick = { onAddPaneSession(running.runtimeId) }
+                                onAddPaneClick = { onAddPaneSession(running.runtimeId) },
+                                showPaneButton = showSplitButtons
                             )
                         }
                         item(key = "running-divider") {
@@ -304,7 +314,13 @@ private fun RunningSessionRow(
     // "only one other session" restriction, any running session (including
     // the active one) can join the pane group.
     isPaneMember: Boolean = false,
-    onAddPaneClick: () -> Unit = {}
+    onAddPaneClick: () -> Unit = {},
+    // When false, hides the GridView (add-to-pane) icon entirely — same
+    // "hidden not disabled" treatment onSplitClick == null gives the split
+    // icon. Controlled by showSplitButtons (Settings > Display > Split
+    // screen visibility) so both split and pane icons appear/disappear
+    // together. Default true keeps existing callers unaffected.
+    showPaneButton: Boolean = true
 ) {
     Row(
         modifier = Modifier
@@ -336,10 +352,6 @@ private fun RunningSessionRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (isActive) MaterialTheme.colorScheme.primary else Color.White
             )
-            // Shown once the process is confirmed gone (natural exit,
-            // SIGTERM, or the trash-can/Ctrl+D SIGKILL below) - the row
-            // stays visible instead of vanishing, so it's clear the
-            // process is dead rather than just idle.
             if (running.exited) {
                 Text(
                     "Session exited",
@@ -348,14 +360,13 @@ private fun RunningSessionRow(
                 )
             }
         }
-        // Split-screen toggle for this specific running session - only
-        // shown for OTHER running sessions (never the currently active
-        // one, since split needs two distinct sessions). Tapping opens it
-        // as the split secondary pane; tapping again while it's already
-        // the split partner closes the split - see MainViewModel.
-        // setSplitSession's doc. Null onSplitClick (only passed for the
-        // active row) hides the button entirely rather than showing it
-        // disabled.
+
+        // Split / add-to-pane icons now show directly on the row, same as
+        // Save/Clone/Wake/Kill below - no more "···" (MoreVert/ExpandLess)
+        // toggle gating them behind an extra tap. That toggle used to hide
+        // these two behind a collapse/expand step; removed per request so
+        // nothing sits in front of the running session's own action row
+        // anymore.
         if (onSplitClick != null) {
             IconButton(onClick = onSplitClick) {
                 Icon(
@@ -365,9 +376,7 @@ private fun RunningSessionRow(
                 )
             }
         }
-        // Multi-pane mode toggle for this row - see this function's
-        // isPaneMember/onAddPaneClick doc above. Always shown (unlike the
-        // split button, no active-row restriction).
+        if (showPaneButton) {
         IconButton(onClick = onAddPaneClick) {
             Icon(
                 Icons.Filled.GridView,
@@ -375,12 +384,7 @@ private fun RunningSessionRow(
                 tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
             )
         }
-        // Exports this specific running session's terminal output (screen +
-        // scrollback) directly from the drawer row - see SessionDrawer's
-        // onSaveRunningSession doc. Placed immediately before the Clone
-        // ("+") icon per the request ("+ onune save buttonu"). Gated
-        // per-row by onSaveClick being null (icon isn't rendered at all)
-        // rather than shown-disabled, same pattern as onSplitClick above.
+        }
         if (onSaveClick != null) {
             IconButton(onClick = onSaveClick) {
                 Icon(

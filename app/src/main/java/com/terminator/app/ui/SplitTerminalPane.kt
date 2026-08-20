@@ -21,6 +21,8 @@
 package com.terminator.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
@@ -48,8 +50,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.unit.dp
 import com.terminator.emulator.TerminalBuffer
+import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 
@@ -116,7 +123,70 @@ fun SplitTerminalPane(
     broadcastInput: Boolean,
     onToggleBroadcast: () -> Unit,
     onInput: (String) -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    // Reports this pane's own isFocused (below) up to MainActivity so it
+    // can route VirtualKeyBar's key presses / keymaps / long-text page to
+    // this pane's session instead of unconditionally sending them to the
+    // primary pane - see MainActivity's splitPaneFocused doc. Fired
+    // whenever isFocused changes, both true (tapped into this pane) and
+    // false (would only happen if something else steals focus, which
+    // today only the primary pane's own hidden field does via its own
+    // callback). Defaults to a no-op so nothing else needs to change.
+    onFocusChanged: (Boolean) -> Unit = {},
+    // Mouse reporting for THIS pane's own session (mc/vim/htop's own
+    // xterm-mouse-mode programs) - see MainViewModel.sessionWantsMouseEvents/
+    // sendMouseEventTo's docs for why these need to be per-runtimeId rather
+    // than reusing the primary pane's activeSessionWantsMouseEvents/
+    // sendMouseEvent (which only ever look at the primary session). Both
+    // default to permanently-off no-ops so any other caller of this
+    // composable keeps working exactly as before without wiring anything.
+    wantsMouseEvents: () -> Boolean = { false },
+    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _ -> },
+    // How many lines back into this pane's own scrollback it's currently
+    // showing (0 = live tail) - caller-owned (MainViewModel.splitScrollOffset)
+    // same as the primary pane's own scrollOffset, just tracked separately
+    // per SplitTerminalPane's doc above. This used to be hardcoded to 0
+    // inside this composable with no way to change it, which is why the
+    // split pane could never scroll back at all - onScroll below is what
+    // now drives it.
+    scrollOffset: Int = 0,
+    // Fired with a fractional line delta (pixels / this pane's own char
+    // height, same unit MainActivity's own drag-scroll uses) whenever a
+    // one-finger vertical drag on this pane isn't mouse-reporting input -
+    // caller is expected to clamp/accumulate via
+    // MainViewModel.adjustSplitScrollOffset, same division of
+    // responsibility as onMouseEvent above.
+    onScroll: (deltaLines: Float) -> Unit = {},
+    // Edge-auto-scroll-while-selecting for this pane, same feature and same
+    // reasoning as MainActivity's primary-pane pointerInput(PointerEventPass.
+    // Initial) block: while paneSelectionState has an active selection and
+    // the finger nears the top/bottom edge of this pane, keep revealing
+    // scrollback so the selection can be extended into history. Split
+    // previously had no such mechanism at all (see this param's absence
+    // before), so a selection near the pane's edge just stopped there with
+    // no way to grow it further than what was on-screen. Separate from
+    // onScroll above (which drives *manual* one-finger drag-to-pan when no
+    // selection is active) - kept as two callbacks rather than folding
+    // auto-scroll into onScroll so the caller can flag the MainViewModel
+    // call as isEdgeAutoScroll=true and avoid wiping the very selection
+    // this is trying to extend (see MainViewModel.lastSplitScrollWasEdge-
+    // AutoScroll's doc for why that flag exists).
+    onEdgeAutoScroll: (deltaLines: Float) -> Unit = {},
+    // Read right after scrollOffset changes to decide whether this was an
+    // edge-auto-scroll tick (preserve the selection it's trying to extend)
+    // or a manual pan (clear it) - same same-frame-signal shape as
+    // MainViewModel.lastScrollWasEdgeAutoScroll on the primary pane, just
+    // threaded through as a plain lambda since this composable doesn't
+    // hold a MainViewModel reference itself.
+    wasLastScrollEdgeAutoScroll: () -> Boolean = { false },
+    // "More" popup actions for this pane's own selection toolbar (clone,
+    // wake lock, split toggle, save). Null hides the More button entirely
+    // (same treatment as the primary pane when activeSessionId is null) -
+    // caller supplies this when a split session is active. MoreActionsPopup
+    // is rendered right inside this composable so it's anchored to the
+    // pane's own Box and inherits its own Z-order, rather than floating
+    // somewhere under the primary pane's coordinate space.
+    moreMenuActions: MoreMenuActions? = null
 ) {
     // Direct-tap-to-type, no separate "Type here..." input box - tapping
     // the terminal area itself focuses it and brings up the keyboard, same
@@ -126,6 +196,22 @@ fun SplitTerminalPane(
     // into. isFocused starts true so the split partner is immediately
     // typable the moment it opens, without requiring an extra tap first.
     var isFocused by remember(runtimeId) { mutableStateOf(true) }
+    // Bumped on every real tap into this pane (see the awaitEachGesture
+    // block below), independent of isFocused's own true/false value.
+    // isFocused starts true and, once flipped away by the primary pane,
+    // never mirrors back - a `isFocused = true` write on re-tap is a
+    // same-value write React/Compose treats as a no-op for anything keyed
+    // on isFocused alone. HiddenPaneInputField's IME-show effect is keyed
+    // on this token instead of on the raw boolean, so every real tap
+    // reliably re-requests focus and re-shows the keyboard - without it,
+    // tapping back into the split pane left the virtual key bar (which
+    // gates on the real IME/WindowInsets state) never reappearing.
+    var focusToken by remember(runtimeId) { mutableStateOf(0) }
+    // Mirrors isFocused up to MainActivity on every change, including the
+    // initial true (this pane is typable immediately on open, same as
+    // isFocused's own doc above) - not just the later awaitEachGesture
+    // tap that flips it. See onFocusChanged's own doc for why this exists.
+    LaunchedEffect(isFocused) { onFocusChanged(isFocused) }
 
     Box(modifier = modifier.background(Color.Black)) {
         androidx.compose.foundation.layout.Column(modifier = Modifier.fillMaxWidth().fillMaxHeight()) {
@@ -172,6 +258,7 @@ fun SplitTerminalPane(
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                android.util.Log.d("ToolbarDebug", "SplitTerminalPane composing, buffer=${buffer != null}, runtimeId=$runtimeId")
                 if (buffer != null) {
                     // Own native selection state (see TerminalView's
                     // selectionState param doc) - independent of the
@@ -180,11 +267,282 @@ fun SplitTerminalPane(
                     // the primary pane, no separate toolbar wiring needed.
                     val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
                     LaunchedEffect(runtimeId) { paneSelectionState.clear() }
+                    // Same reasoning as MainActivity's identical effect on
+                    // state.scrollOffset - this pane's own scrollOffset
+                    // param changing means TerminalView's row Composables
+                    // just got handed different text at the same slot,
+                    // which SelectionContainer can't reliably track. Clear
+                    // immediately rather than leaving a highlight on
+                    // screen that no longer points at anything selectable.
+                    // Guarded the same way as the primary pane: skip the
+                    // clear when this scrollOffset change came from edge-
+                    // auto-scroll-while-selecting (onEdgeAutoScroll above),
+                    // since that gesture exists specifically to grow the
+                    // selection into scrollback - clearing on every tick
+                    // deleted the selection it was trying to extend.
+                    LaunchedEffect(scrollOffset) {
+                        if (!wasLastScrollEdgeAutoScroll()) {
+                            paneSelectionState.clear()
+                        }
+                    }
+                    // This pane's own native Copy/Paste bubble
+                    // (ActionModeController, same mechanism the primary
+                    // pane uses - see SelectionOverrideToolbar.kt). This
+                    // was previously completely missing here: TerminalView
+                    // already suppresses its own default-fallback bubble
+                    // via NoOpTextToolbar (so nothing shows on its own),
+                    // but with no ActionModeController ever calling
+                    // startActionMode for THIS pane's View either,
+                    // selecting text in the split pane showed no toolbar
+                    // at all here - which is what actually surfaced as
+                    // "the split pane still shows Android's own toolbar,
+                    // ours never takes over" (this pane's TerminalView
+                    // sits under the SAME Activity Window as the primary
+                    // pane, so with no override of its own the only
+                    // ActionMode left able to fire for a selection made
+                    // here was the platform's default one, not this
+                    // pane's plain fallback state). No "More" item here -
+                    // clone/wake-lock/split-toggle/save are all
+                    // primary-pane-only concepts (see MoreMenuActions),
+                    // so this pane only ever offers Copy/Paste.
+                    val actionModeController = rememberActionModeController()
+                    val clipboardManager = LocalClipboardManager.current
+                    var moreVisible by remember(runtimeId) { mutableStateOf(false) }
+                    // Keyed on the full selectedTexts list (same as TerminalView's own
+                    // internal LaunchedEffect on line 325 of TerminalView.kt) rather than
+                    // just isNotEmpty(). isNotEmpty() only triggers on false→true — if
+                    // the list clears and refills (e.g. selection drag re-anchors) the
+                    // LaunchedEffect key doesn't change and the toolbar never refreshes.
+                    LaunchedEffect(paneSelectionState.selectedTexts.toList()) {
+                        android.util.Log.d("ToolbarDebug", "split LaunchedEffect fired, isEmpty=${paneSelectionState.selectedTexts.isEmpty()} moreMenuActions=${moreMenuActions != null}")
+                        if (paneSelectionState.selectedTexts.isEmpty()) {
+                            actionModeController.hide()
+                        } else {
+                            actionModeController.show(
+                                onCopy = {
+                                    val text = paneSelectionState.selectedTexts.joinToString("\n") { it.text }
+                                    if (text.isNotEmpty()) clipboardManager.setText(AnnotatedString(text))
+                                    paneSelectionState.clear()
+                                    actionModeController.hide()
+                                },
+                                onPaste = clipboardManager.getText()?.text?.let { pasted ->
+                                    {
+                                        onInput(pasted)
+                                        paneSelectionState.clear()
+                                        actionModeController.hide()
+                                    }
+                                },
+                                onMore = moreMenuActions?.let { _ -> { moreVisible = true } }
+                            )
+                        }
+                    }
+                    // Character cell size for this pane, used only to turn
+                    // a raw touch position into a (col, row) pair for mouse
+                    // reporting below - same measuringPaint approach
+                    // TerminalView itself uses to line its own selection
+                    // overlay up with the Canvas grid.
+                    val density = LocalDensity.current
+                    val (charWidthPx, charHeightPx) = remember(fontFamily, fontSizeSp, density.density, density.fontScale) {
+                        val measuringPaint = android.graphics.Paint().apply {
+                            typeface = fontFamily
+                            textSize = fontSizeSp * density.density * density.fontScale
+                        }
+                        measuringPaint.measureText("M") to measuringPaint.fontSpacing
+                    }
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
+                            // focusToken only bumped on real taps (not long-press / drag
+                            // / mouse events). awaitFirstDown fires on every touch-down
+                            // including the very first frame of a long-press-to-select,
+                            // so bumping focusToken there triggers HiddenPaneInputField's
+                            // LaunchedEffect(activationKey) → insetsController.show(ime())
+                            // mid-selection, which resizes the layout under the active
+                            // SelectionContainer and collapses the selection before the
+                            // toolbar can appear. A separate detectTapGestures block only
+                            // fires onTap after the gesture is confirmed NOT to be a
+                            // long-press or drag, so IME re-show never races with an
+                            // ongoing selection.
+                            // Edge-scroll while selecting - same feature and mechanism
+                            // as MainActivity's primary-pane block: observe pointer
+                            // position at PointerEventPass.Initial (before
+                            // SelectionContainer or the gesture block below consume
+                            // anything) and, while paneSelectionState has an active
+                            // selection, keep revealing scrollback near the top/bottom
+                            // edge so the selection can be extended into history.
+                            // Never consumes - purely a side-effecting observer, same
+                            // as the primary pane's version.
                             .pointerInput(runtimeId) {
-                                detectTapGestures(onTap = { isFocused = true })
+                                val edgeFraction = 0.15f
+                                val maxLinesPerFrame = 1.5f
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                        if (paneSelectionState.selectedTexts.isEmpty()) continue
+                                        val pointer = event.changes.firstOrNull() ?: continue
+                                        if (!pointer.pressed) continue
+                                        val h = size.height.toFloat()
+                                        if (h <= 0f) continue
+                                        val y = pointer.position.y
+                                        val edgePx = h * edgeFraction
+                                        if (charHeightPx <= 0f) continue
+                                        when {
+                                            y < edgePx -> {
+                                                val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
+                                                onEdgeAutoScroll(strength * maxLinesPerFrame)
+                                            }
+                                            y > h - edgePx -> {
+                                                val strength = ((y - (h - edgePx)) / edgePx).coerceIn(0f, 1f)
+                                                onEdgeAutoScroll(-strength * maxLinesPerFrame)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            .pointerInput(runtimeId) {
+                                detectTapGestures(
+                                    onTap = {
+                                        isFocused = true
+                                        focusToken++
+                                        onFocusChanged(true)
+                                    }
+                                )
+                            }
+                            .pointerInput(runtimeId) {
+                                // Single gesture loop for this pane: when the
+                                // session has enabled mouse reporting (DECSET
+                                // 1000/1002/1003 - the same check the primary
+                                // pane makes via wantsMouseEvents), press/
+                                // drag/release become xterm mouse escape
+                                // sequences instead of the plain tap-to-focus
+                                // this pane previously only ever did. This is
+                                // what makes ncurses programs (mc, vim,
+                                // htop...) running in the split partner
+                                // actually receive mouse input, matching the
+                                // primary pane's own support instead of
+                                // silently doing nothing here.
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    // isFocused announced here too (without bumping focusToken)
+                                    // so mouse-reporting sessions that tap to start a drag still
+                                    // route the PRESS event to the right session. focusToken is
+                                    // intentionally NOT bumped here — see the detectTapGestures
+                                    // block above for why (long-press must not trigger IME show).
+                                    isFocused = true
+                                    val mouseWanted = wantsMouseEvents()
+                                    android.util.Log.d(
+                                        "SplitMouseDebug",
+                                        "down at=${down.position} mouseWanted=$mouseWanted charW=$charWidthPx charH=$charHeightPx runtimeId=$runtimeId"
+                                    )
+
+                                    if (!mouseWanted || charWidthPx <= 0f || charHeightPx <= 0f) {
+                                        // No mouse reporting active for this session.
+                                        // Distinguish a vertical scrollback drag from a
+                                        // long-press-to-select the same way the primary
+                                        // pane's own gesture stack does (see MainActivity) -
+                                        // and, critically, using the SAME two-phase
+                                        // approach that fix required, not the naive one
+                                        // this block used to use.
+                                        //
+                                        // This used to call awaitPointerEvent() itself in a
+                                        // tight loop for the whole long-press window,
+                                        // "just watching" without consuming. That still
+                                        // starves TerminalView's own SelectionContainer:
+                                        // its long-press-to-select detector runs as a
+                                        // coroutine on this SAME pointerInput subtree, and
+                                        // whichever coroutine calls awaitPointerEvent()
+                                        // first on a given frame "wins" that shared input
+                                        // queue - so as long as this loop kept polling
+                                        // every frame, the child's long-press timer
+                                        // effectively never got an uncontested window to
+                                        // elapse in, and selection (and therefore the
+                                        // Copy/Paste/More toolbar) never started at all.
+                                        // MainActivity hit this exact bug on the primary
+                                        // pane first (see its own gesture block's doc) -
+                                        // this pane never got the same fix.
+                                        //
+                                        // The fix: don't call awaitPointerEvent() in a
+                                        // competing loop while deciding what this gesture
+                                        // is. Wait, without reading the pointer stream
+                                        // ourselves, for up to the long-press timeout. If
+                                        // the finger hasn't moved past touch slop by then,
+                                        // this is a long-press: return immediately and let
+                                        // SelectionContainer's own detector - which has now
+                                        // had an uncontested window - claim it. Only start
+                                        // this pane's own awaitPointerEvent() loop (and
+                                        // only then start consuming) once real movement
+                                        // past slop is confirmed, i.e. once we're certain
+                                        // this is a scroll and not a selection gesture.
+                                        val slop = viewConfiguration.touchSlop
+                                        val deadline = System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                                        var scrollStartEvent: androidx.compose.ui.input.pointer.PointerInputChange? = null
+                                        while (true) {
+                                            val remainingMillis = (deadline - System.nanoTime()) / 1_000_000L
+                                            if (remainingMillis <= 0L) return@awaitEachGesture // long-press window elapsed untouched
+                                            val event = withTimeoutOrNull(remainingMillis) { awaitPointerEvent() }
+                                                ?: return@awaitEachGesture // timed out untouched
+                                            val change = event.changes.firstOrNull { it.id == down.id }
+                                                ?: event.changes.firstOrNull()
+                                                ?: return@awaitEachGesture
+                                            if (change.isConsumed) return@awaitEachGesture
+                                            if (!change.pressed) return@awaitEachGesture // lifted before slop: plain tap, not our concern
+                                            if (kotlin.math.abs(change.position.y - down.position.y) > slop) {
+                                                scrollStartEvent = change
+                                                break
+                                            }
+                                            // Still within slop - keep waiting without
+                                            // consuming, same as the primary pane's fix.
+                                        }
+                                        // Confirmed scroll: consume this and every
+                                        // subsequent event ourselves for the rest of the
+                                        // drag, driving scrollback the same as before.
+                                        var lastY = down.position.y
+                                        scrollStartEvent?.let { change ->
+                                            change.consume()
+                                            val dy = change.position.y - lastY
+                                            if (charHeightPx > 0f) onScroll(dy / charHeightPx)
+                                            lastY = change.position.y
+                                        }
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id }
+                                                ?: event.changes.firstOrNull()
+                                                ?: break
+                                            change.consume()
+                                            if (!change.pressed) break
+                                            val dy = change.position.y - lastY
+                                            if (charHeightPx > 0f) onScroll(dy / charHeightPx)
+                                            lastY = change.position.y
+                                        }
+                                        return@awaitEachGesture
+                                    }
+
+                                    down.consume()
+                                    fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
+                                        (offset.x / charWidthPx).toInt() to (offset.y / charHeightPx).toInt()
+
+                                    var (col, row) = cellOf(down.position)
+                                    android.util.Log.d("SplitMouseDebug", "PRESS col=$col row=$row")
+                                    onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
+
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull() ?: break
+                                        change.consume()
+                                        if (!change.pressed) {
+                                            val (rCol, rRow) = cellOf(change.position)
+                                            android.util.Log.d("SplitMouseDebug", "RELEASE col=$rCol row=$rRow")
+                                            onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+                                            break
+                                        }
+                                        val (dCol, dRow) = cellOf(change.position)
+                                        if (dCol != col || dRow != row) {
+                                            col = dCol; row = dRow
+                                            android.util.Log.d("SplitMouseDebug", "DRAG col=$col row=$row")
+                                            onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                        }
+                                    }
+                                }
                             }
                     ) {
                         TerminalView(
@@ -194,14 +552,34 @@ fun SplitTerminalPane(
                             fontSizeSp = fontSizeSp,
                             bufferVersion = bufferVersion,
                             backgroundAlpha = 1f,
-                            scrollOffset = 0,
+                            scrollOffset = scrollOffset,
                             selectionState = paneSelectionState,
-                            modifier = Modifier.fillMaxWidth().fillMaxHeight()
+                            modifier = Modifier.fillMaxWidth().fillMaxHeight(),
+                            debugLabel = "split"
                         )
                         HiddenPaneInputField(
                             active = isFocused,
+                            activationKey = focusToken,
                             onText = { text -> onInput(text) }
                         )
+                        // actionModeController.show()/hide() above only
+                        // ever flip isVisible - nothing was reading that
+                        // state back out to actually draw the bar in
+                        // this file, so the black Copy/Paste popup never
+                        // appeared for this pane no matter how correctly
+                        // the controller itself was being driven. Same
+                        // composable/call shape as the primary pane's
+                        // SelectionActionBar(actionModeController) call
+                        // in MainActivity, just anchored inside this
+                        // pane's own Box instead.
+                        SelectionActionBar(actionModeController)
+                        moreMenuActions?.let { actions ->
+                            MoreActionsPopup(
+                                visible = moreVisible,
+                                actions = actions,
+                                onDismiss = { moreVisible = false }
+                            )
+                        }
                     }
                 } else {
                     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {

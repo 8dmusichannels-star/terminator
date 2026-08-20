@@ -45,6 +45,7 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
     val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
     val horizontalModeEnabled by repo.flow(SettingsKeys.HORIZONTAL_MODE, true).collectAsState(initial = true)
     val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
+    val splitScreenVisible by repo.flow(SettingsKeys.SPLIT_SCREEN_VISIBLE, true).collectAsState(initial = true)
     val broadcastAllPanes by repo.flow(SettingsKeys.BROADCAST_ALL_PANES, false).collectAsState(initial = false)
 
     Scaffold(
@@ -82,6 +83,16 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
             }
             Text(
                 "Shows/hides the Save (export) icon on each running session's row in the drawer.",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            SwitchRow("Split screen visibility", splitScreenVisible) {
+                scope.launch { repo.set(SettingsKeys.SPLIT_SCREEN_VISIBLE, it) }
+            }
+            Text(
+                "Shows/hides the split-screen button. Only affects the button itself - " +
+                    "an already-open split stays open even if you turn this off.",
                 style = MaterialTheme.typography.bodySmall
             )
 

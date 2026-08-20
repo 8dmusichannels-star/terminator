@@ -113,6 +113,17 @@ object SettingsKeys {
     // regardless, unaffected by this.
     val SHOW_RUNNER_TOOLBAR_SAVE = booleanPreferencesKey("show_runner_toolbar_save")
 
+    // Display > "Split screen visibility". Purely a UI-chrome toggle -
+    // controls whether the standalone split-screen button (in the
+    // selection bar's More popup and anywhere else a dedicated split
+    // button is offered) is shown at all. Independent of whether a split
+    // is actually open right now (MainUiState.splitRuntimeId): turning
+    // this off just hides the button that would let you open/close one,
+    // it doesn't close an already-open split. Default true, same
+    // "existing installs see it exactly as before" reasoning as the
+    // runner toolbar save toggle above.
+    val SPLIT_SCREEN_VISIBLE = booleanPreferencesKey("split_screen_visible")
+
     // Display > Multi-pane > "Broadcast to all panes". Off (default):
     // typed input goes only to whichever pane is currently focused (tap a
     // pane to focus it) - see MainViewModel.sendPaneInput's doc. On: every

@@ -21,6 +21,8 @@
 package com.terminator.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -57,6 +59,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.input.ImeAction
@@ -75,6 +79,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.terminator.emulator.TerminalBuffer
+import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 import kotlin.math.roundToInt
@@ -125,6 +130,17 @@ fun MultiPaneContainer(
     onSetMode: (PaneMode) -> Unit,
     onAddPaneRequested: () -> Unit,
     onExitMultiPane: () -> Unit,
+    onWantsMouseEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    // "More" actions (clone/wake-lock/save) for each tile's own Copy/Paste
+    // selection bar - see PaneContent's identical params for the full doc.
+    // All default to null/false so every existing caller of this composable
+    // keeps getting exactly the old behavior (no More button on any tile)
+    // without needing to change anything.
+    onCloneSession: ((String) -> Unit)? = null,
+    onToggleWakeUp: ((String) -> Unit)? = null,
+    wakeUpActiveFor: (String) -> Boolean = { false },
+    onSaveSession: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxSize()) {
@@ -149,7 +165,13 @@ fun MultiPaneContainer(
                     onInput = onInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
-                    onResizeSessionPty = onResizeSessionPty
+                    onResizeSessionPty = onResizeSessionPty,
+                    onWantsMouseEvents = onWantsMouseEvents,
+                    onMouseEvent = onMouseEvent,
+                    onCloneSession = onCloneSession,
+                    onToggleWakeUp = onToggleWakeUp,
+                    wakeUpActiveFor = wakeUpActiveFor,
+                    onSaveSession = onSaveSession
                 )
                 PaneMode.Floating -> FloatingLayout(
                     panes = panes,
@@ -165,7 +187,13 @@ fun MultiPaneContainer(
                     onClosePane = onClosePane,
                     onMovePane = onMovePane,
                     onResizePane = onResizePane,
-                    onResizeSessionPty = onResizeSessionPty
+                    onResizeSessionPty = onResizeSessionPty,
+                    onWantsMouseEvents = onWantsMouseEvents,
+                    onMouseEvent = onMouseEvent,
+                    onCloneSession = onCloneSession,
+                    onToggleWakeUp = onToggleWakeUp,
+                    wakeUpActiveFor = wakeUpActiveFor,
+                    onSaveSession = onSaveSession
                 )
             }
         }
@@ -237,7 +265,16 @@ private fun TilingLayout(
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
-    onResizeSessionPty: (String, Int, Int) -> Unit
+    onResizeSessionPty: (String, Int, Int) -> Unit,
+    onWantsMouseEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    // "More" actions for each tile's own selection bar - see PaneContent's
+    // identical params for why these all default to null/false (existing
+    // callers keep the "no More button" behavior they always had).
+    onCloneSession: ((String) -> Unit)? = null,
+    onToggleWakeUp: ((String) -> Unit)? = null,
+    wakeUpActiveFor: (String) -> Boolean = { false },
+    onSaveSession: ((String) -> Unit)? = null
 ) {
     if (panes.isEmpty()) return
     // Grid shape: as close to square as possible, favoring one extra
@@ -287,6 +324,12 @@ private fun TilingLayout(
                                     onMeasuredSize = { cols, rws -> onResizeSessionPty(pane.runtimeId, cols, rws) },
                                     fontDensity = density,
                                     showDragHandle = false,
+                                    onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
+                                    onMouseEvent = { kind, col, row -> onMouseEvent(pane.runtimeId, kind, col, row) },
+                                    onCloneSession = onCloneSession?.let { { it(pane.runtimeId) } },
+                                    onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
+                                    wakeUpActive = wakeUpActiveFor(pane.runtimeId),
+                                    onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -394,7 +437,13 @@ private fun FloatingLayout(
     onClosePane: (String) -> Unit,
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
     onResizePane: (runtimeId: String, size: Size) -> Unit,
-    onResizeSessionPty: (String, Int, Int) -> Unit
+    onResizeSessionPty: (String, Int, Int) -> Unit,
+    onWantsMouseEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    onCloneSession: ((String) -> Unit)? = null,
+    onToggleWakeUp: ((String) -> Unit)? = null,
+    wakeUpActiveFor: (String) -> Boolean = { false },
+    onSaveSession: ((String) -> Unit)? = null
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val density = LocalDensity.current.density
@@ -409,6 +458,18 @@ private fun FloatingLayout(
             // than becoming a permanently off-screen, unrecoverable pane.
             val clampedX = pane.floatOffset.x.coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f)
             val clampedY = pane.floatOffset.y.coerceIn(0f, containerHeightDp - 32f)
+
+            // Fixed reference point for the CURRENT drag/resize gesture -
+            // captured once when a gesture starts (see PaneContent's
+            // cumulative-delta doc) rather than read fresh from `pane` on
+            // every frame. `pane` itself only reflects the latest
+            // committed state, which lags a frame or more behind the
+            // in-progress gesture once movePane/resizePane round-trips
+            // through the ViewModel and back - computing "start + running
+            // total" against a value captured once avoids compounding that
+            // lag into visible jitter.
+            var dragStartOffset by remember(pane.runtimeId) { androidx.compose.runtime.mutableStateOf(pane.floatOffset) }
+            var resizeStartSize by remember(pane.runtimeId) { androidx.compose.runtime.mutableStateOf(pane.floatSize) }
 
             Box(
                 modifier = Modifier
@@ -430,21 +491,33 @@ private fun FloatingLayout(
                     onMeasuredSize = { cols, rws -> onResizeSessionPty(pane.runtimeId, cols, rws) },
                     fontDensity = density,
                     showDragHandle = true,
-                    onHeaderDrag = { deltaPx ->
+                    onDragStart = {
+                        dragStartOffset = pane.floatOffset
+                        resizeStartSize = pane.floatSize
+                    },
+                    onHeaderDrag = { cumulativeDeltaPx ->
                         onFocusPane(pane.runtimeId)
                         val newOffset = Offset(
-                            (clampedX + deltaPx.x / density).coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f),
-                            (clampedY + deltaPx.y / density).coerceIn(0f, containerHeightDp - 32f)
+                            (dragStartOffset.x + cumulativeDeltaPx.x / density)
+                                .coerceIn(-pane.floatSize.width + 48f, containerWidthDp - 48f),
+                            (dragStartOffset.y + cumulativeDeltaPx.y / density)
+                                .coerceIn(0f, containerHeightDp - 32f)
                         )
                         onMovePane(pane.runtimeId, newOffset)
                     },
-                    onResizeDrag = { deltaPx ->
+                    onResizeDrag = { cumulativeDeltaPx ->
                         val newSize = Size(
-                            (pane.floatSize.width + deltaPx.x / density).coerceAtLeast(MIN_PANE_WIDTH.value),
-                            (pane.floatSize.height + deltaPx.y / density).coerceAtLeast(MIN_PANE_HEIGHT.value)
+                            (resizeStartSize.width + cumulativeDeltaPx.x / density).coerceAtLeast(MIN_PANE_WIDTH.value),
+                            (resizeStartSize.height + cumulativeDeltaPx.y / density).coerceAtLeast(MIN_PANE_HEIGHT.value)
                         )
                         onResizePane(pane.runtimeId, newSize)
                     },
+                    onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
+                    onMouseEvent = { kind, col, row -> onMouseEvent(pane.runtimeId, kind, col, row) },
+                    onCloneSession = onCloneSession?.let { { it(pane.runtimeId) } },
+                    onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
+                    wakeUpActive = wakeUpActiveFor(pane.runtimeId),
+                    onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -475,8 +548,28 @@ private fun PaneContent(
     onMeasuredSize: (columns: Int, rows: Int) -> Unit,
     fontDensity: Float,
     showDragHandle: Boolean,
+    onDragStart: () -> Unit = {},
     onHeaderDrag: (Offset) -> Unit = {},
     onResizeDrag: (Offset) -> Unit = {},
+    // Mouse reporting for this pane's own session (mc/vim/htop xterm-mouse-
+    // mode). Defaults to permanently-off/no-op so callers that don't wire
+    // mouse reporting keep working exactly as before.
+    onWantsMouseEvents: () -> Boolean = { false },
+    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _ -> },
+    // "More" actions for this pane's own Copy/Paste/More selection bar -
+    // same MoreMenuActions shape the primary pane and SplitTerminalPane
+    // use, just with onToggleSplitScreen always null (split-screen mode
+    // and multi-pane mode are separate features - see this file's own
+    // MultiPaneContainer doc - so there's no single "the split partner"
+    // concept a multi-pane tile could offer here). Null hides the More
+    // button entirely (same "hidden not disabled" treatment as elsewhere),
+    // which is what every existing caller gets by default since this
+    // param didn't exist before - no wiring needed unless a caller
+    // actually wants the button shown.
+    onCloneSession: (() -> Unit)? = null,
+    onToggleWakeUp: (() -> Unit)? = null,
+    wakeUpActive: Boolean = false,
+    onSaveSession: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     // Per-pane pinch-zoom override, local to this composable only (not
@@ -501,6 +594,15 @@ private fun PaneContent(
     // every other pane's, and of the classic single-pane view's scrollOffset.
     var scrollOffset by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
 
+    // Same focusToken pattern SplitTerminalPane uses: bumped on every real
+    // tap into this pane so HiddenPaneInputField's LaunchedEffect fires even
+    // when isFocused was already true (a same-value write is a no-op for
+    // LaunchedEffect keyed on a boolean). Without this, tapping back into a
+    // pane that was already focused left the keyboard silently closed with
+    // no field to show it for — the "keyboard bazen açılmıyor" bug in
+    // multi-pane mode.
+    var focusToken by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
+
     Column(
         modifier = modifier
             .background(if (isFocused) MaterialTheme.colorScheme.primary.copy(alpha = 0.4f) else Color.White.copy(alpha = 0.12f))
@@ -515,11 +617,33 @@ private fun PaneContent(
                 .let { base ->
                     if (showDragHandle) {
                         base.pointerInput(runtimeId) {
+                            // Accumulates the running total of the drag
+                            // gesture, reset at the start of every new drag -
+                            // NOT the single per-frame dragAmount. Compose's
+                            // pointer-input coroutine runs independently of
+                            // recomposition, so a callback fed only the raw
+                            // per-frame delta and adding it on top of a
+                            // composable-scope value (pane.floatOffset, which
+                            // only updates once recomposition catches up)
+                            // was applying that same tiny delta to a stale
+                            // base repeatedly - the visible symptom being the
+                            // pane jittering in place instead of following
+                            // the finger. Sending the cumulative total lets
+                            // the caller compute newOffset = dragStartOffset
+                            // + total once per frame, which is stable
+                            // regardless of how many recompositions land
+                            // mid-gesture.
+                            var accumulated = Offset.Zero
                             detectDragGestures(
-                                onDragStart = { onFocus() },
+                                onDragStart = {
+                                    accumulated = Offset.Zero
+                                    onDragStart()
+                                    onFocus()
+                                },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
-                                    onHeaderDrag(dragAmount)
+                                    accumulated += dragAmount
+                                    onHeaderDrag(accumulated)
                                 }
                             )
                         }
@@ -539,7 +663,7 @@ private fun PaneContent(
                     tint = Color.White.copy(alpha = 0.4f),
                     modifier = Modifier.size(14.dp)
                 )
-                Spacer(4.dp)
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.width(4.dp))
             }
             Text(
                 label,
@@ -572,16 +696,46 @@ private fun PaneContent(
                                 onMeasuredSize(cols, rws)
                             }
                         }
-                        // Single gesture loop per pane, same "one reader of
-                        // the touch stream" discipline as the primary pane -
-                        // tap focuses + types directly (no separate input
-                        // box, per the "type here kaldir" requirement), drag
-                        // pans scrollback, pinch zooms this pane's own text
-                        // size. Deliberately without the primary pane's
-                        // mouse-reporting/text-selection/edge-auto-scroll
-                        // layers - see this file's header doc.
+                        // Single gesture loop per pane. On tap: focus the pane
+                        // AND bump focusToken so HiddenPaneInputField's IME
+                        // show re-fires even when isFocused was already true —
+                        // see focusToken's doc above. Mouse reporting path
+                        // mirrors SplitTerminalPane: when the session has
+                        // enabled xterm mouse mode (DECSET 1000/1002/1003),
+                        // press/drag/release become mouse escape sequences
+                        // instead of plain tap-to-focus, so ncurses programs
+                        // (mc, vim, htop) running in a multi-pane tile
+                        // actually receive mouse input.
                         .pointerInput(runtimeId) {
-                            detectTapGestures(onTap = { onFocus() })
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                onFocus()
+                                focusToken++
+                                val mouseWanted = onWantsMouseEvents()
+                                if (!mouseWanted || charMetrics.first <= 0f || charMetrics.second <= 0f) {
+                                    return@awaitEachGesture
+                                }
+                                down.consume()
+                                fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
+                                    (offset.x / charMetrics.first).toInt() to (offset.y / charMetrics.second).toInt()
+                                var (col, row) = cellOf(down.position)
+                                onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull() ?: break
+                                    change.consume()
+                                    if (!change.pressed) {
+                                        val (rCol, rRow) = cellOf(change.position)
+                                        onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+                                        break
+                                    }
+                                    val (dCol, dRow) = cellOf(change.position)
+                                    if (dCol != col || dRow != row) {
+                                        col = dCol; row = dRow
+                                        onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                    }
+                                }
+                            }
                         }
                         .pointerInput(runtimeId) {
                             detectTransformGestures { _, pan, zoom, _ ->
@@ -604,12 +758,70 @@ private fun PaneContent(
                     // state (see TerminalView's selectionState param doc,
                     // added by the copy/paste API migration this file was
                     // written before) - long-press/drag selection and the
-                    // OS's own selection handles+toolbar work per-pane
-                    // exactly as they do on the primary pane, with no extra
-                    // wiring needed here since TerminalView owns the native
-                    // selection UI internally now.
+                    // OS's own selection handles work per-pane exactly as
+                    // they do on the primary pane, since TerminalView owns
+                    // the native selection UI internally.
+                    //
+                    // The Copy/Paste toolbar itself is a different story
+                    // from what the comment above used to claim: TerminalView
+                    // deliberately SUPPRESSES the platform's own selection
+                    // bubble (NoOpTextToolbar / NoOpTextContextMenuProvider -
+                    // see TerminalView.kt's doc) because on this Compose
+                    // Foundation version that bubble raced visibly against
+                    // this app's own bar. The primary pane and
+                    // SplitTerminalPane both replace it with their own
+                    // ActionModeController-driven SelectionActionBar; this
+                    // file never got that wiring added, which is why a
+                    // multi-pane tile could show the blue selection
+                    // highlight (SelectionContainer's own handles) but never
+                    // any Copy/Paste/More bar - nothing was left to show one
+                    // once the native fallback was suppressed.
                     val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
                     androidx.compose.runtime.LaunchedEffect(runtimeId) { paneSelectionState.clear() }
+                    val actionModeController = rememberActionModeController()
+                    val clipboardManager = LocalClipboardManager.current
+                    var moreVisible by remember(runtimeId) { androidx.compose.runtime.mutableStateOf(false) }
+                    // Keyed on the full selectedTexts list, not isNotEmpty() -
+                    // same reasoning as the primary pane / SplitTerminalPane's
+                    // identical effect: isNotEmpty() is a Boolean and only
+                    // re-fires on a false<->true edge, so a selection that
+                    // re-anchors (e.g. while dragging a handle) without ever
+                    // fully emptying would leave this effect stale.
+                    androidx.compose.runtime.LaunchedEffect(paneSelectionState.selectedTexts.toList()) {
+                        if (paneSelectionState.selectedTexts.isEmpty()) {
+                            actionModeController.hide()
+                        } else {
+                            actionModeController.show(
+                                onCopy = {
+                                    val text = paneSelectionState.selectedTexts.joinToString("\n") { it.text }
+                                    if (text.isNotEmpty()) clipboardManager.setText(AnnotatedString(text))
+                                    paneSelectionState.clear()
+                                    actionModeController.hide()
+                                },
+                                onPaste = clipboardManager.getText()?.text?.let { pasted ->
+                                    {
+                                        scrollOffset = 0
+                                        onInput(pasted)
+                                        paneSelectionState.clear()
+                                        actionModeController.hide()
+                                    }
+                                },
+                                // Only offered when the caller actually wired
+                                // at least one action - see onCloneSession/
+                                // onToggleWakeUp/onSaveSession's own doc on
+                                // this function's signature. Every existing
+                                // caller of MultiPaneContainer left these
+                                // null before this param existed, so this
+                                // stays a no-op (More button hidden) unless
+                                // MainActivity opts a specific tile in.
+                                onMore = if (onCloneSession != null || onToggleWakeUp != null || onSaveSession != null) {
+                                    { moreVisible = true }
+                                } else {
+                                    null
+                                }
+                            )
+                        }
+                    }
                     TerminalView(
                         buffer = buffer,
                         palette = palette,
@@ -621,6 +833,35 @@ private fun PaneContent(
                         selectionState = paneSelectionState,
                         modifier = Modifier.fillMaxSize()
                     )
+                    // Anchored in this same Box as TerminalView (top-center
+                    // popup, see SelectionActionBar's own doc) so it renders
+                    // directly over this pane's own tile, not some shared
+                    // coordinate space that could land it over a different
+                    // pane entirely.
+                    SelectionActionBar(actionModeController)
+                    // Same MoreActionsPopup the primary pane and
+                    // SplitTerminalPane use - onToggleSplitScreen is always
+                    // null here (see this function's doc), so that row
+                    // never renders for a multi-pane tile regardless of
+                    // splitScreenActive's value.
+                    if (onCloneSession != null || onToggleWakeUp != null || onSaveSession != null) {
+                        MoreActionsPopup(
+                            visible = moreVisible,
+                            actions = MoreMenuActions(
+                                onCloneSession = onCloneSession ?: {},
+                                onToggleWakeUp = onToggleWakeUp ?: {},
+                                wakeUpActive = wakeUpActive,
+                                onToggleSplitScreen = null,
+                                splitScreenActive = false,
+                                onSave = onSaveSession ?: {}
+                            ),
+                            onDismiss = {
+                                moreVisible = false
+                                paneSelectionState.clear()
+                                actionModeController.hide()
+                            }
+                        )
+                    }
                     // Typing always jumps back to the live screen, matching
                     // the primary pane's own sendInput behavior - handled by
                     // the caller-supplied onInput wrapper resetting scroll
@@ -628,6 +869,7 @@ private fun PaneContent(
                     // just resetting locally right before forwarding.
                     HiddenPaneInputField(
                         active = isFocused,
+                        activationKey = focusToken,
                         onText = { text ->
                             scrollOffset = 0
                             onInput(text)
@@ -646,10 +888,22 @@ private fun PaneContent(
                         .align(Alignment.BottomEnd)
                         .size(24.dp)
                         .pointerInput(runtimeId) {
-                            detectDragGestures { change, dragAmount ->
-                                change.consume()
-                                onResizeDrag(dragAmount)
-                            }
+                            // Same cumulative-total fix as the header drag
+                            // above - see its comment for why per-frame
+                            // dragAmount alone caused jitter instead of a
+                            // smooth resize.
+                            var accumulated = Offset.Zero
+                            detectDragGestures(
+                                onDragStart = {
+                                    accumulated = Offset.Zero
+                                    onDragStart()
+                                },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    accumulated += dragAmount
+                                    onResizeDrag(accumulated)
+                                }
+                            )
                         }
                 ) {
                     Icon(
@@ -662,11 +916,6 @@ private fun PaneContent(
             }
         }
     }
-}
-
-@Composable
-private fun Spacer(widthDp: Int) {
-    Box(modifier = Modifier.width(widthDp.dp))
 }
 
 /**
@@ -686,14 +935,56 @@ private fun Spacer(widthDp: Int) {
  * for the entire activity across every session switch.
  */
 @Composable
-internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit) {
+internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, activationKey: Any = active) {
     val placeholder = "\u200B"
     var value by remember { mutableStateOf(TextFieldValue(placeholder, selection = TextRange(placeholder.length))) }
     val focusRequester = remember { FocusRequester() }
+    // Same reliable IME-show pattern the primary pane's own hidden field
+    // uses (see MainActivity's pointerInput tap-to-toggle branch) - plain
+    // requestFocus() alone does fire its own IME show request, but relying
+    // on that alone is what made the keyboard fail to appear here: in
+    // split-screen/multi-pane, this field can be requesting focus while
+    // the system is still mid-animation from something else (the drawer
+    // closing, the primary pane's own field losing focus, an orientation
+    // change), and a bare focus-driven show request loses that race
+    // silently. An explicit, deferred insetsController.show() call - fired
+    // one frame after requestFocus(), same "let the focus-driven request
+    // dispatch first, then reinforce it" ordering used everywhere else in
+    // this app - actually gets the keyboard on screen.
+    val view = androidx.compose.ui.platform.LocalView.current
+    val insetsController = remember(view) {
+        val activity = view.context as? android.app.Activity
+        activity?.window?.let { window ->
+            androidx.core.view.WindowInsetsControllerCompat(window, view)
+        }
+    }
 
-    LaunchedEffect(active) {
+    // Keyed on activationKey (defaults to `active` itself, so every other
+    // caller behaves exactly as before) rather than on `active` alone.
+    // SplitTerminalPane passes its own focusToken here, bumped on every
+    // real tap into the pane - `active` (isFocused) starts true and stays
+    // true across a trip away to the primary pane and back, so a plain
+    // `active`-keyed effect only fires on the false->true edge and misses
+    // every re-tap that doesn't cross it. That's what left this field's
+    // focus/show call never re-firing, the real IME never reopening, and
+    // the virtual key bar (gated on WindowInsets.ime) staying hidden in
+    // split screen.
+    LaunchedEffect(activationKey) {
         if (active) {
-            focusRequester.requestFocus()
+            // Both requestFocus() and insetsController.show() in the same
+            // post() callback so focus is claimed and the IME show request
+            // fires in the same frame. Splitting them (requestFocus outside,
+            // show inside post) meant the show() call could race ahead of
+            // the focus claim on slower devices or when the Compose focus
+            // system was mid-animation — the IME saw no focused field and
+            // declined to open, especially after the user had manually
+            // dismissed the keyboard (which clears focus entirely via
+            // focusManager.clearFocus(), leaving a window where the field
+            // isn't focused yet when show() fires).
+            view.post {
+                focusRequester.requestFocus()
+                insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+            }
         }
     }
 
