@@ -351,6 +351,33 @@ class MainViewModel(
     }
 
     /**
+     * Backs the split pane's own "Clone session" More-menu row. Unlike
+     * [duplicateSession] (which activates the clone, replacing whatever
+     * the primary pane was showing - correct for the primary pane's own
+     * More menu, wrong here), this keeps the primary pane exactly as it
+     * was and swaps a fresh clone of the SPLIT session in as the new
+     * split partner - "clone session" in split's own More menu reads as
+     * "open a new split with a copy of this session", not "replace what
+     * I'm looking at". Mirrors [duplicateActiveSessionIntoSplit]'s own
+     * restore-then-set-split pattern, just cloning the split runtimeId
+     * given here instead of the active one.
+     */
+    fun duplicateSplitSessionIntoNewSplit(splitRuntimeId: String) {
+        val entry = liveEntries[splitRuntimeId] ?: return
+        val originalActiveId = _uiState.value.activeSessionId
+        val newId = newRuntimeId(entry.id)
+        launchLiveSession(runtimeId = newId, entry = entry)
+        // Same reasoning as duplicateActiveSessionIntoSplit: launchLiveSession
+        // just made `newId` the active session, which would have silently
+        // replaced the primary pane's content. Restore the original primary
+        // and put the fresh clone in as the split partner instead.
+        if (originalActiveId != null) {
+            _uiState.value = _uiState.value.copy(activeSessionId = originalActiveId)
+        }
+        setSplitSession(newId)
+    }
+
+    /**
      * Exports the given session's full terminal output (current screen +
      * everything still in scrollback, up to TerminalBuffer.
      * MAX_SCROLLBACK_LINES) as plain text to the given destination Uri (a

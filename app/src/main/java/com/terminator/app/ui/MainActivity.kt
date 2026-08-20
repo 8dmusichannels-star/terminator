@@ -2008,14 +2008,18 @@ class MainActivity : ComponentActivity() {
                                         },
                                         wasLastScrollEdgeAutoScroll = { viewModel.lastSplitScrollWasEdgeAutoScroll },
                                         // Supply More actions for the split pane's own
-                                        // selection toolbar — clone/wake-lock/save all
-                                        // target the split session. Split-screen toggle
-                                        // closes the split (already active by definition
-                                        // here). Null hides the More button entirely when
+                                        // selection toolbar — clone opens a NEW split
+                                        // with a copy of this split session (primary
+                                        // pane stays untouched - see
+                                        // duplicateSplitSessionIntoNewSplit's doc),
+                                        // wake-lock/save target the split session
+                                        // directly. Split-screen toggle closes the
+                                        // split (already active by definition here).
+                                        // Null hides the More button entirely when
                                         // splitScreenVisible is off (same hidden-not-
                                         // disabled treatment as the primary pane's More).
                                         moreMenuActions = MoreMenuActions(
-                                            onCloneSession = { viewModel.duplicateSession(splitRuntimeId) },
+                                            onCloneSession = { viewModel.duplicateSplitSessionIntoNewSplit(splitRuntimeId) },
                                             onToggleWakeUp = { viewModel.toggleWakeUp(splitRuntimeId) },
                                             wakeUpActive = state.runningSessions
                                                 .firstOrNull { it.runtimeId == splitRuntimeId }?.wakeUp == true,
