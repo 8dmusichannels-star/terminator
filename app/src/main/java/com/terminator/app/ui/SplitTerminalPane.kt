@@ -445,7 +445,24 @@ fun SplitTerminalPane(
                                     // route the PRESS event to the right session. focusToken is
                                     // intentionally NOT bumped here — see the detectTapGestures
                                     // block above for why (long-press must not trigger IME show).
+                                    //
+                                    // onFocusChanged(true) must ALSO fire here, not just isFocused
+                                    // itself: this awaitEachGesture loop runs on every touch-down,
+                                    // ahead of the sibling detectTapGestures block (which only
+                                    // fires onTap once a gesture resolves as a real tap, i.e. after
+                                    // finger-lift). Any press that resolves as a drag, long-press,
+                                    // or gets consumed as a mouse-report event never reaches that
+                                    // onTap at all - so if this block only wrote the local
+                                    // `isFocused` var (a same-value no-op once it's already true),
+                                    // MainActivity's splitPaneFocused never learned this pane was
+                                    // focused. That's what left VirtualKeyBar routing CTRL/ALT and
+                                    // regular key presses to the primary session while the split
+                                    // pane looked focused on screen: onKeyPressed's own debug log
+                                    // showed splitPaneFocused=false even after tapping the split
+                                    // pane, because only a clean tap (not a press that becomes a
+                                    // drag/selection/mouse-event) ever reached the other block.
                                     isFocused = true
+                                    onFocusChanged(true)
                                     val mouseWanted = wantsMouseEvents()
                                     android.util.Log.d(
                                         "SplitMouseDebug",

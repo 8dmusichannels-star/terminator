@@ -912,7 +912,23 @@ class MainActivity : ComponentActivity() {
                                     fontFamily = terminalTypeface,
                                     fontSizeSp = textSize,
                                     onInput = { runtimeId, text ->
-                                        viewModel.sendPaneInput(text, broadcastAllPanes)
+                                        // Same missing-transform bug as the split pane's onInput
+                                        // (see its own doc): this tile's HiddenPaneInputField
+                                        // forwards raw IME text, and ctrlActive/altActive are
+                                        // shared with THIS bar (see its ctrlActive/altActive
+                                        // props above) - toggling CTRL here armed the flag but
+                                        // nothing on this path ever consumed it for a real
+                                        // keystroke, only for the bar's own key buttons.
+                                        var toSend = text.replace('\n', '\r')
+                                        if (ctrlActive) {
+                                            toSend = toSend.map(::applyCtrl).joinToString("")
+                                            ctrlActive = false
+                                        }
+                                        if (altActive) {
+                                            toSend = "\u001B$toSend"
+                                            altActive = false
+                                        }
+                                        viewModel.sendPaneInput(toSend, broadcastAllPanes)
                                         // sendPaneInput() only targets the focused pane (or every
                                         // pane, if broadcasting) - it deliberately ignores which
                                         // pane's OWN hidden field produced this call, matching
@@ -1994,7 +2010,29 @@ class MainActivity : ComponentActivity() {
                                         fontSizeSp = effectiveTextSize,
                                         broadcastInput = state.broadcastInput,
                                         onToggleBroadcast = { viewModel.setBroadcastInput(!state.broadcastInput) },
-                                        onInput = { text -> viewModel.sendInputTo(splitRuntimeId, text) },
+                                        onInput = { text ->
+                                            // Split pane's own HiddenPaneInputField forwards raw IME
+                                            // text with no processing at all - unlike the primary
+                                            // pane's inline BasicTextField (see its onValueChange),
+                                            // it never applied ctrlActive/altActive or the \n->\r
+                                            // fix. That's what left CTRL a visible no-op here: the
+                                            // VirtualKeyBar's CTRL toggle correctly flips ctrlActive
+                                            // (button animates, onKeyPressed's own log confirms it),
+                                            // but a regular letter typed via the real keyboard while
+                                            // the split pane is focused went straight through as a
+                                            // literal character - the flag was armed but nothing ever
+                                            // consumed it on this path.
+                                            var toSend = text.replace('\n', '\r')
+                                            if (ctrlActive) {
+                                                toSend = toSend.map(::applyCtrl).joinToString("")
+                                                ctrlActive = false
+                                            }
+                                            if (altActive) {
+                                                toSend = "\u001B$toSend"
+                                                altActive = false
+                                            }
+                                            viewModel.sendInputTo(splitRuntimeId, toSend)
+                                        },
                                         onClose = { viewModel.setSplitSession(null) },
                                         onFocusChanged = { focused -> splitPaneFocused = focused },
                                         wantsMouseEvents = { viewModel.sessionWantsMouseEvents(splitRuntimeId) },

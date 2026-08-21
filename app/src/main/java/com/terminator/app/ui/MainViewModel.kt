@@ -834,19 +834,40 @@ class MainViewModel(
      *  Running list, same as closing a split used to just close the split.
      *  Leaving the last pane closes multi-pane mode entirely rather than
      *  leaving a permanently-empty pane container on screen. */
+    /**
+     * Closes one multi-pane tile (the tile's own × button, via onClosePane).
+     *
+     * Previously this ONLY dropped the runtimeId out of the `panes` UI list
+     * - it never touched liveSessions/liveEntries/runningSessions, unlike
+     * every other "a session is going away" path in this file (killSession,
+     * dismissExitedActiveSession, deleteSession all call
+     * liveSessions.remove(...)?.kill() and clean up the same three places).
+     * That's why closing a tile in multi-pane mode "removed" it from the
+     * screen but the underlying pty process, its liveEntries bookkeeping,
+     * and its row in the drawer's running-sessions list all silently kept
+     * living forever - a real resource/process leak, and a session that
+     * looked gone but was still fully alive in the background.
+     */
     fun removePane(runtimeId: String) {
+        liveSessions.remove(runtimeId)?.kill()
+        liveEntries.remove(runtimeId)
+        paneColumnsRows.remove(runtimeId)
         val state = _uiState.value
         val remaining = state.panes.filterNot { it.runtimeId == runtimeId }
-        if (remaining.isEmpty()) {
-            exitMultiPaneMode()
-            return
-        }
         val nextFocused = if (state.focusedPaneRuntimeId == runtimeId) {
             remaining.maxByOrNull { it.zIndex }?.runtimeId
         } else {
             state.focusedPaneRuntimeId
         }
-        _uiState.value = state.copy(panes = remaining, focusedPaneRuntimeId = nextFocused)
+        _uiState.value = state.copy(
+            panes = remaining,
+            focusedPaneRuntimeId = nextFocused,
+            runningSessions = state.runningSessions.filterNot { it.runtimeId == runtimeId },
+            sessionTextSizes = state.sessionTextSizes - runtimeId
+        )
+        if (remaining.isEmpty()) {
+            exitMultiPaneMode()
+        }
     }
 
     /** Tap-to-focus: makes this pane the target of typed input (when the
