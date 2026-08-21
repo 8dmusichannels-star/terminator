@@ -325,12 +325,29 @@ fun SplitTerminalPane(
                                     paneSelectionState.clear()
                                     actionModeController.hide()
                                 },
-                                onPaste = clipboardManager.getText()?.text?.let { pasted ->
-                                    {
-                                        onInput(pasted)
-                                        paneSelectionState.clear()
-                                        actionModeController.hide()
+                                onPaste = {
+                                    // Always offered (button never hidden for an
+                                    // empty clipboard) - read the clipboard at TAP
+                                    // time, not at LaunchedEffect-fire time. See
+                                    // MultiPaneContainer's identical fix/doc: the
+                                    // old `clipboardManager.getText()?.text?.let
+                                    // { pasted -> {...} }` pattern read the
+                                    // clipboard once, synchronously, the instant
+                                    // this LaunchedEffect fired (selection
+                                    // changed) - an empty clipboard at that exact
+                                    // moment made onPaste null and vanished the
+                                    // Paste button from the bar for the rest of
+                                    // that selection. Matches the primary pane's
+                                    // own onPaste (MainActivity).
+                                    clipboardManager.getText()?.text?.let { pasted ->
+                                        if (pasted.isNotEmpty()) {
+                                            // Same CR/LF fixup as the primary
+                                            // pane's onPaste.
+                                            onInput(pasted.replace('\n', '\r'))
+                                        }
                                     }
+                                    paneSelectionState.clear()
+                                    actionModeController.hide()
                                 },
                                 onMore = moreMenuActions?.let { _ -> { moreVisible = true } }
                             )

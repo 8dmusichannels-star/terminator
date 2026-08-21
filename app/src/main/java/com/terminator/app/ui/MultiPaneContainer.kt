@@ -798,13 +798,35 @@ private fun PaneContent(
                                     paneSelectionState.clear()
                                     actionModeController.hide()
                                 },
-                                onPaste = clipboardManager.getText()?.text?.let { pasted ->
-                                    {
-                                        scrollOffset = 0
-                                        onInput(pasted)
-                                        paneSelectionState.clear()
-                                        actionModeController.hide()
+                                onPaste = {
+                                    // Always offered (button never hidden for an
+                                    // empty clipboard) - read the clipboard at
+                                    // TAP time, not at LaunchedEffect-fire time.
+                                    // The old `clipboardManager.getText()?.text
+                                    // ?.let { pasted -> {...} }` pattern read the
+                                    // clipboard once, synchronously, right when
+                                    // this LaunchedEffect fired (i.e. the instant
+                                    // the selection changed) - if the clipboard
+                                    // was empty at that exact moment, onPaste
+                                    // became null and the Paste button vanished
+                                    // from the bar entirely for the rest of that
+                                    // selection, even if something got copied a
+                                    // second later. Matches the primary pane's
+                                    // own onPaste (MainActivity), which is a
+                                    // plain always-present lambda for the same
+                                    // reason.
+                                    clipboardManager.getText()?.text?.let { pasted ->
+                                        if (pasted.isNotEmpty()) {
+                                            // Same CR/LF fixup as the primary pane's
+                                            // onPaste - real terminals want CR for a
+                                            // line break, not the LF a multi-line
+                                            // clipboard selection naturally contains.
+                                            scrollOffset = 0
+                                            onInput(pasted.replace('\n', '\r'))
+                                        }
                                     }
+                                    paneSelectionState.clear()
+                                    actionModeController.hide()
                                 },
                                 // Only offered when the caller actually wired
                                 // at least one action - see onCloneSession/
