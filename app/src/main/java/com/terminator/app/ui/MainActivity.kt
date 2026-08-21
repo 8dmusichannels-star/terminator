@@ -2156,6 +2156,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onKeyPressed = { key ->
+                                            android.util.Log.d("KbDebug", "onKeyPressed: key=$key splitPaneFocused=$splitPaneFocused splitRuntimeId=$splitRuntimeId ctrlActive=$ctrlActive altActive=$altActive")
                                             when (key) {
                                                 VirtualKey.CTRL -> ctrlActive = !ctrlActive
                                                 VirtualKey.ALT -> altActive = !altActive
