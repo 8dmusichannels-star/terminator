@@ -58,6 +58,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -150,6 +151,24 @@ fun VirtualKeyBar(
     // Requests focus on the text-entry field every time the page opens -
     // see the LaunchedEffect below for why this exists.
     val textFieldFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+    // See the LaunchedEffect(textEntryOpen) close branch below for why
+    // this is needed - clearing this field's own Compose focus explicitly,
+    // synchronously, right when the swipe-back starts, rather than passively
+    // waiting for it to leave composition at the end of the exit animation.
+    val focusManager = LocalFocusManager.current
+    // Guards the close-branch logic below so it only ever runs after a
+    // REAL open->close transition, never on the very first composition.
+    // LaunchedEffect(textEntryOpen) fires on mount too, with textEntryOpen
+    // at its default (false) - that "close" branch used to run unconditionally,
+    // which meant every time this whole bar entered composition (it's
+    // conditionally shown/hidden on keyboardOpen at the call site - see
+    // MainActivity), it force-cleared focus from whatever field the user
+    // had just tapped into a moment earlier, before the real IME had even
+    // finished opening for it. That's what turned into "primaryde IME hiç
+    // açılmıyor, dokununca kendi kendine kapanıyor" - a tap opened the
+    // keyboard -> this bar mounted -> its very first LaunchedEffect run
+    // yanked focus straight back off, closing what had just opened.
+    var everOpened by remember { mutableStateOf(false) }
     // Opening the text page via swipe never itself focused the field it
     // just revealed - only an explicit tap on the OutlinedTextField did.
     // Without an input connection, the system has no reason to show the
@@ -163,8 +182,22 @@ fun VirtualKeyBar(
     // actually has something to show a keyboard for.
     LaunchedEffect(textEntryOpen) {
         if (textEntryOpen) {
+            everOpened = true
             textFieldFocusRequester.requestFocus()
-        } else {
+        } else if (everOpened) {
+            // Force this field to give up Compose focus right now, instead
+            // of leaving it focused for the rest of the exit animation and
+            // making the caller's replacement field wait it out with an
+            // artificial delay (see PaneContent's/SplitTerminalPane's own
+            // focusRequestSignal doc for that old workaround). A still-
+            // focused outgoing field is exactly what was making the real
+            // IME visibly close and reopen on its own after a swipe-back -
+            // force=true here so it lets go even while still composed and
+            // mid-animation, so whichever field the caller focuses next
+            // (from onTextEntryClosed(), fired immediately after) can claim
+            // the window's one IME connection with no focus-less gap in
+            // between for the system to animate a close/reopen for.
+            focusManager.clearFocus(force = true)
             onTextEntryClosed()
         }
     }

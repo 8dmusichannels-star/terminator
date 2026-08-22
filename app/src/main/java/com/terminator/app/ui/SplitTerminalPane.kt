@@ -133,6 +133,18 @@ fun SplitTerminalPane(
     // today only the primary pane's own hidden field does via its own
     // callback). Defaults to a no-op so nothing else needs to change.
     onFocusChanged: (Boolean) -> Unit = {},
+    // External "reclaim focus" trigger - same shape as MultiPaneContainer's
+    // activationKey pattern, but driven from OUTSIDE this pane (MainActivity's
+    // shared VirtualKeyBar's onTextEntryClosed) rather than by this pane's
+    // own tap gesture. Swiping the key bar back from its long-text page while
+    // this pane was the focused one used to always hand focus back to the
+    // PRIMARY pane's hidden field (the only thing MainActivity's
+    // onTextEntryClosed knew how to do), leaving this pane's own
+    // HiddenPaneInputField with no input connection at all - the real IME
+    // then closed itself with nothing focused to reopen it for. Bumping this
+    // (any change from the caller's last value) re-triggers the same
+    // focusToken bump / IME re-show a real re-tap into this pane would.
+    focusRequestSignal: Int = 0,
     // Mouse reporting for THIS pane's own session (mc/vim/htop's own
     // xterm-mouse-mode programs) - see MainViewModel.sessionWantsMouseEvents/
     // sendMouseEventTo's docs for why these need to be per-runtimeId rather
@@ -207,6 +219,29 @@ fun SplitTerminalPane(
     // tapping back into the split pane left the virtual key bar (which
     // gates on the real IME/WindowInsets state) never reappearing.
     var focusToken by remember(runtimeId) { mutableStateOf(0) }
+    // Consumes focusRequestSignal (see its own doc) - any change from
+    // MainActivity means "reclaim this pane's IME focus", identical to what
+    // a real re-tap into this pane does via the gesture blocks below.
+    // Skips signal 0 so the very first composition (default value) doesn't
+    // fire this - only an actual caller-driven bump should.
+    //
+    // No artificial delay needed anymore. VirtualKeyBar's own
+    // LaunchedEffect(textEntryOpen) now force-clears the outgoing long-text
+    // field's Compose focus (focusManager.clearFocus(force = true))
+    // synchronously, right when the swipe-back starts, before it ever fires
+    // onTextEntryClosed() - so by the time this signal bumps, the old field
+    // has already let go of focus regardless of where its 120ms exit
+    // animation still is. Requesting focus here immediately no longer loses
+    // the race the old comment described, and the real IME never sees a
+    // focus-less gap in between to visibly close and reopen for - which is
+    // what used to surface as the keyboard flickering shut on every
+    // swipe-back in split screen.
+    LaunchedEffect(focusRequestSignal) {
+        if (focusRequestSignal != 0) {
+            isFocused = true
+            focusToken++
+        }
+    }
     // Mirrors isFocused up to MainActivity on every change, including the
     // initial true (this pane is typable immediately on open, same as
     // isFocused's own doc above) - not just the later awaitEachGesture
@@ -591,10 +626,15 @@ fun SplitTerminalPane(
                             modifier = Modifier.fillMaxWidth().fillMaxHeight(),
                             debugLabel = "split"
                         )
+                        android.util.Log.d("SplitIMEDebug", "HiddenPaneInputField: active=$isFocused focusToken=$focusToken runtimeId=$runtimeId")
                         HiddenPaneInputField(
                             active = isFocused,
                             activationKey = focusToken,
-                            onText = { text -> onInput(text) }
+                            onText = { text ->
+                                android.util.Log.d("SplitIMEDebug", "onText called: ${text.map{it.code}}")
+                                onInput(text)
+                                android.util.Log.d("SplitIMEDebug", "onInput returned")
+                            }
                         )
                         // actionModeController.show()/hide() above only
                         // ever flip isVisible - nothing was reading that

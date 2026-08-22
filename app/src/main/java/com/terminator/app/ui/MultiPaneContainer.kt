@@ -52,18 +52,20 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.TextRange
@@ -141,6 +143,11 @@ fun MultiPaneContainer(
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
     onSaveSession: ((String) -> Unit)? = null,
+    // "Reclaim the focused pane's IME focus" signal - see PaneContent's own
+    // doc on the identically-named param this threads down to. Bump on any
+    // change (e.g. a counter incremented by the caller); 0 is the inert
+    // default so existing callers need no wiring to keep today's behavior.
+    focusRequestSignal: Int = 0,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxSize()) {
@@ -171,7 +178,8 @@ fun MultiPaneContainer(
                     onCloneSession = onCloneSession,
                     onToggleWakeUp = onToggleWakeUp,
                     wakeUpActiveFor = wakeUpActiveFor,
-                    onSaveSession = onSaveSession
+                    onSaveSession = onSaveSession,
+                    focusRequestSignal = focusRequestSignal
                 )
                 PaneMode.Floating -> FloatingLayout(
                     panes = panes,
@@ -274,7 +282,8 @@ private fun TilingLayout(
     onCloneSession: ((String) -> Unit)? = null,
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
-    onSaveSession: ((String) -> Unit)? = null
+    onSaveSession: ((String) -> Unit)? = null,
+    focusRequestSignal: Int = 0
 ) {
     if (panes.isEmpty()) return
     // Grid shape: as close to square as possible, favoring one extra
@@ -330,6 +339,7 @@ private fun TilingLayout(
                                     onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
                                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
                                     onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
+                                    focusRequestSignal = focusRequestSignal,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -443,7 +453,8 @@ private fun FloatingLayout(
     onCloneSession: ((String) -> Unit)? = null,
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
-    onSaveSession: ((String) -> Unit)? = null
+    onSaveSession: ((String) -> Unit)? = null,
+    focusRequestSignal: Int = 0
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val density = LocalDensity.current.density
@@ -518,6 +529,7 @@ private fun FloatingLayout(
                     onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
                     onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
+                    focusRequestSignal = focusRequestSignal,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -570,6 +582,20 @@ private fun PaneContent(
     onToggleWakeUp: (() -> Unit)? = null,
     wakeUpActive: Boolean = false,
     onSaveSession: (() -> Unit)? = null,
+    // Same "reclaim this pane's IME focus" signal SplitTerminalPane's own
+    // focusRequestSignal is (see its doc): MainActivity bumps this after
+    // VirtualKeyBar's long-text page swipes closed. Without a per-pane
+    // equivalent here, multi-pane mode's onTextEntryClosed had nothing to
+    // bump - the outgoing OutlinedTextField left composition with no field
+    // left focused, the real IME started closing on its own with nothing to
+    // reopen it for, and MainActivity's only fallback was a bare
+    // insetsController.show() with no input connection behind it - the
+    // "IMEİ kendi kendine kapanıyor" swipe bug, multi-pane-only for exactly
+    // the same reason SplitTerminalPane's own doc gives (the primary pane's
+    // field is requested directly, one hop; every pane in here goes through
+    // this extra signal -> focusToken bump hop instead). Defaults to 0 so
+    // every existing caller keeps its old behavior with no wiring needed.
+    focusRequestSignal: Int = 0,
     modifier: Modifier = Modifier
 ) {
     // Per-pane pinch-zoom override, local to this composable only (not
@@ -602,6 +628,24 @@ private fun PaneContent(
     // no field to show it for — the "keyboard bazen açılmıyor" bug in
     // multi-pane mode.
     var focusToken by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
+
+    // Consumes focusRequestSignal - only for whichever pane is actually
+    // focused, same guard SplitTerminalPane's splitPaneFocused check gives
+    // it implicitly (MainActivity there only has one split pane to target;
+    // here there are N tiles, so this composable has to check isFocused
+    // itself instead). No artificial delay needed anymore: VirtualKeyBar's
+    // own LaunchedEffect(textEntryOpen) now force-clears the outgoing
+    // long-text field's focus (focusManager.clearFocus(force = true))
+    // synchronously before firing onTextEntryClosed(), so by the time this
+    // signal bumps the old field has already let go - requesting focus here
+    // immediately no longer loses the race, and the real IME never sees a
+    // focus-less gap to visibly close/reopen for. Skips signal 0 so the
+    // initial composition (default value) never fires this on its own.
+    androidx.compose.runtime.LaunchedEffect(focusRequestSignal) {
+        if (focusRequestSignal != 0 && isFocused) {
+            focusToken++
+        }
+    }
 
     Column(
         modifier = modifier
@@ -951,28 +995,17 @@ private fun PaneContent(
  *
  * Simpler than MainActivity's single shared hidden field (no
  * consumedBaseline growth-cap dance) because each pane's field only needs
- * to stay alive/focused while THIS pane is the focused one - it's fine for
- * it to fully reset to the placeholder on every own edit, unlike the
- * primary pane's field which has to survive being the ONLY hidden field
- * for the entire activity across every session switch.
+ * to stay alive/focused while THIS pane is the focused one. Now uses the
+ * same append-baseline architecture as the primary pane's hidden field
+ * (see HiddenPaneInputField's own doc below for why the old reset-every-
+ * keystroke approach broke Enter specifically in split screen).
  */
 @Composable
 internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, activationKey: Any = active) {
     val placeholder = "\u200B"
     var value by remember { mutableStateOf(TextFieldValue(placeholder, selection = TextRange(placeholder.length))) }
+    var consumedBaseline by remember { mutableStateOf(placeholder) }
     val focusRequester = remember { FocusRequester() }
-    // Same reliable IME-show pattern the primary pane's own hidden field
-    // uses (see MainActivity's pointerInput tap-to-toggle branch) - plain
-    // requestFocus() alone does fire its own IME show request, but relying
-    // on that alone is what made the keyboard fail to appear here: in
-    // split-screen/multi-pane, this field can be requesting focus while
-    // the system is still mid-animation from something else (the drawer
-    // closing, the primary pane's own field losing focus, an orientation
-    // change), and a bare focus-driven show request loses that race
-    // silently. An explicit, deferred insetsController.show() call - fired
-    // one frame after requestFocus(), same "let the focus-driven request
-    // dispatch first, then reinforce it" ordering used everywhere else in
-    // this app - actually gets the keyboard on screen.
     val view = androidx.compose.ui.platform.LocalView.current
     val insetsController = remember(view) {
         val activity = view.context as? android.app.Activity
@@ -980,67 +1013,83 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             androidx.core.view.WindowInsetsControllerCompat(window, view)
         }
     }
+    // onText arrives as a new lambda on every recomposition (it closes over
+    // state from SplitTerminalPane/MainActivity that changes). Without
+    // rememberUpdatedState the onValueChange closure below captures whatever
+    // lambda was current at the last remember{} call - a stale version that
+    // sees old state (e.g. splitExited=false right after a kill). This is
+    // exactly why Enter did nothing: by the time the user pressed Enter,
+    // onText had already been captured in the closure before exited=true was
+    // propagated, and no recomposition had run to refresh it.
+    val latestOnText = rememberUpdatedState(onText)
 
-    // Keyed on activationKey (defaults to `active` itself, so every other
-    // caller behaves exactly as before) rather than on `active` alone.
-    // SplitTerminalPane passes its own focusToken here, bumped on every
-    // real tap into the pane - `active` (isFocused) starts true and stays
-    // true across a trip away to the primary pane and back, so a plain
-    // `active`-keyed effect only fires on the false->true edge and misses
-    // every re-tap that doesn't cross it. That's what left this field's
-    // focus/show call never re-firing, the real IME never reopening, and
-    // the virtual key bar (gated on WindowInsets.ime) staying hidden in
-    // split screen.
     LaunchedEffect(activationKey) {
         if (active) {
-            // Both requestFocus() and insetsController.show() in the same
-            // post() callback so focus is claimed and the IME show request
-            // fires in the same frame. Splitting them (requestFocus outside,
-            // show inside post) meant the show() call could race ahead of
-            // the focus claim on slower devices or when the Compose focus
-            // system was mid-animation — the IME saw no focused field and
-            // declined to open, especially after the user had manually
-            // dismissed the keyboard (which clears focus entirely via
-            // focusManager.clearFocus(), leaving a window where the field
-            // isn't focused yet when show() fires).
-            view.post {
-                focusRequester.requestFocus()
-                insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
-            }
+            // Was routed through view.post (queues to the next Choreographer
+            // frame) - see the old comment below for why that existed for
+            // the very FIRST composition. But this LaunchedEffect only runs
+            // on a real activationKey CHANGE, which means Compose has
+            // already committed a recomposition by the time this coroutine
+            // resumes - the layout that owns this FocusRequester is already
+            // in the tree, so the "hasn't been committed yet" concern
+            // view.post was guarding against doesn't apply here. Routing
+            // through post was adding a full extra frame (sometimes more,
+            // if the Looper queue was busy) on top of whatever gap already
+            // exists between the outgoing field's clearFocus/hide and this
+            // field's requestFocus/show - part of what was reading as the
+            // keyboard staying fully closed for the better part of a second
+            // on swipe-back in split screen. Calling both directly,
+            // synchronously, closes that extra frame of delay.
+            android.util.Log.d("SplitIMEDebug", "direct: requesting focus + show, active=$active activationKey=$activationKey")
+            focusRequester.requestFocus()
+            insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
         }
     }
 
     BasicTextField(
         value = value,
         onValueChange = { new ->
+            android.util.Log.d("SplitIMEDebug", "onValueChange fired: new.text=${new.text.map{it.code}} consumedBaseline=${consumedBaseline.map{it.code}}")
             val newText = new.text
             when {
-                newText.length > placeholder.length && newText.startsWith(placeholder) -> {
-                    onText(newText.removePrefix(placeholder))
+                newText.length > consumedBaseline.length && newText.startsWith(consumedBaseline) -> {
+                    latestOnText.value(newText.substring(consumedBaseline.length))
+                    consumedBaseline = newText
+                    if (newText.length > 256 && new.composition == null) {
+                        consumedBaseline = placeholder
+                    }
                 }
-                newText.length < placeholder.length -> {
-                    // Backspace past the placeholder itself - single DEL,
-                    // matches a real terminal's backspace-with-nothing-to-
-                    // delete-locally behavior (still forwarded, the running
-                    // program decides what to do with it).
-                    onText("\u007F")
+                newText.length <= consumedBaseline.length -> {
+                    val removedCount = (consumedBaseline.length - newText.length).coerceAtLeast(1)
+                    latestOnText.value("\u007F".repeat(removedCount))
+                    consumedBaseline = placeholder
                 }
-                !newText.startsWith(placeholder) -> {
-                    // Autocorrect/predictive-text replaced the whole field -
-                    // forward as-is rather than silently dropping it, same
-                    // fallback the primary pane's field uses.
-                    onText(newText)
+                else -> {
+                    latestOnText.value(newText)
+                    consumedBaseline = placeholder
                 }
             }
-            value = TextFieldValue(placeholder, selection = TextRange(placeholder.length))
+            value = new.copy(
+                text = if (consumedBaseline == placeholder) placeholder else newText,
+                selection = if (consumedBaseline == placeholder)
+                    TextRange(placeholder.length) else new.selection
+            )
         },
         modifier = Modifier
             .size(1.dp)
             .alpha(0f)
-            .focusRequester(focusRequester),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Send),
-        keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-            onSend = { onText("\r") }
+            .focusRequester(focusRequester)
+            .onFocusChanged {
+                android.util.Log.d("SplitIMEDebug", "HiddenPaneInputField onFocusChanged: isFocused=${it.isFocused} active=$active")
+                if (it.isFocused && consumedBaseline != placeholder) {
+                    consumedBaseline = placeholder
+                    value = TextFieldValue(placeholder, selection = TextRange(placeholder.length))
+                }
+            },
+        keyboardOptions = KeyboardOptions(
+            keyboardType = KeyboardType.Text,
+            capitalization = KeyboardCapitalization.None,
+            autoCorrect = false
         )
     )
 }
