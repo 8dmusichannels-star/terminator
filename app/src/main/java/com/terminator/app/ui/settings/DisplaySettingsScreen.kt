@@ -21,32 +21,90 @@
 package com.terminator.app.ui.settings
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.datastore.preferences.core.Preferences
 import com.terminator.app.settings.SettingsKeys
+import com.terminator.app.settings.SettingsRepository
 import kotlinx.coroutines.launch
 
 /**
- * Show/hide statusbar (single toggle, consistent in both portrait and
- * landscape - no separate horizontal-mode setting needed), show/hide
- * titlebar, and enable/disable horizontal (landscape) mode itself.
+ * One row's worth of a Display toggle: the persisted key, its default,
+ * label, and optional helper text. Adding a new on/off Display setting
+ * means adding one entry here - not copy-pasting a Switch+Text+Spacer
+ * block like this screen used to require for every single toggle.
+ */
+private data class DisplayToggleItem(
+    val key: Preferences.Key<Boolean>,
+    val default: Boolean,
+    val label: String,
+    val description: String? = null
+)
+
+private val DISPLAY_TOGGLES = listOf(
+    DisplayToggleItem(
+        key = SettingsKeys.SHOW_STATUSBAR,
+        default = false,
+        label = "Show statusbar",
+        description = "Applies consistently in both portrait and landscape."
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.SHOW_TITLEBAR,
+        default = true,
+        label = "Show titlebar"
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.HORIZONTAL_MODE,
+        default = true,
+        label = "Horizontal (landscape) mode"
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE,
+        default = true,
+        label = "Show runner toolbar save button",
+        description = "Shows/hides the Save (export) icon on each running session's row in the drawer."
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.SPLIT_SCREEN_VISIBLE,
+        default = true,
+        label = "Split screen visibility",
+        description = "Shows/hides the split-screen button. Only affects the button itself - " +
+            "an already-open split stays open even if you turn this off."
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.BROADCAST_ALL_PANES,
+        default = false,
+        label = "Broadcast to all panes",
+        description = "When multiple panes are open (multi-pane mode), typing reaches every visible pane at once. " +
+            "When off, typing only reaches whichever pane you last tapped to focus."
+    ),
+    DisplayToggleItem(
+        key = SettingsKeys.SHOW_CLEAR_ALL_SESSIONS_BUTTON,
+        default = false,
+        label = "Show \"All clear session\" button",
+        description = "Shows a button in the session area that kills every running session at once. " +
+            "Saved session profiles aren't affected - only what's currently running."
+    )
+)
+
+/**
+ * Every toggle here is driven off [DISPLAY_TOGGLES] and rendered by
+ * [DisplayToggleRow] - the list is the single source of truth for both
+ * order and content, so adding/reordering a Display setting is a one-line
+ * change instead of touching layout code.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DisplaySettingsScreen(onBack: () -> Unit) {
     val repo = rememberSettingsRepository()
     val scope = rememberCoroutineScope()
-
-    val showStatusbar by repo.flow(SettingsKeys.SHOW_STATUSBAR, false).collectAsState(initial = false)
-    val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
-    val horizontalModeEnabled by repo.flow(SettingsKeys.HORIZONTAL_MODE, true).collectAsState(initial = true)
-    val showRunnerToolbarSave by repo.flow(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, true).collectAsState(initial = true)
-    val splitScreenVisible by repo.flow(SettingsKeys.SPLIT_SCREEN_VISIBLE, true).collectAsState(initial = true)
-    val broadcastAllPanes by repo.flow(SettingsKeys.BROADCAST_ALL_PANES, false).collectAsState(initial = false)
 
     Scaffold(
         topBar = {
@@ -58,53 +116,36 @@ fun DisplaySettingsScreen(onBack: () -> Unit) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
-            SwitchRow("Show statusbar", showStatusbar) {
-                scope.launch { repo.set(SettingsKeys.SHOW_STATUSBAR, it) }
+        LazyColumn(
+            modifier = Modifier.padding(padding).fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            items(DISPLAY_TOGGLES, key = { it.label }) { item ->
+                DisplayToggleRow(item = item, repo = repo, scope = scope)
+                Spacer(modifier = Modifier.height(16.dp))
             }
-            Text(
-                "Applies consistently in both portrait and landscape.",
-                style = MaterialTheme.typography.bodySmall
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-            SwitchRow("Show titlebar", showTitlebar) {
-                scope.launch { repo.set(SettingsKeys.SHOW_TITLEBAR, it) }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-            SwitchRow("Horizontal (landscape) mode", horizontalModeEnabled) {
-                scope.launch { repo.set(SettingsKeys.HORIZONTAL_MODE, it) }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-            SwitchRow("Show runner toolbar save button", showRunnerToolbarSave) {
-                scope.launch { repo.set(SettingsKeys.SHOW_RUNNER_TOOLBAR_SAVE, it) }
-            }
-            Text(
-                "Shows/hides the Save (export) icon on each running session's row in the drawer.",
-                style = MaterialTheme.typography.bodySmall
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-            SwitchRow("Split screen visibility", splitScreenVisible) {
-                scope.launch { repo.set(SettingsKeys.SPLIT_SCREEN_VISIBLE, it) }
-            }
-            Text(
-                "Shows/hides the split-screen button. Only affects the button itself - " +
-                    "an already-open split stays open even if you turn this off.",
-                style = MaterialTheme.typography.bodySmall
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-            SwitchRow("Broadcast to all panes", broadcastAllPanes) {
-                scope.launch { repo.set(SettingsKeys.BROADCAST_ALL_PANES, it) }
-            }
-            Text(
-                "When multiple panes are open (multi-pane mode), typing reaches every visible pane at once. " +
-                    "When off, typing only reaches whichever pane you last tapped to focus.",
-                style = MaterialTheme.typography.bodySmall
-            )
         }
+    }
+}
+
+@Composable
+private fun DisplayToggleRow(
+    item: DisplayToggleItem,
+    repo: SettingsRepository,
+    scope: kotlinx.coroutines.CoroutineScope
+) {
+    val checked by repo.flow(item.key, item.default).collectAsState(initial = item.default)
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(item.label, style = MaterialTheme.typography.bodyLarge)
+            item.description?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = { newValue -> scope.launch { repo.set(item.key, newValue) } }
+        )
     }
 }

@@ -632,6 +632,54 @@ class MainViewModel(
         }
     }
 
+    /**
+     * "All clear session" - kills every currently RUNNING session (classic
+     * view, split partner, and every multi-pane instance alike) in one go,
+     * then relaunches a single fresh default session so the user never
+     * lands on an empty screen. Deliberately only touches runtime state:
+     * saved session profiles in [MainUiState.sessions] (Settings > Sessions)
+     * are never read from or written to here - "running" and "saved" are
+     * kept as separate concerns the same way [killSession] already treats
+     * them for a single session.
+     *
+     * Reimplements killSession's per-runtime cleanup as one batched pass
+     * instead of calling killSession(id) in a loop, so a large pane group
+     * collapses via a single _uiState update/recomposition rather than one
+     * per running session.
+     */
+    fun clearAllSessions() {
+        val runtimeIds = _uiState.value.runningSessions.map { it.runtimeId }
+        if (runtimeIds.isEmpty()) return
+
+        runtimeIds.forEach { id ->
+            liveSessions.remove(id)?.kill()
+            liveEntries.remove(id)
+            paneColumnsRows.remove(id)
+        }
+
+        _uiState.value = _uiState.value.copy(
+            runningSessions = emptyList(),
+            activeSessionId = null,
+            sessionTextSizes = emptyMap(),
+            scrollOffset = 0,
+            splitScrollOffset = 0,
+            splitRuntimeId = null,
+            broadcastInput = false,
+            panes = emptyList(),
+            focusedPaneRuntimeId = null
+        )
+
+        // Land on a fresh default session rather than an empty screen -
+        // same fallback chain openSession/duplicateActiveSession already
+        // use elsewhere: the flagged default, or just the first saved
+        // session if none is flagged.
+        val defaultEntry = _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+        if (defaultEntry != null) {
+            launchLiveSession(runtimeId = defaultEntry.id, entry = defaultEntry)
+        }
+    }
+
     /** Flips one session's wakeUp flag - see TerminatorApp.requestToggleWakeUp
      *  for what "awake" actually changes. Symmetric: calling this again on
      *  an already-awake session turns it back off, which is what lets both

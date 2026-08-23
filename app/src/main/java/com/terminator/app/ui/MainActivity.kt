@@ -336,6 +336,12 @@ class MainActivity : ComponentActivity() {
             // popup). Doesn't affect an already-open split - see
             // SettingsKeys.SPLIT_SCREEN_VISIBLE's doc.
             val splitScreenVisible by repo.flow(SettingsKeys.SPLIT_SCREEN_VISIBLE, true).collectAsState(initial = true)
+            // Settings > Display > "Show \"All clear session\" button" - gates
+            // whether SessionDrawer's Running-section header shows the
+            // "All clear session" button (kills every running session at
+            // once, see MainViewModel.clearAllSessions's doc). Off by
+            // default since it's a destructive action.
+            val showClearAllSessionsButton by repo.flow(SettingsKeys.SHOW_CLEAR_ALL_SESSIONS_BUTTON, false).collectAsState(initial = false)
             // Settings > Display > "Broadcast to all panes" - see
             // MainViewModel.sendPaneInput's doc. Only consulted while
             // multi-pane mode is on (state.panes non-empty); has no effect
@@ -1075,12 +1081,23 @@ class MainActivity : ComponentActivity() {
                                     focusRequestSignal = multiPaneFocusRequestSignal,
                                     modifier = Modifier.weight(1f)
                                 )
-                                // VirtualKeyBar for multi-pane mode. Shows whenever any pane is
-                                // focused (focusedPaneRuntimeId != null) or the IME is visible,
-                                // same reasoning as splitPaneFocused in the else branch below.
+                                // VirtualKeyBar for multi-pane mode. Was also shown whenever
+                                // state.focusedPaneRuntimeId != null - but unlike splitPaneFocused
+                                // (a live "is this pane focused right now" signal), that field is
+                                // sticky: it's set the first time any tile is focused and only
+                                // cleared on a handful of specific events (adding a pane, tapping a
+                                // different tile, exiting multi-pane mode) - not when the keyboard
+                                // itself closes. That's what kept the bar glued to the screen after
+                                // a tile lost focus/its IME closed: focusedPaneRuntimeId was still
+                                // non-null even though nothing was actually focused anymore. Now
+                                // that HiddenPaneInputField (MultiPaneContainer.kt) properly hides
+                                // the IME when a tile's field goes inactive, keyboardOpen alone -
+                                // the same live WindowInsets.ime read the primary pane and split
+                                // both already rely on - is the correct signal here, matching
+                                // splitPaneFocused's role in the else branch below exactly.
                                 // Routes to the focused pane via sendPaneInput — no CTRL/ALT
                                 // state here, key presses go straight as sequences.
-                                if (virtualKeysEnabled && (!softKeyboardEnabled || keyboardOpen || state.focusedPaneRuntimeId != null)) {
+                                if (virtualKeysEnabled && (!softKeyboardEnabled || keyboardOpen)) {
                                     VirtualKeyBar(
                                         ctrlActive = ctrlActive,
                                         altActive = altActive,
@@ -2539,6 +2556,8 @@ class MainActivity : ComponentActivity() {
                                 // see its doc.
                                 paneRuntimeIds = state.panes.map { it.runtimeId }.toSet(),
                                 onAddPaneSession = { runtimeId -> viewModel.addPaneSession(runtimeId) },
+                                showClearAllSessionsButton = showClearAllSessionsButton,
+                                onClearAllSessions = { viewModel.clearAllSessions() },
                                 onSettingsClicked = {
                                     startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                                 },

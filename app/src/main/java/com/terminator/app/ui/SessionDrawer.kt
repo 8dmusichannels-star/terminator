@@ -121,6 +121,13 @@ fun SessionDrawer(
     // "already a pane".
     paneRuntimeIds: Set<String> = emptySet(),
     onAddPaneSession: (String) -> Unit = {},
+    // Settings > Display > "Show \"All clear session\" button"
+    // (SettingsKeys.SHOW_CLEAR_ALL_SESSIONS_BUTTON). False hides the button
+    // entirely (not shown-but-disabled), same treatment as
+    // showRunnerSaveButtons/showSplitButtons above. Only rendered at all
+    // when runningSessions is non-empty - nothing to clear otherwise.
+    showClearAllSessionsButton: Boolean = false,
+    onClearAllSessions: () -> Unit = {},
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
@@ -156,6 +163,7 @@ fun SessionDrawer(
                 )
         ) {
             var dragOffset by remember { mutableFloatStateOf(0f) }
+            var showClearAllConfirm by remember { mutableStateOf(false) }
             val drawerWidth = 300.dp
             val drawerWidthPx = with(LocalDensity.current) { drawerWidth.toPx() }
 
@@ -194,12 +202,31 @@ fun SessionDrawer(
                 LazyColumn(modifier = Modifier.weight(1f)) {
                     if (runningSessions.isNotEmpty()) {
                         item(key = "running-header") {
-                            Text(
-                                "RUNNING",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.5f),
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    "RUNNING",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.White.copy(alpha = 0.5f),
+                                    modifier = Modifier.padding(vertical = 4.dp)
+                                )
+                                // Destructive one-tap action - confirm before actually
+                                // killing every running session, same reasoning as any
+                                // other "wipe everything" control.
+                                if (showClearAllSessionsButton) {
+                                    TextButton(onClick = { showClearAllConfirm = true }) {
+                                        Text(
+                                            "All clear session",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                }
+                            }
                         }
                         items(
                             items = runningSessions,
@@ -284,6 +311,29 @@ fun SessionDrawer(
                     Spacer(modifier = Modifier.width(12.dp))
                     Text("Settings", style = MaterialTheme.typography.bodyLarge)
                 }
+            }
+
+            if (showClearAllConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showClearAllConfirm = false },
+                    title = { Text("Clear all running sessions?") },
+                    text = {
+                        Text(
+                            "This kills every running session (${runningSessions.size} total), " +
+                                "including any split-screen or multi-pane instances. Saved " +
+                                "sessions in Settings aren't affected and can still be reopened."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showClearAllConfirm = false
+                            onClearAllSessions()
+                        }) { Text("Clear all") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showClearAllConfirm = false }) { Text("Cancel") }
+                    }
+                )
             }
         }
     }

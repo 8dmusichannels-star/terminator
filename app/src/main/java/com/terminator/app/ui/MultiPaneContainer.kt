@@ -54,6 +54,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -62,6 +63,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -1006,6 +1008,7 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
     var value by remember { mutableStateOf(TextFieldValue(placeholder, selection = TextRange(placeholder.length))) }
     var consumedBaseline by remember { mutableStateOf(placeholder) }
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     val view = androidx.compose.ui.platform.LocalView.current
     val insetsController = remember(view) {
         val activity = view.context as? android.app.Activity
@@ -1022,6 +1025,7 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
     // onText had already been captured in the closure before exited=true was
     // propagated, and no recomposition had run to refresh it.
     val latestOnText = rememberUpdatedState(onText)
+    val latestActive = rememberUpdatedState(active)
 
     LaunchedEffect(activationKey) {
         if (active) {
@@ -1042,6 +1046,42 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             // synchronously, closes that extra frame of delay.
             focusRequester.requestFocus()
             insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+        } else {
+            // Mirrors the primary pane's own tap-to-close path in
+            // MainActivity (focusManager.clearFocus() + a synchronous
+            // insetsController.hide(ime()), see its onTap/onCopy/onPaste
+            // "else" branches) - that pairing is what makes the primary
+            // pane's keyboard open/close cleanly with no animation glitch.
+            // This field previously only handled active == true: leaving a
+            // pane (split partner losing focus, a multi-pane tile losing
+            // focus, or the split/pane closing outright) never told the IME
+            // to hide and never released this field's own Compose focus, so
+            // the keyboard was left to whatever state it happened to be in -
+            // sometimes staying open over a pane that no longer wants it,
+            // sometimes only partially animating closed. Calling both here,
+            // synchronously and unconditionally whenever activationKey
+            // flips to inactive, gives split-screen and multi-pane the same
+            // clean full open/close animation the primary pane already has.
+            focusManager.clearFocus()
+            insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+        }
+    }
+
+    // Covers the case LaunchedEffect(activationKey) above can't: this whole
+    // field being torn out of composition while still active == true, e.g.
+    // closing the split entirely (SplitTerminalPane's parent `if
+    // (splitRuntimeId != null)` block in MainActivity stops composing it)
+    // or a multi-pane tile being removed outright rather than merely losing
+    // focus. Neither path flips activationKey first - the field just
+    // disappears - so without this the keyboard could stay shown over
+    // whatever pane happens to be left, anchored to a focus target that no
+    // longer exists.
+    DisposableEffect(Unit) {
+        onDispose {
+            if (latestActive.value) {
+                focusManager.clearFocus()
+                insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+            }
         }
     }
 
