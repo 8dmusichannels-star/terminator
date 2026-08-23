@@ -58,7 +58,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -151,11 +150,6 @@ fun VirtualKeyBar(
     // Requests focus on the text-entry field every time the page opens -
     // see the LaunchedEffect below for why this exists.
     val textFieldFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
-    // See the LaunchedEffect(textEntryOpen) close branch below for why
-    // this is needed - clearing this field's own Compose focus explicitly,
-    // synchronously, right when the swipe-back starts, rather than passively
-    // waiting for it to leave composition at the end of the exit animation.
-    val focusManager = LocalFocusManager.current
     // Guards the close-branch logic below so it only ever runs after a
     // REAL open->close transition, never on the very first composition.
     // LaunchedEffect(textEntryOpen) fires on mount too, with textEntryOpen
@@ -185,19 +179,31 @@ fun VirtualKeyBar(
             everOpened = true
             textFieldFocusRequester.requestFocus()
         } else if (everOpened) {
-            // Force this field to give up Compose focus right now, instead
-            // of leaving it focused for the rest of the exit animation and
-            // making the caller's replacement field wait it out with an
-            // artificial delay (see PaneContent's/SplitTerminalPane's own
-            // focusRequestSignal doc for that old workaround). A still-
-            // focused outgoing field is exactly what was making the real
-            // IME visibly close and reopen on its own after a swipe-back -
-            // force=true here so it lets go even while still composed and
-            // mid-animation, so whichever field the caller focuses next
-            // (from onTextEntryClosed(), fired immediately after) can claim
-            // the window's one IME connection with no focus-less gap in
-            // between for the system to animate a close/reopen for.
-            focusManager.clearFocus(force = true)
+            // NOTE: this used to call focusManager.clearFocus(force = true)
+            // here, before onTextEntryClosed(). Per Android's own
+            // View.clearFocus() contract, clearing focus with nothing else
+            // explicitly claiming it does NOT leave focus unclaimed - the
+            // platform automatically hands it to the next focusable node it
+            // finds in the view hierarchy (see
+            // https://issuetracker.google.com/issues/374031296, which hits
+            // this exact failure mode and recommends against calling
+            // clearFocus() for precisely this reason). In split screen, that
+            // next focusable node is the primary pane's own always-composed
+            // hidden field - not the split pane the user was actually typing
+            // into. So clearFocus() was silently stealing focus onto the
+            // WRONG field for one frame, which is what made the real IME
+            // flash open (still connected to the wrong field for an instant)
+            // and then shut again once onTextEntryClosed()'s split branch
+            // caught up and moved focus to where it actually belonged - a
+            // real focus-hijack, not a settling-animation timing gap.
+            //
+            // Fix: don't call clearFocus() at all. onTextEntryClosed() below
+            // is responsible for moving focus straight to the correct next
+            // field itself (the split pane's own hidden field, or the
+            // primary pane's, depending on which one is actually active) -
+            // requesting focus on the correct target already implicitly
+            // takes focus away from this closing field, with no intermediate
+            // step where the platform can reassign it somewhere else first.
             onTextEntryClosed()
         }
     }

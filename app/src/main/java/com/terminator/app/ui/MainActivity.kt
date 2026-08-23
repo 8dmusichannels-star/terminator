@@ -76,8 +76,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.ViewCompat
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.terminator.app.TerminatorApp
@@ -479,6 +481,57 @@ class MainActivity : ComponentActivity() {
                     delay(120)
                     settledKeyboardOpen = keyboardOpen
                 }
+                // Real IME-animation-finished signal, used ONLY by the split-screen
+                // text-page-close path (see onTextEntryClosed's split branch below).
+                // settledKeyboardOpen above is a fixed 120ms guess at when the
+                // animation has settled - it has no idea whether the platform's own
+                // IME show/hide animation is actually still running, so a
+                // VirtualKeyBar swipe-back's synchronous focusManager.clearFocus can
+                // nudge the inset right in the middle of that guessed window and get
+                // read as "settled" when the real animation is still moving out from
+                // under it. WindowInsetsAnimationCompat.Callback's onEnd() fires
+                // from the platform itself exactly once the IME animation - shown or
+                // hidden - has actually finished, so imeAnimationSettled bumping is
+                // ground truth rather than a timer. This runs for every IME
+                // animation regardless of what triggered it (this file's own show/
+                // hide calls, the system back gesture, the user's own IME dismiss
+                // control), same breadth WindowInsets.ime already gives keyboardOpen
+                // above - it's just also anchored to the animation's real end instead
+                // of a live per-frame inset read.
+                var imeAnimationSettled by remember { mutableIntStateOf(0) }
+                DisposableEffect(currentView) {
+                    val callback = object : WindowInsetsAnimationCompat.Callback(
+                        WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_STOP
+                    ) {
+                        override fun onProgress(
+                            insets: WindowInsetsCompat,
+                            runningAnimations: MutableList<WindowInsetsAnimationCompat>
+                        ): WindowInsetsCompat {
+                            // DISPATCH_MODE_STOP means this callback doesn't need to
+                            // adjust child view insets mid-animation - just pass through.
+                            return insets
+                        }
+
+                        override fun onEnd(animation: WindowInsetsAnimationCompat) {
+                            if (animation.typeMask and WindowInsetsCompat.Type.ime() != 0) {
+                                imeAnimationSettled++
+                            }
+                        }
+                    }
+                    ViewCompat.setWindowInsetsAnimationCallback(currentView, callback)
+                    onDispose {
+                        ViewCompat.setWindowInsetsAnimationCallback(currentView, null)
+                    }
+                }
+                var splitFocusRequestSignal by remember { mutableIntStateOf(0) }
+                // Bumped (never 0 after the first bump) to tell SplitTerminalPane
+                // "reclaim your own IME focus" - see its focusRequestSignal doc.
+                // Needed because the shared VirtualKeyBar's onTextEntryClosed
+                // below previously only knew how to focus the PRIMARY pane's own
+                // field, even while the split pane was the one actually focused.
+                // Fired synchronously from onTextEntryClosed's split branch (see
+                // its own doc there) the same way the non-split branch calls
+                // focusRequester.requestFocus() synchronously.
                 // Ground truth for "did WE just tell the keyboard to open or
                 // close", updated synchronously at every one of this file's
                 // own show()/hide() call sites (tap-to-toggle, Copy/Paste/
@@ -537,12 +590,6 @@ class MainActivity : ComponentActivity() {
                 // literally.
                 var ctrlActive by remember { mutableStateOf(false) }
                 var altActive by remember { mutableStateOf(false) }
-                // Bumped (never 0 after the first bump) to tell SplitTerminalPane
-                // "reclaim your own IME focus" - see its focusRequestSignal doc.
-                // Needed because the shared VirtualKeyBar's onTextEntryClosed
-                // below previously only knew how to focus the PRIMARY pane's own
-                // field, even while the split pane was the one actually focused.
-                var splitFocusRequestSignal by remember { mutableIntStateOf(0) }
                 // Same purpose as splitFocusRequestSignal above, but for
                 // multi-pane grid mode's own focused tile - see
                 // MultiPaneContainer/PaneContent's focusRequestSignal doc.
@@ -1079,6 +1126,21 @@ class MainActivity : ComponentActivity() {
                                         terminalExportLauncher.launch("terminator-session.txt")
                                     },
                                     focusRequestSignal = multiPaneFocusRequestSignal,
+                                    // Collapses every tile's HiddenPaneInputField down to this
+                                    // file's single insetsController instead of each tile deriving
+                                    // its own separate WindowInsetsControllerCompat from LocalView -
+                                    // same fix, same reasoning as SplitTerminalPane's
+                                    // onImeRequestShow/onImeRequestHide above (see
+                                    // HiddenPaneInputField's own doc). Multi-pane tiling/floating
+                                    // showed the identical swipe-glitch symptom split screen did,
+                                    // for the identical root cause: a second, independent IME
+                                    // controller instance per tile that MainActivity's own
+                                    // imeAnimationSettled ground-truth callback was never attached
+                                    // to, so it could issue a show()/hide() the ground-truth ended
+                                    // up not knowing about no matter how correctly the ground-truth
+                                    // itself was timed.
+                                    onImeRequestShow = { insetsController.show(WindowInsetsCompat.Type.ime()) },
+                                    onImeRequestHide = { insetsController.hide(WindowInsetsCompat.Type.ime()) },
                                     modifier = Modifier.weight(1f)
                                 )
                                 // VirtualKeyBar for multi-pane mode. Was also shown whenever
@@ -2207,6 +2269,25 @@ class MainActivity : ComponentActivity() {
                                             viewModel.adjustSplitScrollOffset(deltaLines, isEdgeAutoScroll = true)
                                         },
                                         wasLastScrollEdgeAutoScroll = { viewModel.lastSplitScrollWasEdgeAutoScroll },
+                                        // Collapses the split pane's HiddenPaneInputField down to
+                                        // MainActivity's own single insetsController instead of that
+                                        // field deriving its own separate WindowInsetsControllerCompat
+                                        // from LocalView - see HiddenPaneInputField's onRequestShow/
+                                        // onRequestHide doc for why. Before this, split screen had TWO
+                                        // independent controller instances (this file's insetsController,
+                                        // used for the primary pane and for splitFocusRequestSignal's
+                                        // own ground-truth WindowInsetsAnimationCompat.Callback below,
+                                        // AND HiddenPaneInputField's own locally-derived one) both able
+                                        // to issue show()/hide() against the same window - two call
+                                        // sites racing each other with neither aware of the other is
+                                        // exactly the kind of glitch a single ground-truth callback
+                                        // can't fully paper over no matter how correctly its own timing
+                                        // is read. Routing both calls through this same controller
+                                        // means every IME show/hide for split screen now goes through
+                                        // the one instance imeAnimationSettled's onEnd() callback is
+                                        // actually attached to.
+                                        onImeRequestShow = { insetsController.show(WindowInsetsCompat.Type.ime()) },
+                                        onImeRequestHide = { insetsController.hide(WindowInsetsCompat.Type.ime()) },
                                         // Supply More actions for the split pane's own
                                         // selection toolbar — clone opens a NEW split
                                         // with a copy of this split session (primary
@@ -2359,36 +2440,31 @@ class MainActivity : ComponentActivity() {
                                             // long-text page while typing into the split pane.
                                             val targetSplitId = splitRuntimeId
                                             if (splitPaneFocused && targetSplitId != null) {
-                                                if (settledKeyboardOpen) {
-                                                    // Signal the split pane to reclaim its own
-                                                    // HiddenPaneInputField focus - this is the ONLY
-                                                    // show() call for this path. It used to be paired
-                                                    // with a direct
-                                                    // currentView.post { insetsController.show(...) }
-                                                    // fired right here (reasoned as "reinforcing" the
-                                                    // signal path in case it lost the race) - but that
-                                                    // direct call uses MainActivity's own
-                                                    // insetsController/view, completely independent of
-                                                    // HiddenPaneInputField's own focusRequester. At the
-                                                    // moment this fires there is no focused field yet
-                                                    // for the system to attach the keyboard to - the
-                                                    // signal chain (splitFocusRequestSignal++ ->
-                                                    // SplitTerminalPane's LaunchedEffect -> focusToken++
-                                                    // -> HiddenPaneInputField's own
-                                                    // LaunchedEffect(activationKey) -> requestFocus() +
-                                                    // show() together) hasn't run yet. A show() request
-                                                    // with nothing focused is a well-known Android/
-                                                    // Compose race that fails SILENTLY, and once real
-                                                    // focus lands a frame later nothing re-fires show()
-                                                    // for it - the IME never (re)appears. That silent
-                                                    // failure is exactly the "swipe-right in split
-                                                    // screen, IME closes itself" bug: this path only
-                                                    // runs in split screen (the primary branch below
-                                                    // never had this second call), which is why the
-                                                    // same swipe worked fine there.
-                                                    splitFocusRequestSignal++
-                                                    lastKeyboardIntentOpen = true
-                                                }
+                                                // Fire the split pane's own refocus synchronously,
+                                                // right here - same as the non-split branch below
+                                                // does with focusRequester.requestFocus(). The
+                                                // earlier version deferred this until
+                                                // imeAnimationSettled confirmed the platform's own
+                                                // WindowInsetsAnimationCompat.Callback.onEnd() had
+                                                // fired, reasoning that firing synchronously could
+                                                // race a still-running close animation. But
+                                                // clearFocus(force = true) just above (in
+                                                // VirtualKeyBar) already drops Compose focus with
+                                                // NOTHING else claiming it in the same frame - with
+                                                // no field holding an input connection, the real
+                                                // platform IME starts its own hide animation
+                                                // immediately, before imeAnimationSettled ever gets a
+                                                // chance to change. That's what actually surfaced as
+                                                // "opens for a split second and closes again" here:
+                                                // the keyboard was genuinely closing (unclaimed-focus
+                                                // gap), and only afterward did the deferred branch
+                                                // catch up and reopen it - a real close-then-reopen,
+                                                // not a settling-animation timing issue. Requesting
+                                                // focus synchronously, in the same frame clearFocus
+                                                // ran, closes that gap the same way the non-split
+                                                // branch already does.
+                                                splitFocusRequestSignal++
+                                                lastKeyboardIntentOpen = true
                                             } else if (settledKeyboardOpen) {
                                                 focusRequester.requestFocus()
                                                 currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }

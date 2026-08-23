@@ -150,7 +150,14 @@ fun MultiPaneContainer(
     // doc on the identically-named param this threads down to. Bump on any
     // change (e.g. a counter incremented by the caller); 0 is the inert
     // default so existing callers need no wiring to keep today's behavior.
-    focusRequestSignal: Int = 0
+    focusRequestSignal: Int = 0,
+    // Routes every tile's HiddenPaneInputField show()/hide() through
+    // MainActivity's single insetsController - see PaneContent's own doc on
+    // these params (threaded down through TilingLayout/FloatingLayout to
+    // there). Null (the default) keeps any other caller's behavior
+    // unchanged.
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         MultiPaneToolbar(
@@ -181,7 +188,9 @@ fun MultiPaneContainer(
                     onToggleWakeUp = onToggleWakeUp,
                     wakeUpActiveFor = wakeUpActiveFor,
                     onSaveSession = onSaveSession,
-                    focusRequestSignal = focusRequestSignal
+                    focusRequestSignal = focusRequestSignal,
+                    onImeRequestShow = onImeRequestShow,
+                    onImeRequestHide = onImeRequestHide
                 )
                 PaneMode.Floating -> FloatingLayout(
                     panes = panes,
@@ -203,7 +212,9 @@ fun MultiPaneContainer(
                     onCloneSession = onCloneSession,
                     onToggleWakeUp = onToggleWakeUp,
                     wakeUpActiveFor = wakeUpActiveFor,
-                    onSaveSession = onSaveSession
+                    onSaveSession = onSaveSession,
+                    onImeRequestShow = onImeRequestShow,
+                    onImeRequestHide = onImeRequestHide
                 )
             }
         }
@@ -285,7 +296,9 @@ private fun TilingLayout(
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
     onSaveSession: ((String) -> Unit)? = null,
-    focusRequestSignal: Int = 0
+    focusRequestSignal: Int = 0,
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null
 ) {
     if (panes.isEmpty()) return
     // Grid shape: as close to square as possible, favoring one extra
@@ -342,6 +355,8 @@ private fun TilingLayout(
                                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
                                     onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
                                     focusRequestSignal = focusRequestSignal,
+                                    onImeRequestShow = onImeRequestShow,
+                                    onImeRequestHide = onImeRequestHide,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -456,7 +471,9 @@ private fun FloatingLayout(
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
     onSaveSession: ((String) -> Unit)? = null,
-    focusRequestSignal: Int = 0
+    focusRequestSignal: Int = 0,
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val density = LocalDensity.current.density
@@ -532,6 +549,8 @@ private fun FloatingLayout(
                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
                     onSaveSession = onSaveSession?.let { { it(pane.runtimeId) } },
                     focusRequestSignal = focusRequestSignal,
+                    onImeRequestShow = onImeRequestShow,
+                    onImeRequestHide = onImeRequestHide,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -598,7 +617,22 @@ private fun PaneContent(
     // field is requested directly, one hop; every pane in here goes through
     // this extra signal -> focusToken bump hop instead). Defaults to 0 so
     // every existing caller keeps its old behavior with no wiring needed.
-    focusRequestSignal: Int = 0
+    focusRequestSignal: Int = 0,
+    // Routes this tile's HiddenPaneInputField show()/hide() through
+    // MainActivity's single insetsController + WindowInsetsAnimationCompat
+    // ground-truth instead of HiddenPaneInputField deriving its own local
+    // controller - same fix and same reasoning as SplitTerminalPane's own
+    // onImeRequestShow/onImeRequestHide (see HiddenPaneInputField's doc on
+    // those params). Multi-pane mode showed the identical swipe-glitch
+    // symptom split screen did, for the identical reason: each tile's
+    // HiddenPaneInputField was deriving its own separate
+    // WindowInsetsControllerCompat from LocalView, a second controller
+    // instance able to issue show()/hide() against the same window
+    // independently of the one MainActivity's own ground-truth callback is
+    // attached to. Null (the default) keeps any other caller's behavior
+    // unchanged.
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null
 ) {
     // Per-pane pinch-zoom override, local to this composable only (not
     // persisted) - matches the lightweight-vs-primary-pane tradeoff this
@@ -941,7 +975,9 @@ private fun PaneContent(
                         onText = { text ->
                             scrollOffset = 0
                             onInput(text)
-                        }
+                        },
+                        onRequestShow = onImeRequestShow,
+                        onRequestHide = onImeRequestHide
                     )
                 }
             } else {
@@ -1003,13 +1039,37 @@ private fun PaneContent(
  * keystroke approach broke Enter specifically in split screen).
  */
 @Composable
-internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, activationKey: Any = active) {
+internal fun HiddenPaneInputField(
+    active: Boolean,
+    onText: (String) -> Unit,
+    activationKey: Any = active,
+    // Split-screen-only override: lets SplitTerminalPane route show()/hide()
+    // through MainActivity's single insetsController + WindowInsetsAnimation
+    // ground-truth instead of this field deriving its own local
+    // WindowInsetsControllerCompat below. Null (the default, and the only
+    // thing MultiPaneContainer's own tiling callers ever pass) keeps this
+    // field's original self-contained behavior exactly as-is - multi-pane
+    // mode has no glitch and isn't part of this change. Only SplitTerminalPane
+    // supplies these, collapsing what used to be a 3rd independent
+    // insetsController (this field's own, derived from LocalView here) down
+    // to zero for the split-screen path - every IME show/hide call for split
+    // screen now originates from the same single controller MainActivity's
+    // own WindowInsetsAnimationCompat.Callback is already attached to, so
+    // there's no longer a second, unsynchronized controller instance that
+    // could issue a show()/hide() the platform's own animation callback
+    // doesn't know about.
+    onRequestShow: (() -> Unit)? = null,
+    onRequestHide: (() -> Unit)? = null
+) {
     val placeholder = "\u200B"
     var value by remember { mutableStateOf(TextFieldValue(placeholder, selection = TextRange(placeholder.length))) }
     var consumedBaseline by remember { mutableStateOf(placeholder) }
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     val view = androidx.compose.ui.platform.LocalView.current
+    // Only actually derived/used when the caller didn't supply
+    // onRequestShow/onRequestHide (i.e. every MultiPaneContainer tiling
+    // caller) - see the show()/hide() call sites below.
     val insetsController = remember(view) {
         val activity = view.context as? android.app.Activity
         activity?.window?.let { window ->
@@ -1045,7 +1105,11 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             // on swipe-back in split screen. Calling both directly,
             // synchronously, closes that extra frame of delay.
             focusRequester.requestFocus()
-            insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+            if (onRequestShow != null) {
+                onRequestShow()
+            } else {
+                insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+            }
         } else {
             // Mirrors the primary pane's own tap-to-close path in
             // MainActivity (focusManager.clearFocus() + a synchronous
@@ -1063,7 +1127,11 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             // flips to inactive, gives split-screen and multi-pane the same
             // clean full open/close animation the primary pane already has.
             focusManager.clearFocus()
-            insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+            if (onRequestHide != null) {
+                onRequestHide()
+            } else {
+                insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+            }
         }
     }
 
@@ -1080,7 +1148,11 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
         onDispose {
             if (latestActive.value) {
                 focusManager.clearFocus()
-                insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+                if (onRequestHide != null) {
+                    onRequestHide()
+                } else {
+                    insetsController?.hide(androidx.core.view.WindowInsetsCompat.Type.ime())
+                }
             }
         }
     }

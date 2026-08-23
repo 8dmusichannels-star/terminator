@@ -200,7 +200,16 @@ fun SplitTerminalPane(
     // is rendered right inside this composable so it's anchored to the
     // pane's own Box and inherits its own Z-order, rather than floating
     // somewhere under the primary pane's coordinate space.
-    moreMenuActions: MoreMenuActions? = null
+    moreMenuActions: MoreMenuActions? = null,
+    // Routes this pane's HiddenPaneInputField show()/hide() calls through
+    // MainActivity's single insetsController + WindowInsetsAnimationCompat
+    // ground-truth instead of HiddenPaneInputField deriving its own local
+    // controller. Split screen only - see HiddenPaneInputField's own doc on
+    // onRequestShow/onRequestHide for why. Null (the default) falls back to
+    // that field's original self-contained behavior, so any other caller of
+    // this composable keeps working unchanged.
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null
 ) {
     // Direct-tap-to-type, no separate "Type here..." input box - tapping
     // the terminal area itself focuses it and brings up the keyboard, same
@@ -624,7 +633,9 @@ fun SplitTerminalPane(
                             activationKey = focusToken,
                             onText = { text ->
                                 onInput(text)
-                            }
+                            },
+                            onRequestShow = onImeRequestShow,
+                            onRequestHide = onImeRequestHide
                         )
                         // actionModeController.show()/hide() above only
                         // ever flip isVisible - nothing was reading that
