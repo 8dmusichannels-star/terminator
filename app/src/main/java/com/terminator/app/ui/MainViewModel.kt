@@ -20,6 +20,7 @@
 
 package com.terminator.app.ui
 
+import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.terminator.app.NotificationSessionInfo
@@ -1288,6 +1289,6 @@ private fun SessionEntry.toSpec(): com.terminator.emulator.SessionSpec = when (t
         com.terminator.emulator.SessionSpec.CommandArg(name, commandPath ?: "/system/bin/sh", workingDirectory)
     com.terminator.app.session.SessionType.FILE_BASE ->
         com.terminator.emulator.SessionSpec.FileBase(
-            name, filePath ?: "/sdcard/Terminator", fileName ?: "session.sh", workingDirectory
+            name, filePath ?: "${Environment.getExternalStorageDirectory().path}/Terminator", fileName ?: "session.sh", workingDirectory
         )
 }

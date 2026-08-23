@@ -132,6 +132,7 @@ fun MultiPaneContainer(
     onSetMode: (PaneMode) -> Unit,
     onAddPaneRequested: () -> Unit,
     onExitMultiPane: () -> Unit,
+    modifier: Modifier = Modifier,
     onWantsMouseEvents: (String) -> Boolean = { false },
     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
     // "More" actions (clone/wake-lock/save) for each tile's own Copy/Paste
@@ -147,8 +148,7 @@ fun MultiPaneContainer(
     // doc on the identically-named param this threads down to. Bump on any
     // change (e.g. a counter incremented by the caller); 0 is the inert
     // default so existing callers need no wiring to keep today's behavior.
-    focusRequestSignal: Int = 0,
-    modifier: Modifier = Modifier
+    focusRequestSignal: Int = 0
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         MultiPaneToolbar(
@@ -560,6 +560,7 @@ private fun PaneContent(
     onMeasuredSize: (columns: Int, rows: Int) -> Unit,
     fontDensity: Float,
     showDragHandle: Boolean,
+    modifier: Modifier = Modifier,
     onDragStart: () -> Unit = {},
     onHeaderDrag: (Offset) -> Unit = {},
     onResizeDrag: (Offset) -> Unit = {},
@@ -595,8 +596,7 @@ private fun PaneContent(
     // field is requested directly, one hop; every pane in here goes through
     // this extra signal -> focusToken bump hop instead). Defaults to 0 so
     // every existing caller keeps its old behavior with no wiring needed.
-    focusRequestSignal: Int = 0,
-    modifier: Modifier = Modifier
+    focusRequestSignal: Int = 0
 ) {
     // Per-pane pinch-zoom override, local to this composable only (not
     // persisted) - matches the lightweight-vs-primary-pane tradeoff this
@@ -1040,7 +1040,6 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             // keyboard staying fully closed for the better part of a second
             // on swipe-back in split screen. Calling both directly,
             // synchronously, closes that extra frame of delay.
-            android.util.Log.d("SplitIMEDebug", "direct: requesting focus + show, active=$active activationKey=$activationKey")
             focusRequester.requestFocus()
             insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
         }
@@ -1049,7 +1048,6 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
     BasicTextField(
         value = value,
         onValueChange = { new ->
-            android.util.Log.d("SplitIMEDebug", "onValueChange fired: new.text=${new.text.map{it.code}} consumedBaseline=${consumedBaseline.map{it.code}}")
             val newText = new.text
             when {
                 newText.length > consumedBaseline.length && newText.startsWith(consumedBaseline) -> {
@@ -1080,7 +1078,6 @@ internal fun HiddenPaneInputField(active: Boolean, onText: (String) -> Unit, act
             .alpha(0f)
             .focusRequester(focusRequester)
             .onFocusChanged {
-                android.util.Log.d("SplitIMEDebug", "HiddenPaneInputField onFocusChanged: isFocused=${it.isFocused} active=$active")
                 if (it.isFocused && consumedBaseline != placeholder) {
                     consumedBaseline = placeholder
                     value = TextFieldValue(placeholder, selection = TextRange(placeholder.length))

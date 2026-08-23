@@ -110,6 +110,7 @@ private val row2 = listOf(
 fun VirtualKeyBar(
     onKeyPressed: (VirtualKey) -> Unit,
     onTextSubmitted: (String) -> Unit = {},
+    modifier: Modifier = Modifier,
     ctrlActive: Boolean = false,
     altActive: Boolean = false,
     // The hidden terminal input field loses focus the moment the user taps
@@ -142,8 +143,7 @@ fun VirtualKeyBar(
     // needing the titlebar to be visible or reaching across for the edge
     // swipe - purely an extra entry point into the existing drawer, the
     // drawer's own contents/behavior are untouched.
-    onMenuClicked: () -> Unit = {},
-    modifier: Modifier = Modifier
+    onMenuClicked: () -> Unit = {}
 ) {
     var textEntryOpen by remember { mutableStateOf(false) }
     var textEntryValue by remember { mutableStateOf("") }

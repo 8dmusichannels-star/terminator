@@ -79,6 +79,7 @@ fun SessionDrawer(
     visible: Boolean,
     sessions: List<SessionEntry>,
     runningSessions: List<RunningSession> = emptyList(),
+    modifier: Modifier = Modifier,
     activeSessionId: String? = null,
     onSessionSelected: (SessionEntry) -> Unit,
     onRunningSessionSelected: (String) -> Unit = {},
@@ -123,8 +124,7 @@ fun SessionDrawer(
     onSettingsClicked: () -> Unit,
     onToggleFavorite: (SessionEntry) -> Unit,
     onSetDefault: (SessionEntry) -> Unit,
-    onDismissRequest: () -> Unit,
-    modifier: Modifier = Modifier
+    onDismissRequest: () -> Unit
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -155,7 +155,7 @@ fun SessionDrawer(
                     onClick = onDismissRequest
                 )
         ) {
-            var dragOffset by remember { mutableStateOf(0f) }
+            var dragOffset by remember { mutableFloatStateOf(0f) }
             val drawerWidth = 300.dp
             val drawerWidthPx = with(LocalDensity.current) { drawerWidth.toPx() }
 

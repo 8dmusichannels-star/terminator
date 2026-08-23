@@ -20,6 +20,7 @@
 
 package com.terminator.app.session
 
+import android.os.Environment
 import java.util.UUID
 
 enum class SessionType { COMMAND_ARG, FILE_BASE }
@@ -57,7 +58,7 @@ data class SessionEntry(
     fun resolvedExecutable(): String = when (type) {
         SessionType.COMMAND_ARG -> commandPath ?: "/system/bin/sh"
         SessionType.FILE_BASE -> {
-            val dir = filePath ?: "/sdcard/Terminator"
+            val dir = filePath ?: "${Environment.getExternalStorageDirectory().path}/Terminator"
             val name = fileName ?: "session.sh"
             "$dir/$name".replace("//", "/")
         }

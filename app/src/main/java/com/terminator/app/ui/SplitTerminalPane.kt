@@ -43,6 +43,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -79,7 +81,7 @@ import com.terminator.emulator.TerminalView
  */
 @Composable
 fun SplitDragHandle(onDrag: (deltaPx: Float, containerHeightPx: Float) -> Unit) {
-    var containerHeightPx by remember { mutableStateOf(0f) }
+    var containerHeightPx by remember { mutableFloatStateOf(0f) }
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -218,7 +220,7 @@ fun SplitTerminalPane(
     // reliably re-requests focus and re-shows the keyboard - without it,
     // tapping back into the split pane left the virtual key bar (which
     // gates on the real IME/WindowInsets state) never reappearing.
-    var focusToken by remember(runtimeId) { mutableStateOf(0) }
+    var focusToken by remember(runtimeId) { mutableIntStateOf(0) }
     // Consumes focusRequestSignal (see its own doc) - any change from
     // MainActivity means "reclaim this pane's IME focus", identical to what
     // a real re-tap into this pane does via the gesture blocks below.
@@ -293,7 +295,6 @@ fun SplitTerminalPane(
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                android.util.Log.d("ToolbarDebug", "SplitTerminalPane composing, buffer=${buffer != null}, runtimeId=$runtimeId")
                 if (buffer != null) {
                     // Own native selection state (see TerminalView's
                     // selectionState param doc) - independent of the
@@ -349,7 +350,6 @@ fun SplitTerminalPane(
                     // the list clears and refills (e.g. selection drag re-anchors) the
                     // LaunchedEffect key doesn't change and the toolbar never refreshes.
                     LaunchedEffect(paneSelectionState.selectedTexts.toList()) {
-                        android.util.Log.d("ToolbarDebug", "split LaunchedEffect fired, isEmpty=${paneSelectionState.selectedTexts.isEmpty()} moreMenuActions=${moreMenuActions != null}")
                         if (paneSelectionState.selectedTexts.isEmpty()) {
                             actionModeController.hide()
                         } else {
@@ -499,10 +499,6 @@ fun SplitTerminalPane(
                                     isFocused = true
                                     onFocusChanged(true)
                                     val mouseWanted = wantsMouseEvents()
-                                    android.util.Log.d(
-                                        "SplitMouseDebug",
-                                        "down at=${down.position} mouseWanted=$mouseWanted charW=$charWidthPx charH=$charHeightPx runtimeId=$runtimeId"
-                                    )
 
                                     if (!mouseWanted || charWidthPx <= 0f || charHeightPx <= 0f) {
                                         // No mouse reporting active for this session.
@@ -591,7 +587,6 @@ fun SplitTerminalPane(
                                         (offset.x / charWidthPx).toInt() to (offset.y / charHeightPx).toInt()
 
                                     var (col, row) = cellOf(down.position)
-                                    android.util.Log.d("SplitMouseDebug", "PRESS col=$col row=$row")
                                     onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
 
                                     while (true) {
@@ -600,14 +595,12 @@ fun SplitTerminalPane(
                                         change.consume()
                                         if (!change.pressed) {
                                             val (rCol, rRow) = cellOf(change.position)
-                                            android.util.Log.d("SplitMouseDebug", "RELEASE col=$rCol row=$rRow")
                                             onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
                                             break
                                         }
                                         val (dCol, dRow) = cellOf(change.position)
                                         if (dCol != col || dRow != row) {
                                             col = dCol; row = dRow
-                                            android.util.Log.d("SplitMouseDebug", "DRAG col=$col row=$row")
                                             onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
                                         }
                                     }
@@ -626,14 +619,11 @@ fun SplitTerminalPane(
                             modifier = Modifier.fillMaxWidth().fillMaxHeight(),
                             debugLabel = "split"
                         )
-                        android.util.Log.d("SplitIMEDebug", "HiddenPaneInputField: active=$isFocused focusToken=$focusToken runtimeId=$runtimeId")
                         HiddenPaneInputField(
                             active = isFocused,
                             activationKey = focusToken,
                             onText = { text ->
-                                android.util.Log.d("SplitIMEDebug", "onText called: ${text.map{it.code}}")
                                 onInput(text)
-                                android.util.Log.d("SplitIMEDebug", "onInput returned")
                             }
                         )
                         // actionModeController.show()/hide() above only

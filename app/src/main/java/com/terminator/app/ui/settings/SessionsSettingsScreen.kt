@@ -21,6 +21,7 @@
 package com.terminator.app.ui.settings
 
 import android.content.Intent
+import android.os.Environment
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -245,7 +246,7 @@ private fun AddSessionDialog(
     var name by remember { mutableStateOf(existing?.name ?: "") }
     var type by remember { mutableStateOf(existing?.type ?: SessionType.COMMAND_ARG) }
     var commandPath by remember { mutableStateOf(existing?.commandPath ?: "") }
-    var filePath by remember { mutableStateOf(existing?.filePath ?: "/sdcard/Terminator") }
+    var filePath by remember { mutableStateOf(existing?.filePath ?: "${Environment.getExternalStorageDirectory().path}/Terminator") }
     var fileName by remember { mutableStateOf(existing?.fileName ?: "session.sh") }
     // Entry path: the directory the spawned process starts in (its cwd /
     // $HOME). Blank means "no override" - TerminalSession falls back to
