@@ -43,6 +43,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -79,7 +81,7 @@ import com.terminator.emulator.TerminalView
  */
 @Composable
 fun SplitDragHandle(onDrag: (deltaPx: Float, containerHeightPx: Float) -> Unit) {
-    var containerHeightPx by remember { mutableStateOf(0f) }
+    var containerHeightPx by remember { mutableFloatStateOf(0f) }
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -133,6 +135,18 @@ fun SplitTerminalPane(
     // today only the primary pane's own hidden field does via its own
     // callback). Defaults to a no-op so nothing else needs to change.
     onFocusChanged: (Boolean) -> Unit = {},
+    // External "reclaim focus" trigger - same shape as MultiPaneContainer's
+    // activationKey pattern, but driven from OUTSIDE this pane (MainActivity's
+    // shared VirtualKeyBar's onTextEntryClosed) rather than by this pane's
+    // own tap gesture. Swiping the key bar back from its long-text page while
+    // this pane was the focused one used to always hand focus back to the
+    // PRIMARY pane's hidden field (the only thing MainActivity's
+    // onTextEntryClosed knew how to do), leaving this pane's own
+    // HiddenPaneInputField with no input connection at all - the real IME
+    // then closed itself with nothing focused to reopen it for. Bumping this
+    // (any change from the caller's last value) re-triggers the same
+    // focusToken bump / IME re-show a real re-tap into this pane would.
+    focusRequestSignal: Int = 0,
     // Mouse reporting for THIS pane's own session (mc/vim/htop's own
     // xterm-mouse-mode programs) - see MainViewModel.sessionWantsMouseEvents/
     // sendMouseEventTo's docs for why these need to be per-runtimeId rather
@@ -206,7 +220,30 @@ fun SplitTerminalPane(
     // reliably re-requests focus and re-shows the keyboard - without it,
     // tapping back into the split pane left the virtual key bar (which
     // gates on the real IME/WindowInsets state) never reappearing.
-    var focusToken by remember(runtimeId) { mutableStateOf(0) }
+    var focusToken by remember(runtimeId) { mutableIntStateOf(0) }
+    // Consumes focusRequestSignal (see its own doc) - any change from
+    // MainActivity means "reclaim this pane's IME focus", identical to what
+    // a real re-tap into this pane does via the gesture blocks below.
+    // Skips signal 0 so the very first composition (default value) doesn't
+    // fire this - only an actual caller-driven bump should.
+    //
+    // No artificial delay needed anymore. VirtualKeyBar's own
+    // LaunchedEffect(textEntryOpen) now force-clears the outgoing long-text
+    // field's Compose focus (focusManager.clearFocus(force = true))
+    // synchronously, right when the swipe-back starts, before it ever fires
+    // onTextEntryClosed() - so by the time this signal bumps, the old field
+    // has already let go of focus regardless of where its 120ms exit
+    // animation still is. Requesting focus here immediately no longer loses
+    // the race the old comment described, and the real IME never sees a
+    // focus-less gap in between to visibly close and reopen for - which is
+    // what used to surface as the keyboard flickering shut on every
+    // swipe-back in split screen.
+    LaunchedEffect(focusRequestSignal) {
+        if (focusRequestSignal != 0) {
+            isFocused = true
+            focusToken++
+        }
+    }
     // Mirrors isFocused up to MainActivity on every change, including the
     // initial true (this pane is typable immediately on open, same as
     // isFocused's own doc above) - not just the later awaitEachGesture
@@ -258,7 +295,6 @@ fun SplitTerminalPane(
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                android.util.Log.d("ToolbarDebug", "SplitTerminalPane composing, buffer=${buffer != null}, runtimeId=$runtimeId")
                 if (buffer != null) {
                     // Own native selection state (see TerminalView's
                     // selectionState param doc) - independent of the
@@ -314,7 +350,6 @@ fun SplitTerminalPane(
                     // the list clears and refills (e.g. selection drag re-anchors) the
                     // LaunchedEffect key doesn't change and the toolbar never refreshes.
                     LaunchedEffect(paneSelectionState.selectedTexts.toList()) {
-                        android.util.Log.d("ToolbarDebug", "split LaunchedEffect fired, isEmpty=${paneSelectionState.selectedTexts.isEmpty()} moreMenuActions=${moreMenuActions != null}")
                         if (paneSelectionState.selectedTexts.isEmpty()) {
                             actionModeController.hide()
                         } else {
@@ -325,12 +360,29 @@ fun SplitTerminalPane(
                                     paneSelectionState.clear()
                                     actionModeController.hide()
                                 },
-                                onPaste = clipboardManager.getText()?.text?.let { pasted ->
-                                    {
-                                        onInput(pasted)
-                                        paneSelectionState.clear()
-                                        actionModeController.hide()
+                                onPaste = {
+                                    // Always offered (button never hidden for an
+                                    // empty clipboard) - read the clipboard at TAP
+                                    // time, not at LaunchedEffect-fire time. See
+                                    // MultiPaneContainer's identical fix/doc: the
+                                    // old `clipboardManager.getText()?.text?.let
+                                    // { pasted -> {...} }` pattern read the
+                                    // clipboard once, synchronously, the instant
+                                    // this LaunchedEffect fired (selection
+                                    // changed) - an empty clipboard at that exact
+                                    // moment made onPaste null and vanished the
+                                    // Paste button from the bar for the rest of
+                                    // that selection. Matches the primary pane's
+                                    // own onPaste (MainActivity).
+                                    clipboardManager.getText()?.text?.let { pasted ->
+                                        if (pasted.isNotEmpty()) {
+                                            // Same CR/LF fixup as the primary
+                                            // pane's onPaste.
+                                            onInput(pasted.replace('\n', '\r'))
+                                        }
                                     }
+                                    paneSelectionState.clear()
+                                    actionModeController.hide()
                                 },
                                 onMore = moreMenuActions?.let { _ -> { moreVisible = true } }
                             )
@@ -428,12 +480,25 @@ fun SplitTerminalPane(
                                     // route the PRESS event to the right session. focusToken is
                                     // intentionally NOT bumped here — see the detectTapGestures
                                     // block above for why (long-press must not trigger IME show).
+                                    //
+                                    // onFocusChanged(true) must ALSO fire here, not just isFocused
+                                    // itself: this awaitEachGesture loop runs on every touch-down,
+                                    // ahead of the sibling detectTapGestures block (which only
+                                    // fires onTap once a gesture resolves as a real tap, i.e. after
+                                    // finger-lift). Any press that resolves as a drag, long-press,
+                                    // or gets consumed as a mouse-report event never reaches that
+                                    // onTap at all - so if this block only wrote the local
+                                    // `isFocused` var (a same-value no-op once it's already true),
+                                    // MainActivity's splitPaneFocused never learned this pane was
+                                    // focused. That's what left VirtualKeyBar routing CTRL/ALT and
+                                    // regular key presses to the primary session while the split
+                                    // pane looked focused on screen: onKeyPressed's own debug log
+                                    // showed splitPaneFocused=false even after tapping the split
+                                    // pane, because only a clean tap (not a press that becomes a
+                                    // drag/selection/mouse-event) ever reached the other block.
                                     isFocused = true
+                                    onFocusChanged(true)
                                     val mouseWanted = wantsMouseEvents()
-                                    android.util.Log.d(
-                                        "SplitMouseDebug",
-                                        "down at=${down.position} mouseWanted=$mouseWanted charW=$charWidthPx charH=$charHeightPx runtimeId=$runtimeId"
-                                    )
 
                                     if (!mouseWanted || charWidthPx <= 0f || charHeightPx <= 0f) {
                                         // No mouse reporting active for this session.
@@ -522,7 +587,6 @@ fun SplitTerminalPane(
                                         (offset.x / charWidthPx).toInt() to (offset.y / charHeightPx).toInt()
 
                                     var (col, row) = cellOf(down.position)
-                                    android.util.Log.d("SplitMouseDebug", "PRESS col=$col row=$row")
                                     onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
 
                                     while (true) {
@@ -531,14 +595,12 @@ fun SplitTerminalPane(
                                         change.consume()
                                         if (!change.pressed) {
                                             val (rCol, rRow) = cellOf(change.position)
-                                            android.util.Log.d("SplitMouseDebug", "RELEASE col=$rCol row=$rRow")
                                             onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
                                             break
                                         }
                                         val (dCol, dRow) = cellOf(change.position)
                                         if (dCol != col || dRow != row) {
                                             col = dCol; row = dRow
-                                            android.util.Log.d("SplitMouseDebug", "DRAG col=$col row=$row")
                                             onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
                                         }
                                     }
@@ -560,7 +622,9 @@ fun SplitTerminalPane(
                         HiddenPaneInputField(
                             active = isFocused,
                             activationKey = focusToken,
-                            onText = { text -> onInput(text) }
+                            onText = { text ->
+                                onInput(text)
+                            }
                         )
                         // actionModeController.show()/hide() above only
                         // ever flip isVisible - nothing was reading that

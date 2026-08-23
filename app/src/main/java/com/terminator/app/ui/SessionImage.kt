@@ -26,9 +26,15 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.net.Uri
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import com.caverock.androidsvg.SVG
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Every session-picture display site (titlebar, drawer rows, the Settings >
@@ -54,6 +60,9 @@ import com.caverock.androidsvg.SVG
  * every previously-working format keeps working unchanged.
  */
 private const val SESSION_IMAGE_RENDER_PX = 128
+
+/** Process-lifetime cache keyed by uri string - see rememberSessionImage's doc. */
+private val sessionImageCache = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
 
 private fun sniffIsSvg(bytes: ByteArray): Boolean {
     // Only need to look at a small header window - "<svg" (or an XML
@@ -100,15 +109,31 @@ fun decodeSessionImage(context: Context, uri: String): Bitmap? = runCatching {
 }.getOrNull()
 
 /**
- * Compose-friendly wrapper: decodes once per distinct [uri] (via
- * remember(uri), same caching behavior every call site already had with
- * its own inline remember block) using the current LocalContext. Returns
- * null for a null/blank uri without attempting a decode.
+ * Compose-friendly wrapper: decodes once per distinct [uri] using the
+ * current LocalContext. Returns null for a null/blank uri without
+ * attempting a decode.
+ *
+ * Decode runs on Dispatchers.IO inside a LaunchedEffect keyed on uri, not
+ * synchronously inside remember(uri) { ... } - the old version did the
+ * decode (file read + SVG parse/render) directly on the composition/main
+ * thread, and every session row in the drawer/settings list calls this
+ * once, so any recomposition re-ran that decode chain on the main thread
+ * for every visible row - the stutter/freeze reported after adding a
+ * session photo. A process-lifetime cache also avoids re-decoding the same
+ * uri across drawer re-opens.
  */
 @Composable
 fun rememberSessionImage(uri: String?): Bitmap? {
     val context = LocalContext.current
-    return remember(uri) {
-        uri?.takeIf { it.isNotBlank() }?.let { decodeSessionImage(context, it) }
+    var bitmap by remember(uri) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(uri) {
+        val target = uri?.takeIf { it.isNotBlank() }
+        bitmap = when {
+            target == null -> null
+            else -> sessionImageCache[target] ?: withContext(Dispatchers.IO) {
+                decodeSessionImage(context, target)
+            }?.also { sessionImageCache[target] = it }
+        }
     }
+    return bitmap
 }

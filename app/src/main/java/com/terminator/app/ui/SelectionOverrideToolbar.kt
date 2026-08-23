@@ -20,19 +20,26 @@
 package com.terminator.app.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.VerticalSplit
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -85,14 +92,12 @@ class ActionModeController {
      *  nullable exactly as before - null hides that button rather than
      *  greying it out, so e.g. an empty clipboard shows Copy only. */
     fun show(onCopy: () -> Unit, onPaste: (() -> Unit)?, onMore: (() -> Unit)?) {
-        android.util.Log.d("ToolbarDebug", "ActionModeController@${System.identityHashCode(this)}.show called")
         this.onCopy = onCopy
         this.onPaste = onPaste
         this.onMore = onMore
         isVisible = true
     }
     fun hide() {
-        android.util.Log.d("ToolbarDebug", "ActionModeController@${System.identityHashCode(this)}.hide called")
         isVisible = false
         onCopy = null
         onPaste = null
@@ -111,7 +116,15 @@ fun rememberActionModeController(): ActionModeController {
  *  selection itself and both edges, without needing the selection's own
  *  rect (which native ActionMode/TextToolbar positioning relied on and
  *  which doesn't reliably reach this app's SelectionContainer version -
- *  see this file's top doc). */
+ *  see this file's top doc).
+ *
+ *  Visual shape/color follow the system's own floating selection toolbar
+ *  (the dark full-capsule pill with a trailing overflow dot-icon,
+ *  Material-You-tinted) rather than the earlier flat rounded-rect bar -
+ *  Copy/Paste/More stay exactly the same three actions/callbacks, this is
+ *  purely the container's shape and color scheme. MoreActionsPopup (the
+ *  menu that opens off the More button) is intentionally untouched - only
+ *  this bar's own look changed. */
 @Composable
 fun SelectionActionBar(controller: ActionModeController) {
     if (!controller.isVisible) return
@@ -121,17 +134,50 @@ fun SelectionActionBar(controller: ActionModeController) {
         properties = PopupProperties(focusable = false),
     ) {
         Surface(
-            shape = RoundedCornerShape(10.dp),
-            color = Color(0xFF1F1F1F),
-            shadowElevation = 8.dp,
+            // Full capsule, not a fixed corner radius - matches the
+            // system toolbar's pill shape at any bar height, the same way
+            // the reference screenshot's own pill scales with its content.
+            shape = CircleShape,
+            // Material You's own tonal surface rather than a hardcoded
+            // dark gray, so this bar tints along with the rest of the
+            // app's dynamic color instead of looking like a fixed asset
+            // dropped on top of it - surfaceContainerHigh sits close to
+            // the reference's dark neutral pill while still tracking the
+            // active wallpaper-derived palette.
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            shadowElevation = 6.dp,
         ) {
-            Row(modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .height(IntrinsicSize.Min)
+                    .padding(vertical = 4.dp)
+            ) {
                 SelectionBarButton("Copy", onClick = copy)
                 controller.onPaste?.let { paste ->
                     SelectionBarButton("Paste", onClick = paste)
                 }
                 controller.onMore?.let { more ->
-                    SelectionBarButton("More", onClick = more)
+                    // Trailing hairline divider before the overflow icon,
+                    // same as the reference toolbar's separator between
+                    // its label and its dot-menu - only drawn when More
+                    // is actually present, so a Copy-only bar (no
+                    // paste/more) stays a plain pill with no dangling
+                    // divider.
+                    Divider(
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f),
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(1.dp)
+                            .padding(vertical = 8.dp)
+                    )
+                    IconButton(onClick = more, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            Icons.Filled.MoreVert,
+                            contentDescription = "More",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
             }
         }
@@ -141,7 +187,7 @@ fun SelectionActionBar(controller: ActionModeController) {
 private fun SelectionBarButton(label: String, onClick: () -> Unit) {
     Text(
         text = label,
-        color = Color.White,
+        color = MaterialTheme.colorScheme.onSurface,
         style = MaterialTheme.typography.labelLarge,
         modifier = Modifier
             .clickable(
@@ -176,7 +222,6 @@ private object NoOpTextToolbar : androidx.compose.ui.platform.TextToolbar {
         onCutRequested: (() -> Unit)?,
         onSelectAllRequested: (() -> Unit)?
     ) {
-        android.util.Log.d("ToolbarDebug", "NoOpTextToolbar.showMenu blocked (would have shown Compose's own menu)")
         // Intentionally empty - never show Compose's own menu.
     }
     override fun hide() {}

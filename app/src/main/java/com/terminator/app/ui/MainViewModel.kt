@@ -20,6 +20,7 @@
 
 package com.terminator.app.ui
 
+import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.terminator.app.NotificationSessionInfo
@@ -521,19 +522,36 @@ class MainViewModel(
                 session.write(data)
             }
         }
-        // Fires once, off the pty reader thread, the moment this process is
-        // confirmed gone (natural exit, SIGTERM, or SIGKILL). Flips this
-        // runtime's row in the drawer to an "exited" state instead of
-        // silently leaving a dead session looking alive.
+        // Fires once, either off the pty reader thread (natural EOF) or
+        // synchronously on the calling thread (kill()/destroy(), which call
+        // markExited() inline - see TerminalSession). Flips this runtime's
+        // row in the drawer to an "exited" state instead of silently
+        // leaving a dead session looking alive.
+        //
+        // MUST update _uiState.value directly here, not via
+        // viewModelScope.launch { ... }. Launching a coroutine defers the
+        // update by at least one dispatch, and that deferral is exactly
+        // what caused "Ctrl+D kills the session, then Enter does nothing":
+        // killActiveSessionHard()/killSessionHard() call sendCtrlDOrKill()
+        // -> kill() -> markExited() -> this callback, all synchronously on
+        // the UI thread when the shell itself is in the foreground - so by
+        // the time markExited() returns, the exit is already real, but
+        // with launch{} _uiState.value hadn't been published yet. If the
+        // user's next keystroke (Enter) landed before that queued
+        // coroutine got to run, the activeIsExited/splitExited guards in
+        // MainActivity read a stale exited=false and Enter's \r got
+        // written into a pty whose fd kill() had already closed - silently
+        // swallowed, looked like the app just stopped responding.
+        // MutableStateFlow.value's setter is a plain atomic CAS - safe to
+        // call from any thread, including the pty reader thread's
+        // natural-EOF path - so no dispatch is needed here.
         session.setOnExited {
-            viewModelScope.launch {
-                _uiState.value = _uiState.value.copy(
-                    runningSessions = _uiState.value.runningSessions.map {
-                        if (it.runtimeId == runtimeId) it.copy(exited = true) else it
-                    }
-                )
-                bumpVersion()
-            }
+            _uiState.value = _uiState.value.copy(
+                runningSessions = _uiState.value.runningSessions.map {
+                    if (it.runtimeId == runtimeId) it.copy(exited = true) else it
+                }
+            )
+            bumpVersion()
         }
 
         session.start(listener, columns = columns, rows = rows)
@@ -614,6 +632,54 @@ class MainViewModel(
         }
     }
 
+    /**
+     * "All clear session" - kills every currently RUNNING session (classic
+     * view, split partner, and every multi-pane instance alike) in one go,
+     * then relaunches a single fresh default session so the user never
+     * lands on an empty screen. Deliberately only touches runtime state:
+     * saved session profiles in [MainUiState.sessions] (Settings > Sessions)
+     * are never read from or written to here - "running" and "saved" are
+     * kept as separate concerns the same way [killSession] already treats
+     * them for a single session.
+     *
+     * Reimplements killSession's per-runtime cleanup as one batched pass
+     * instead of calling killSession(id) in a loop, so a large pane group
+     * collapses via a single _uiState update/recomposition rather than one
+     * per running session.
+     */
+    fun clearAllSessions() {
+        val runtimeIds = _uiState.value.runningSessions.map { it.runtimeId }
+        if (runtimeIds.isEmpty()) return
+
+        runtimeIds.forEach { id ->
+            liveSessions.remove(id)?.kill()
+            liveEntries.remove(id)
+            paneColumnsRows.remove(id)
+        }
+
+        _uiState.value = _uiState.value.copy(
+            runningSessions = emptyList(),
+            activeSessionId = null,
+            sessionTextSizes = emptyMap(),
+            scrollOffset = 0,
+            splitScrollOffset = 0,
+            splitRuntimeId = null,
+            broadcastInput = false,
+            panes = emptyList(),
+            focusedPaneRuntimeId = null
+        )
+
+        // Land on a fresh default session rather than an empty screen -
+        // same fallback chain openSession/duplicateActiveSession already
+        // use elsewhere: the flagged default, or just the first saved
+        // session if none is flagged.
+        val defaultEntry = _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+        if (defaultEntry != null) {
+            launchLiveSession(runtimeId = defaultEntry.id, entry = defaultEntry)
+        }
+    }
+
     /** Flips one session's wakeUp flag - see TerminatorApp.requestToggleWakeUp
      *  for what "awake" actually changes. Symmetric: calling this again on
      *  an already-awake session turns it back off, which is what lets both
@@ -640,6 +706,29 @@ class MainViewModel(
     fun killActiveSessionHard() {
         val activeId = _uiState.value.activeSessionId ?: return
         liveSessions[activeId]?.sendCtrlDOrKill()
+    }
+
+    /**
+     * Same foreground-aware Ctrl+D behaviour as [killActiveSessionHard] but
+     * targets an arbitrary runtime by id rather than the active session.
+     * Used by the split pane's onInput so Ctrl+D there gets the same
+     * treatment as the primary pane: SIGKILL when the shell itself is in the
+     * foreground (exit is instantaneous → exited flag propagates immediately
+     * → the next Enter correctly sees splitExited=true and tears the runtime
+     * down), or plain EOT when something else has the foreground (vim, top,
+     * etc.) so that program can handle EOF its own way.
+     *
+     * Without this the split pane was sending a raw 0x04 byte via
+     * sendInputTo, which is correct when a foreground program should receive
+     * EOF - but when the shell itself is in the foreground, the shell exits
+     * asynchronously (pty write → shell reads → shell calls exit()) rather
+     * than synchronously via kill(), so there is a timing window where the
+     * very next keystroke (Enter) arrives before the exited flag has been
+     * set in UI state - splitExited reads false and the Enter is forwarded
+     * into a dead pty instead of dismissing the runtime.
+     */
+    fun killSessionHard(runtimeId: String) {
+        liveSessions[runtimeId]?.sendCtrlDOrKill()
     }
 
     /** Pinch-to-zoom: per-session text size override in sp, cleared when
@@ -834,19 +923,40 @@ class MainViewModel(
      *  Running list, same as closing a split used to just close the split.
      *  Leaving the last pane closes multi-pane mode entirely rather than
      *  leaving a permanently-empty pane container on screen. */
+    /**
+     * Closes one multi-pane tile (the tile's own × button, via onClosePane).
+     *
+     * Previously this ONLY dropped the runtimeId out of the `panes` UI list
+     * - it never touched liveSessions/liveEntries/runningSessions, unlike
+     * every other "a session is going away" path in this file (killSession,
+     * dismissExitedActiveSession, deleteSession all call
+     * liveSessions.remove(...)?.kill() and clean up the same three places).
+     * That's why closing a tile in multi-pane mode "removed" it from the
+     * screen but the underlying pty process, its liveEntries bookkeeping,
+     * and its row in the drawer's running-sessions list all silently kept
+     * living forever - a real resource/process leak, and a session that
+     * looked gone but was still fully alive in the background.
+     */
     fun removePane(runtimeId: String) {
+        liveSessions.remove(runtimeId)?.kill()
+        liveEntries.remove(runtimeId)
+        paneColumnsRows.remove(runtimeId)
         val state = _uiState.value
         val remaining = state.panes.filterNot { it.runtimeId == runtimeId }
-        if (remaining.isEmpty()) {
-            exitMultiPaneMode()
-            return
-        }
         val nextFocused = if (state.focusedPaneRuntimeId == runtimeId) {
             remaining.maxByOrNull { it.zIndex }?.runtimeId
         } else {
             state.focusedPaneRuntimeId
         }
-        _uiState.value = state.copy(panes = remaining, focusedPaneRuntimeId = nextFocused)
+        _uiState.value = state.copy(
+            panes = remaining,
+            focusedPaneRuntimeId = nextFocused,
+            runningSessions = state.runningSessions.filterNot { it.runtimeId == runtimeId },
+            sessionTextSizes = state.sessionTextSizes - runtimeId
+        )
+        if (remaining.isEmpty()) {
+            exitMultiPaneMode()
+        }
     }
 
     /** Tap-to-focus: makes this pane the target of typed input (when the
@@ -938,15 +1048,38 @@ class MainViewModel(
      * of these are meant to block on each other. Reuses sendInputTo() above
      * as the single-target primitive rather than writing to liveSessions
      * directly here.
+     *
+     * Mirrors the classic split pane's onInput fix in MainActivity (see its
+     * splitExited/killSessionHard doc): this was the one call site that
+     * fix never reached. Every multi-pane input path - typed IME text, the
+     * VirtualKeyBar's key/keymap presses, sendPaneInput was and still is
+     * the single primitive they all funnel through - so the same two gaps
+     * existed here as in split screen before that fix: a literal EOT byte
+     * (Ctrl+D) went to sendInputTo() and only ever hit the shell
+     * asynchronously (pty write -> shell reads -> shell exit()), so the
+     * "exited" flag wasn't set yet by the time the next Enter arrived, and
+     * that Enter then wrote \r into an already-dead pty with nothing left
+     * to read it or close the tile - matching "CTRL+D kill ettikten sonra
+     * enter basıyorum ama tepki vermiyor, session temizlenmiyor". Handling
+     * both here, once, means the typed-text path, the keymap path and the
+     * raw key path in MainActivity all get the fix for free instead of
+     * needing it duplicated at each of those three call sites.
      */
     fun sendPaneInput(text: String, broadcastAllPanes: Boolean) {
         val state = _uiState.value
         if (state.panes.isEmpty()) return
-        if (broadcastAllPanes) {
-            state.panes.forEach { pane -> sendInputTo(pane.runtimeId, text) }
+        val targets = if (broadcastAllPanes) {
+            state.panes.map { it.runtimeId }
         } else {
-            val target = state.focusedPaneRuntimeId ?: return
-            sendInputTo(target, text)
+            listOfNotNull(state.focusedPaneRuntimeId)
+        }
+        targets.forEach { target ->
+            val exited = state.runningSessions.firstOrNull { it.runtimeId == target }?.exited == true
+            when {
+                text == "\u0004" -> killSessionHard(target)
+                exited && text.contains('\r') -> removePane(target)
+                else -> sendInputTo(target, text)
+            }
         }
     }
 
@@ -1204,6 +1337,6 @@ private fun SessionEntry.toSpec(): com.terminator.emulator.SessionSpec = when (t
         com.terminator.emulator.SessionSpec.CommandArg(name, commandPath ?: "/system/bin/sh", workingDirectory)
     com.terminator.app.session.SessionType.FILE_BASE ->
         com.terminator.emulator.SessionSpec.FileBase(
-            name, filePath ?: "/sdcard/Terminator", fileName ?: "session.sh", workingDirectory
+            name, filePath ?: "${Environment.getExternalStorageDirectory().path}/Terminator", fileName ?: "session.sh", workingDirectory
         )
 }

@@ -132,6 +132,12 @@ object SettingsKeys {
     // pane group instead of just one partner.
     val BROADCAST_ALL_PANES = booleanPreferencesKey("broadcast_all_panes")
 
+    // Controls whether the "All clear session" button (kills every running
+    // session at once, see MainViewModel.clearAllSessions) is shown in the
+    // session area at all. Off by default - it's a destructive one-tap
+    // action, so it should be an opt-in reveal rather than always visible.
+    val SHOW_CLEAR_ALL_SESSIONS_BUTTON = booleanPreferencesKey("show_clear_all_sessions_button")
+
     // Keyboard
     val SOFT_KEYBOARD = booleanPreferencesKey("soft_keyboard")
     val VIRTUAL_KEYS = booleanPreferencesKey("virtual_keys")

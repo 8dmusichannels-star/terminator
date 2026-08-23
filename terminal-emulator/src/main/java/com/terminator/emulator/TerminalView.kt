@@ -330,7 +330,6 @@ fun TerminalView(
         ) {
             SelectionContainer(state = selectionState) {
                 androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
-                    android.util.Log.d("SelDebug", "TerminalView[$debugLabel]: selectedTexts changed, count=${selectionState.selectedTexts.size}")
                 }
                 // Freeze the row text this overlay shows while a selection is
                 // active. Without this, every bufferVersion bump (i.e. every
@@ -372,7 +371,6 @@ fun TerminalView(
                     modifier = Modifier
                         .fillMaxSize()
                         .onGloballyPositioned { coords ->
-                            android.util.Log.d("SelDebug", "TerminalView[$debugLabel]: overlay Column size=${coords.size}")
                         }
                 ) {
                     val rowHeightDp = with(density) { charHeightPx.toDp() }
@@ -448,10 +446,8 @@ private class NoOpTextToolbar : TextToolbar {
     ) {
         // Intentionally renders nothing - ActionModeController/
         // SelectionActionBar (in MainActivity) is the real, visible bar.
-        android.util.Log.d("ToolbarDebug", "NoOpTextToolbar.showMenu called - suppressing (no-op)")
     }
     override fun hide() {
-        android.util.Log.d("ToolbarDebug", "NoOpTextToolbar.hide called (no-op, status stays Shown)")
     }
 }
 
@@ -479,7 +475,6 @@ private class NoOpTextToolbar : TextToolbar {
 @OptIn(ExperimentalFoundationApi::class)
 private object NoOpTextContextMenuProvider : TextContextMenuProvider {
     override suspend fun showTextContextMenu(dataProvider: TextContextMenuDataProvider) {
-        android.util.Log.d("ToolbarDebug", "NoOpTextContextMenuProvider.showTextContextMenu called - suppressing (no-op)")
         // Intentionally never opens a menu session - ActionModeController/
         // SelectionActionBar is the real, visible bar.
     }

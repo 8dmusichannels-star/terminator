@@ -20,6 +20,7 @@
 
 package com.terminator.emulator
 
+import android.os.Environment
 import android.os.ParcelFileDescriptor
 import java.io.File
 import java.io.FileInputStream
@@ -228,9 +229,9 @@ class TerminalSession(
         val path = System.getenv("PATH") ?: "/system/bin:/system/xbin"
         val base = mutableListOf(
             "PATH=$path",
-            "HOME=${cwd ?: "/sdcard"}",
+            "HOME=${cwd ?: Environment.getExternalStorageDirectory().path}",
             "TERM=$termType",
-            "TMPDIR=${cwd ?: "/sdcard"}"
+            "TMPDIR=${cwd ?: Environment.getExternalStorageDirectory().path}"
         )
         if (!terminfoDir.isNullOrBlank()) {
             base += "TERMINFO=$terminfoDir"
