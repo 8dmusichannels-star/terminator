@@ -38,16 +38,23 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-/** A single saved shortcut: a free-form name plus the terminal key actions it triggers. */
+/** A single saved shortcut: a free-form name plus the terminal key actions
+ *  it triggers. [repeatOnHold] is per-entry and user-chosen (in the editor,
+ *  not a fixed list of "these keys always repeat") - some shortcuts make
+ *  sense to hold (e.g. a repeated arrow-based combo for scrolling), others
+ *  don't (e.g. a one-shot Ctrl+C), and only the user creating the shortcut
+ *  really knows which is which. Defaults to false so every keymap saved
+ *  before this field existed decodes as "tap only", unchanged from today. */
 data class KeymapEntry(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
-    val keys: List<String> // VirtualKey.name values, e.g. "ESC", "CTRL", "UP"
+    val keys: List<String>, // VirtualKey.name values, e.g. "ESC", "CTRL", "UP"
+    val repeatOnHold: Boolean = false
 )
 
 private val ALL_KEY_OPTIONS = listOf(
     "ESC", "TAB", "CTRL", "ALT", "SLASH", "DASH",
-    "HOME", "END", "PGUP", "PGDN", "UP", "DOWN", "LEFT", "RIGHT"
+    "HOME", "END", "PGUP", "PGDN", "UP", "DOWN", "LEFT", "RIGHT", "INSERT"
 )
 
 fun decodeKeymaps(json: String): List<KeymapEntry> {
@@ -60,7 +67,11 @@ fun decodeKeymaps(json: String): List<KeymapEntry> {
             KeymapEntry(
                 id = o.getString("id"),
                 name = o.getString("name"),
-                keys = (0 until keysArr.length()).map { keysArr.getString(it) }
+                keys = (0 until keysArr.length()).map { keysArr.getString(it) },
+                // optBoolean defaults to false for any entry saved before
+                // this field existed, so old keymaps keep their old
+                // tap-only behavior unchanged.
+                repeatOnHold = o.optBoolean("repeatOnHold", false)
             )
         }
     }.getOrDefault(emptyList())
@@ -73,6 +84,7 @@ private fun encodeKeymaps(list: List<KeymapEntry>): String {
         o.put("id", entry.id)
         o.put("name", entry.name)
         o.put("keys", JSONArray(entry.keys))
+        o.put("repeatOnHold", entry.repeatOnHold)
         arr.put(o)
     }
     return arr.toString()
@@ -138,7 +150,12 @@ fun KeymapperScreen(onBack: () -> Unit) {
                 items(keymaps, key = { it.id }) { entry ->
                     ListItem(
                         headlineContent = { Text(entry.name) },
-                        supportingContent = { Text(entry.keys.joinToString(" + ")) },
+                        supportingContent = {
+                            Text(
+                                entry.keys.joinToString(" + ") +
+                                    if (entry.repeatOnHold) "  •  hold to repeat" else ""
+                            )
+                        },
                         trailingContent = {
                             IconButton(onClick = {
                                 val updated = keymaps.filterNot { it.id == entry.id }
@@ -173,6 +190,7 @@ private fun KeymapEditor(
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
     var selectedKeys by remember { mutableStateOf(initial?.keys?.toSet() ?: emptySet()) }
+    var repeatOnHold by remember { mutableStateOf(initial?.repeatOnHold ?: false) }
 
     Scaffold(
         topBar = {
@@ -193,7 +211,8 @@ private fun KeymapEditor(
                                 KeymapEntry(
                                     id = initial?.id ?: UUID.randomUUID().toString(),
                                     name = name.trim(),
-                                    keys = selectedKeys.toList()
+                                    keys = selectedKeys.toList(),
+                                    repeatOnHold = repeatOnHold
                                 )
                             )
                         }
@@ -239,6 +258,22 @@ private fun KeymapEditor(
                         label = { Text(key) }
                     )
                 }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Hold to repeat", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "When on, holding this shortcut's button keeps sending it, like a held key on a physical keyboard. Off sends it once per tap, same as before.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(checked = repeatOnHold, onCheckedChange = { repeatOnHold = it })
             }
         }
     }

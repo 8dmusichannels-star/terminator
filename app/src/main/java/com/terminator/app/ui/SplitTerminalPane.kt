@@ -48,6 +48,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -55,12 +56,93 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.unit.dp
 import com.terminator.emulator.TerminalBuffer
 import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
+
+/**
+ * Runs a two-finger pinch-to-zoom gesture for [SplitTerminalPane] to
+ * completion, starting from the pointer event that first reported a second
+ * finger down. Mirrors MainActivity's own primary-pane pinch branch
+ * (distance-ratio zoom, 8f..40f clamp, 150ms debounced commit so a fast
+ * pinch doesn't push a ViewModel write - and therefore a full-screen
+ * recomposition, see MainActivity's own liveZoomSize doc - on every single
+ * frame) but deliberately does NOT reproduce that branch's midpoint-row
+ * scrollback-anchoring: MainActivity's version needs it because it also
+ * resizes the live pty grid (updateTerminalSize) out from under the
+ * fingers, whereas this pane's column/row count is driven entirely by
+ * MainActivity's own onResizeSessionPty-less bufferVersion/onSizeChanged
+ * path elsewhere - adding a second, independent pty-resize call from in
+ * here would race that path rather than cooperate with it. Font size is
+ * still fully live (effectivePaneFontSize) during the pinch, exactly like
+ * the primary pane, just without also reflowing the pty mid-gesture.
+ *
+ * Left as a plain suspend function (not inlined into the two call sites
+ * above) since the exact same sequence - read distance ratio, clamp,
+ * publish liveZoomSize, debounce-commit - is needed from both the
+ * long-press-vs-scroll decision loop (second finger arrives before slop is
+ * exceeded) and the confirmed-scroll loop (second finger arrives after);
+ * duplicating this inline at both would double the surface area for the
+ * two loops to drift out of sync with each other.
+ */
+private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.runSplitPinchZoom(
+    initialEvent: androidx.compose.ui.input.pointer.PointerEvent,
+    latestFontSize: androidx.compose.runtime.State<Float>,
+    coroutineScope: kotlinx.coroutines.CoroutineScope,
+    onLiveZoom: (Float?) -> Unit,
+    onCommitZoom: ((Float) -> Unit)?,
+    setZoomCommitJob: (Job?) -> Unit,
+    cancelPendingZoomCommit: () -> Unit
+) {
+    // Runs directly on the AwaitPointerEventScope the caller (an
+    // awaitEachGesture block) is already inside, rather than opening a
+    // second, nested awaitPointerEventScope { } of its own. awaitEachGesture
+    // provides a *restricted* suspend scope (RestrictsSuspension) - Kotlin
+    // rejects a restricted-suspend receiver calling into a NEW instance of
+    // that same restricted scope from inside itself ("Restricted suspending
+    // functions can invoke member or extension suspending functions only on
+    // their restricted coroutine scope"), which is exactly what this
+    // function used to do by wrapping its whole body in its own
+    // awaitPointerEventScope { }. Being an extension ON
+    // AwaitPointerEventScope directly - with no such wrapper - means every
+    // awaitPointerEvent() call below runs on the SAME restricted scope the
+    // two call sites are already suspended within, which is allowed.
+    var lastEvent = initialEvent
+    while (true) {
+        val changes = lastEvent.changes.filter { it.pressed }
+        if (changes.size < 2) break // back down to one finger (or zero) - pinch is over
+        val p1 = changes.getOrNull(0)
+        val p2 = changes.getOrNull(1)
+        if (p1 != null && p2 != null) {
+            val prevDist = (p1.previousPosition - p2.previousPosition).getDistance()
+            val curDist = (p1.position - p2.position).getDistance()
+            if (prevDist > 0f) {
+                val zoom = curDist / prevDist
+                if (zoom != 1f) {
+                    val newSize = (latestFontSize.value * zoom).coerceIn(8f, 40f)
+                    onLiveZoom(newSize)
+                    cancelPendingZoomCommit()
+                    setZoomCommitJob(
+                        coroutineScope.launch {
+                            delay(150)
+                            onCommitZoom?.invoke(newSize)
+                            onLiveZoom(null)
+                        }
+                    )
+                }
+            }
+        }
+        val event = awaitPointerEvent()
+        event.changes.forEach { it.consume() }
+        lastEvent = event
+    }
+}
 
 /**
  * The bar between the primary and secondary split panes. A thin drag
@@ -200,7 +282,39 @@ fun SplitTerminalPane(
     // is rendered right inside this composable so it's anchored to the
     // pane's own Box and inherits its own Z-order, rather than floating
     // somewhere under the primary pane's coordinate space.
-    moreMenuActions: MoreMenuActions? = null
+    moreMenuActions: MoreMenuActions? = null,
+    // Routes this pane's HiddenPaneInputField show()/hide() calls through
+    // MainActivity's single insetsController + WindowInsetsAnimationCompat
+    // ground-truth instead of HiddenPaneInputField deriving its own local
+    // controller. Split screen only - see HiddenPaneInputField's own doc on
+    // onRequestShow/onRequestHide for why. Null (the default) falls back to
+    // that field's original self-contained behavior, so any other caller of
+    // this composable keeps working unchanged.
+    onImeRequestShow: (() -> Unit)? = null,
+    onImeRequestHide: (() -> Unit)? = null,
+    // Settings > Appearance > Pinch to zoom, same flag MultiPaneContainer
+    // already threads down to its own tiles (see its zoomEnabled doc) -
+    // this pane previously ignored the setting entirely because it had no
+    // pinch-zoom gesture at all. Defaults to true so any other existing
+    // caller of this composable keeps today's behavior (which was: no zoom)
+    // with no wiring needed - the gesture itself is only added below, this
+    // flag alone doesn't change anything for a caller that never supplies
+    // onZoomTextSize.
+    zoomEnabled: Boolean = true,
+    // Fired (debounced, once per pinch - not per frame, see the
+    // zoomCommitJob doc inline below) with this pane's newly-committed text
+    // size whenever the user pinch-zooms THIS split pane specifically -
+    // mirrors MainActivity's own viewModel.setSessionTextSize(activeSessionId,
+    // newSize) call for the primary pane, just handed back up as a callback
+    // since this composable has no ViewModel reference of its own. Caller
+    // is expected to store it per-runtimeId (MainViewModel.sessionTextSizes
+    // already is a runtimeId-keyed map, so the split pane's own runtimeId
+    // slots into the exact same mechanism the primary pane uses) and feed
+    // the result back in as this composable's fontSizeSp param. Null (the
+    // default) disables committing anything - the gesture still runs and
+    // resizes the pty live, but nothing persists past the pinch, same as
+    // supplying zoomEnabled = false.
+    onZoomTextSize: ((Float) -> Unit)? = null
 ) {
     // Direct-tap-to-type, no separate "Type here..." input box - tapping
     // the terminal area itself focuses it and brings up the keyboard, same
@@ -388,19 +502,54 @@ fun SplitTerminalPane(
                             )
                         }
                     }
+                    // Pinch-to-zoom text size for THIS split pane specifically -
+                    // same liveZoomSize/zoomCommitJob split as MainActivity's
+                    // primary-pane pinch gesture (see its own doc): a pinch
+                    // fires on essentially every frame while fingers are
+                    // moving, so resizing straight through onZoomTextSize (a
+                    // ViewModel write, which recomposes the whole screen) on
+                    // every single frame would make this feel stuttery.
+                    // liveZoomSize is purely local Compose state read only by
+                    // this pane's own TerminalView; onZoomTextSize is only
+                    // actually invoked once, 150ms after the pinch settles.
+                    // Declared before the char-metrics measurement below since
+                    // that measurement needs to react to the SAME live-zoomed
+                    // size the TerminalView itself is showing, not just the
+                    // caller's static fontSizeSp - otherwise mouse-reporting
+                    // touch-to-cell math would use stale metrics for the
+                    // duration of a pinch.
+                    var liveZoomSize by remember(runtimeId) { mutableStateOf<Float?>(null) }
+                    var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
+                    val effectivePaneFontSize = liveZoomSize ?: fontSizeSp
+                    // Gesture below is keyed only on runtimeId (not fontSizeSp/
+                    // effectivePaneFontSize) so it doesn't restart mid-pinch -
+                    // same rememberUpdatedState pattern as MainActivity's
+                    // latestEffectiveTextSize for the identical reason.
+                    val latestEffectivePaneFontSize = androidx.compose.runtime.rememberUpdatedState(effectivePaneFontSize)
                     // Character cell size for this pane, used only to turn
                     // a raw touch position into a (col, row) pair for mouse
                     // reporting below - same measuringPaint approach
                     // TerminalView itself uses to line its own selection
                     // overlay up with the Canvas grid.
                     val density = LocalDensity.current
-                    val (charWidthPx, charHeightPx) = remember(fontFamily, fontSizeSp, density.density, density.fontScale) {
+                    val (charWidthPx, charHeightPx) = remember(fontFamily, effectivePaneFontSize, density.density, density.fontScale) {
                         val measuringPaint = android.graphics.Paint().apply {
                             typeface = fontFamily
-                            textSize = fontSizeSp * density.density * density.fontScale
+                            textSize = effectivePaneFontSize * density.density * density.fontScale
                         }
                         measuringPaint.measureText("M") to measuringPaint.fontSpacing
                     }
+                    // Hoisted for the drag-scroll frame-coalescing job below -
+                    // see that pointerInput block's own doc for why raw
+                    // per-pointer-event onScroll() calls needed batching down
+                    // to once per frame. rememberCoroutineScope() (not a bare
+                    // launch{} inside the gesture block itself) matches this
+                    // codebase's own existing pattern for a job started from
+                    // inside a pointerInput/awaitEachGesture block - see
+                    // MainActivity's identically-shaped resizeDebounceJob/
+                    // zoomCommitJob, both driven off a coroutineScope hoisted
+                    // the same way.
+                    val paneCoroutineScope = androidx.compose.runtime.rememberCoroutineScope()
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -546,6 +695,28 @@ fun SplitTerminalPane(
                                             if (remainingMillis <= 0L) return@awaitEachGesture // long-press window elapsed untouched
                                             val event = withTimeoutOrNull(remainingMillis) { awaitPointerEvent() }
                                                 ?: return@awaitEachGesture // timed out untouched
+                                            // Second finger landed: a long-press-to-select can only
+                                            // ever be a one-finger gesture, so as soon as a second
+                                            // pointer is down this is unambiguously a pinch, not a
+                                            // selection attempt - break out of the slop-vs-long-press
+                                            // decision immediately instead of waiting out the rest of
+                                            // the long-press timeout window for nothing. Mirrors
+                                            // MainActivity's own primary-pane pinch branch, just
+                                            // entered from this pane's own long-press/scroll decision
+                                            // loop rather than after an already-confirmed scroll.
+                                            if (zoomEnabled && event.changes.count { it.pressed } >= 2) {
+                                                event.changes.forEach { it.consume() }
+                                                runSplitPinchZoom(
+                                                    initialEvent = event,
+                                                    latestFontSize = latestEffectivePaneFontSize,
+                                                    coroutineScope = paneCoroutineScope,
+                                                    onLiveZoom = { liveZoomSize = it },
+                                                    onCommitZoom = onZoomTextSize,
+                                                    setZoomCommitJob = { zoomCommitJob = it },
+                                                    cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
+                                                )
+                                                return@awaitEachGesture
+                                            }
                                             val change = event.changes.firstOrNull { it.id == down.id }
                                                 ?: event.changes.firstOrNull()
                                                 ?: return@awaitEachGesture
@@ -561,23 +732,110 @@ fun SplitTerminalPane(
                                         // Confirmed scroll: consume this and every
                                         // subsequent event ourselves for the rest of the
                                         // drag, driving scrollback the same as before.
+                                        //
+                                        // Coalesced to at most one onScroll() call per
+                                        // rendered frame, not one per raw pointer event.
+                                        // A fast drag can deliver several pointer-move
+                                        // events between two actual UI frames - each one
+                                        // used to call onScroll() straight through,
+                                        // which (via adjustSplitScrollOffset ->
+                                        // _uiState.copy()) triggered its own
+                                        // recomposition and a full 80x24-cell Canvas
+                                        // repaint (drawTerminal allocates a fresh Paint
+                                        // per redraw - see that function's own doc) EACH
+                                        // time, several of which the compositor then
+                                        // only had one frame's worth of time to actually
+                                        // show. Accumulating dy here and flushing it
+                                        // once via withFrameNanos - which suspends until
+                                        // the next frame is about to be drawn - collapses
+                                        // however many raw events landed in between into
+                                        // a single onScroll()/repaint per frame instead,
+                                        // with the split pane's own second live session
+                                        // (and its own independent bufferVersion-driven
+                                        // repaints) competing for the same frame budget
+                                        // being exactly why this showed up here first.
+                                        // The total scrolled distance is identical either
+                                        // way - only how often it's applied changes.
+                                        var pendingDy = 0f
                                         var lastY = down.position.y
                                         scrollStartEvent?.let { change ->
                                             change.consume()
-                                            val dy = change.position.y - lastY
-                                            if (charHeightPx > 0f) onScroll(dy / charHeightPx)
+                                            pendingDy += change.position.y - lastY
                                             lastY = change.position.y
                                         }
-                                        while (true) {
-                                            val event = awaitPointerEvent()
-                                            val change = event.changes.firstOrNull { it.id == down.id }
-                                                ?: event.changes.firstOrNull()
-                                                ?: break
-                                            change.consume()
-                                            if (!change.pressed) break
-                                            val dy = change.position.y - lastY
-                                            if (charHeightPx > 0f) onScroll(dy / charHeightPx)
-                                            lastY = change.position.y
+                                        val frameJob = paneCoroutineScope.launch {
+                                            while (true) {
+                                                withFrameNanos {}
+                                                if (pendingDy != 0f && charHeightPx > 0f) {
+                                                    // Route through onEdgeAutoScroll (not onScroll)
+                                                    // whenever a selection is already active - not
+                                                    // just near the top/bottom edge, which is what
+                                                    // that callback was previously reserved for (see
+                                                    // its own doc higher up). A plain one-finger drag
+                                                    // ANYWHERE in the pane should scroll scrollback
+                                                    // while keeping the selection intact, same as
+                                                    // MainActivity's primary-pane fix for this same
+                                                    // gap. onScroll's own caller
+                                                    // (adjustSplitScrollOffset with the default
+                                                    // isEdgeAutoScroll=false) is what fed
+                                                    // paneSelectionState.clear() on every single
+                                                    // scroll tick via this pane's own
+                                                    // LaunchedEffect(scrollOffset) guard - so
+                                                    // scrolling while a selection was active looked
+                                                    // like it did nothing, since the selection
+                                                    // vanished the instant the drag started.
+                                                    if (paneSelectionState.selectedTexts.isNotEmpty()) {
+                                                        onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                    } else {
+                                                        onScroll(pendingDy / charHeightPx)
+                                                    }
+                                                    pendingDy = 0f
+                                                }
+                                            }
+                                        }
+                                        try {
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                // A second finger can also land mid-scroll (drag
+                                                // started with one finger, a second touches down
+                                                // before the first lifts) - hand off to the same
+                                                // pinch-zoom path rather than continuing to treat
+                                                // this as a one-finger scroll.
+                                                if (zoomEnabled && event.changes.count { it.pressed } >= 2) {
+                                                    event.changes.forEach { it.consume() }
+                                                    runSplitPinchZoom(
+                                                        initialEvent = event,
+                                                        latestFontSize = latestEffectivePaneFontSize,
+                                                        coroutineScope = paneCoroutineScope,
+                                                        onLiveZoom = { liveZoomSize = it },
+                                                        onCommitZoom = onZoomTextSize,
+                                                        setZoomCommitJob = { zoomCommitJob = it },
+                                                        cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
+                                                    )
+                                                    break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id }
+                                                    ?: event.changes.firstOrNull()
+                                                    ?: break
+                                                change.consume()
+                                                if (!change.pressed) break
+                                                pendingDy += change.position.y - lastY
+                                                lastY = change.position.y
+                                            }
+                                        } finally {
+                                            // Flush whatever moved since the last frame
+                                            // tick fired, so the drag's very last bit of
+                                            // motion (between the final frame tick and
+                                            // the finger lifting) isn't silently dropped.
+                                            frameJob.cancel()
+                                            if (pendingDy != 0f && charHeightPx > 0f) {
+                                                if (paneSelectionState.selectedTexts.isNotEmpty()) {
+                                                    onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                } else {
+                                                    onScroll(pendingDy / charHeightPx)
+                                                }
+                                                pendingDy = 0f
+                                            }
                                         }
                                         return@awaitEachGesture
                                     }
@@ -611,7 +869,7 @@ fun SplitTerminalPane(
                             buffer = buffer,
                             palette = palette,
                             fontFamily = fontFamily,
-                            fontSizeSp = fontSizeSp,
+                            fontSizeSp = effectivePaneFontSize,
                             bufferVersion = bufferVersion,
                             backgroundAlpha = 1f,
                             scrollOffset = scrollOffset,
@@ -624,7 +882,9 @@ fun SplitTerminalPane(
                             activationKey = focusToken,
                             onText = { text ->
                                 onInput(text)
-                            }
+                            },
+                            onRequestShow = onImeRequestShow,
+                            onRequestHide = onImeRequestHide
                         )
                         // actionModeController.show()/hide() above only
                         // ever flip isVisible - nothing was reading that

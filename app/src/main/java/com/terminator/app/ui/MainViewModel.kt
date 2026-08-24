@@ -410,6 +410,34 @@ class MainViewModel(
     }
 
     /**
+     * Backs MultiPaneContainer's per-tile "Clone" More-menu row. Unlike
+     * [duplicateSession] (which spawns the clone as the classic view's
+     * activeSessionId - correct for the primary pane's own More menu, but
+     * invisible here since multi-pane mode renders from panes, not
+     * activeSessionId), this adds the fresh clone as a NEW PANE right in
+     * the same pane group instead. Without this, tapping Clone on a
+     * multi-pane tile silently spawned a background session with no tile
+     * of its own - it existed in runningSessions/liveSessions and showed
+     * up in the drawer, but nothing on screen changed, reading as "Clone
+     * does nothing" in multi-pane mode specifically.
+     *
+     * Falls back to [spawnAndAddPane] (clone of the focused/active
+     * session) if the given runtimeId's entry isn't resolvable anymore -
+     * same "clone whichever one is still actually here" fallback
+     * [duplicateSession] already uses for the classic view's own picker.
+     */
+    fun clonePaneSession(runtimeId: String) {
+        val entry = liveEntries[runtimeId]
+        if (entry == null) {
+            spawnAndAddPane()
+            return
+        }
+        val newId = newRuntimeId(entry.id)
+        launchLiveSession(runtimeId = newId, entry = entry)
+        addPaneSession(newId)
+    }
+
+    /**
      * Backs QuickAddSessionPickerDialog: spawns a fresh copy of whichever
      * *specific* running session the user picked from that popup (by
      * runtimeId), rather than always whatever happens to be active - see
@@ -857,14 +885,63 @@ class MainViewModel(
     /** Leaves multi-pane mode entirely, returning to the classic single-
      *  pane (optionally split-screen) rendering path. The session that was
      *  focused becomes the classic view's active session. Panes' floating
-     *  geometry stays persisted (per entryId) for next time. */
+     *  geometry stays persisted (per entryId) for next time.
+     *
+     *  Guards against landing on a dead runtime: this is called from
+     *  removePane() once the last tile is gone (see its own doc), at which
+     *  point focusedPaneRuntimeId has already been cleared to null by that
+     *  same removePane update - so the fallback below was activeSessionId,
+     *  a value multi-pane mode never actually keeps current (see this
+     *  file's activeSessionId assignments - the only one inside multi-pane
+     *  mode is this function's own, right below). If the tile that just
+     *  died was ALSO whatever activeSessionId happened to be frozen at
+     *  from before multi-pane mode was entered, that fallback pointed
+     *  activeSessionId at a runtime with nothing left in liveSessions for
+     *  it - the classic view then rendered a black screen with no process
+     *  to send input to, and nothing anywhere spawned a replacement.
+     *  Falling back through the still-alive runtime list first, and
+     *  spawning a fresh default session only when truly none are left
+     *  (same fallback chain clearAllSessions() already uses), means
+     *  leaving multi-pane mode always lands on an actual live session. */
     fun exitMultiPaneMode() {
-        val focused = _uiState.value.focusedPaneRuntimeId ?: _uiState.value.activeSessionId
-        _uiState.value = _uiState.value.copy(
+        val state = _uiState.value
+        val focused = state.focusedPaneRuntimeId ?: state.activeSessionId
+        val focusedIsAlive = focused != null && liveSessions[focused]?.isAlive() == true
+        if (focusedIsAlive) {
+            _uiState.value = state.copy(
+                panes = emptyList(),
+                focusedPaneRuntimeId = null,
+                activeSessionId = focused
+            )
+            return
+        }
+        // Neither the focused pane nor the frozen activeSessionId is still
+        // alive - fall back to any other still-running session first.
+        val fallbackAlive = state.runningSessions.firstOrNull {
+            !it.exited && liveSessions[it.runtimeId]?.isAlive() == true
+        }?.runtimeId
+        if (fallbackAlive != null) {
+            _uiState.value = state.copy(
+                panes = emptyList(),
+                focusedPaneRuntimeId = null,
+                activeSessionId = fallbackAlive
+            )
+            return
+        }
+        // Truly nothing left running - same "never land on an empty
+        // screen" fallback clearAllSessions() uses: launch a fresh default
+        // session rather than leaving activeSessionId pointed at a dead
+        // runtime with no process to spawn a replacement for it.
+        _uiState.value = state.copy(
             panes = emptyList(),
             focusedPaneRuntimeId = null,
-            activeSessionId = focused
+            activeSessionId = null
         )
+        val defaultEntry = _uiState.value.sessions.firstOrNull { it.isDefault }
+            ?: _uiState.value.sessions.firstOrNull()
+        if (defaultEntry != null) {
+            launchLiveSession(runtimeId = newRuntimeId(defaultEntry.id), entry = defaultEntry)
+        }
     }
 
     /**

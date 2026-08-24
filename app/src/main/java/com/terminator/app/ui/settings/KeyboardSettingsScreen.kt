@@ -47,6 +47,7 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
 
     val softKeyboard by repo.flow(SettingsKeys.SOFT_KEYBOARD, true).collectAsState(initial = true)
     val virtualKeys by repo.flow(SettingsKeys.VIRTUAL_KEYS, true).collectAsState(initial = true)
+    val keymapperEnabled by repo.flow(SettingsKeys.KEYMAPPER_ENABLED, true).collectAsState(initial = true)
     val inputMode by repo.flow(SettingsKeys.INPUT_MODE, "Default").collectAsState(initial = "Default")
     val seccompEnabled by repo.flow(SettingsKeys.SECCOMP_ENABLED, false).collectAsState(initial = false)
     val termType by repo.flow(SettingsKeys.TERM_TYPE, "xterm-256color").collectAsState(initial = "xterm-256color")
@@ -74,6 +75,13 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(16.dp))
             SwitchRow("Virtual keys (key bar)", virtualKeys) {
                 scope.launch { repo.set(SettingsKeys.VIRTUAL_KEYS, it) }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            // Independent of "Virtual keys" above - the keymap row used to be
+            // tied to the key bar's own visibility, so there was no way to
+            // keep keyboard shortcuts working while hiding the bar itself.
+            SwitchRow("Keyboard shortcuts & keymapper", keymapperEnabled) {
+                scope.launch { repo.set(SettingsKeys.KEYMAPPER_ENABLED, it) }
             }
 
             Spacer(modifier = Modifier.height(24.dp))

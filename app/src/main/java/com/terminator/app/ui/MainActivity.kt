@@ -76,8 +76,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.ViewCompat
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.terminator.app.TerminatorApp
@@ -273,6 +275,11 @@ class MainActivity : ComponentActivity() {
             val backgroundBlur by repo.flow(SettingsKeys.BACKGROUND_BLUR, 0f).collectAsState(initial = 0f)
             val showTitlebar by repo.flow(SettingsKeys.SHOW_TITLEBAR, true).collectAsState(initial = true)
             val virtualKeysEnabled by repo.flow(SettingsKeys.VIRTUAL_KEYS, true).collectAsState(initial = true)
+            // Independent of virtualKeysEnabled above - see KeymapperRow's
+            // own doc and SettingsKeys.KEYMAPPER_ENABLED for why this used
+            // to just be virtualKeysEnabled reused (turning the key bar off
+            // silently killed keymap shortcuts too).
+            val keymapperEnabled by repo.flow(SettingsKeys.KEYMAPPER_ENABLED, true).collectAsState(initial = true)
             val softKeyboardEnabled by repo.flow(SettingsKeys.SOFT_KEYBOARD, true).collectAsState(initial = true)
             val textSize by repo.flow(SettingsKeys.TEXT_SIZE, 14f).collectAsState(initial = 14f)
             val colorSchemeMode by repo.flow(SettingsKeys.COLOR_SCHEME_MODE, "Material")
@@ -479,6 +486,57 @@ class MainActivity : ComponentActivity() {
                     delay(120)
                     settledKeyboardOpen = keyboardOpen
                 }
+                // Real IME-animation-finished signal, used ONLY by the split-screen
+                // text-page-close path (see onTextEntryClosed's split branch below).
+                // settledKeyboardOpen above is a fixed 120ms guess at when the
+                // animation has settled - it has no idea whether the platform's own
+                // IME show/hide animation is actually still running, so a
+                // VirtualKeyBar swipe-back's synchronous focusManager.clearFocus can
+                // nudge the inset right in the middle of that guessed window and get
+                // read as "settled" when the real animation is still moving out from
+                // under it. WindowInsetsAnimationCompat.Callback's onEnd() fires
+                // from the platform itself exactly once the IME animation - shown or
+                // hidden - has actually finished, so imeAnimationSettled bumping is
+                // ground truth rather than a timer. This runs for every IME
+                // animation regardless of what triggered it (this file's own show/
+                // hide calls, the system back gesture, the user's own IME dismiss
+                // control), same breadth WindowInsets.ime already gives keyboardOpen
+                // above - it's just also anchored to the animation's real end instead
+                // of a live per-frame inset read.
+                var imeAnimationSettled by remember { mutableIntStateOf(0) }
+                DisposableEffect(currentView) {
+                    val callback = object : WindowInsetsAnimationCompat.Callback(
+                        WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_STOP
+                    ) {
+                        override fun onProgress(
+                            insets: WindowInsetsCompat,
+                            runningAnimations: MutableList<WindowInsetsAnimationCompat>
+                        ): WindowInsetsCompat {
+                            // DISPATCH_MODE_STOP means this callback doesn't need to
+                            // adjust child view insets mid-animation - just pass through.
+                            return insets
+                        }
+
+                        override fun onEnd(animation: WindowInsetsAnimationCompat) {
+                            if (animation.typeMask and WindowInsetsCompat.Type.ime() != 0) {
+                                imeAnimationSettled++
+                            }
+                        }
+                    }
+                    ViewCompat.setWindowInsetsAnimationCallback(currentView, callback)
+                    onDispose {
+                        ViewCompat.setWindowInsetsAnimationCallback(currentView, null)
+                    }
+                }
+                var splitFocusRequestSignal by remember { mutableIntStateOf(0) }
+                // Bumped (never 0 after the first bump) to tell SplitTerminalPane
+                // "reclaim your own IME focus" - see its focusRequestSignal doc.
+                // Needed because the shared VirtualKeyBar's onTextEntryClosed
+                // below previously only knew how to focus the PRIMARY pane's own
+                // field, even while the split pane was the one actually focused.
+                // Fired synchronously from onTextEntryClosed's split branch (see
+                // its own doc there) the same way the non-split branch calls
+                // focusRequester.requestFocus() synchronously.
                 // Ground truth for "did WE just tell the keyboard to open or
                 // close", updated synchronously at every one of this file's
                 // own show()/hide() call sites (tap-to-toggle, Copy/Paste/
@@ -537,12 +595,6 @@ class MainActivity : ComponentActivity() {
                 // literally.
                 var ctrlActive by remember { mutableStateOf(false) }
                 var altActive by remember { mutableStateOf(false) }
-                // Bumped (never 0 after the first bump) to tell SplitTerminalPane
-                // "reclaim your own IME focus" - see its focusRequestSignal doc.
-                // Needed because the shared VirtualKeyBar's onTextEntryClosed
-                // below previously only knew how to focus the PRIMARY pane's own
-                // field, even while the split pane was the one actually focused.
-                var splitFocusRequestSignal by remember { mutableIntStateOf(0) }
                 // Same purpose as splitFocusRequestSignal above, but for
                 // multi-pane grid mode's own focused tile - see
                 // MultiPaneContainer/PaneContent's focusRequestSignal doc.
@@ -1016,6 +1068,7 @@ class MainActivity : ComponentActivity() {
                                     palette = terminalPalette,
                                     fontFamily = terminalTypeface,
                                     fontSizeSp = textSize,
+                                    zoomEnabled = zoomEnabled,
                                     onInput = { runtimeId, text ->
                                         // Same missing-transform bug as the split pane's onInput
                                         // (see its own doc): this tile's HiddenPaneInputField
@@ -1069,7 +1122,7 @@ class MainActivity : ComponentActivity() {
                                     onExitMultiPane = { viewModel.exitMultiPaneMode() },
                                     onWantsMouseEvents = { runtimeId -> viewModel.sessionWantsMouseEvents(runtimeId) },
                                     onMouseEvent = { runtimeId, kind, col, row -> viewModel.sendMouseEventTo(runtimeId, kind, col, row) },
-                                    onCloneSession = { runtimeId -> viewModel.duplicateSession(runtimeId) },
+                                    onCloneSession = { runtimeId -> viewModel.clonePaneSession(runtimeId) },
                                     onToggleWakeUp = { runtimeId -> viewModel.toggleWakeUp(runtimeId) },
                                     wakeUpActiveFor = { runtimeId ->
                                         state.runningSessions.firstOrNull { it.runtimeId == runtimeId }?.wakeUp == true
@@ -1079,6 +1132,21 @@ class MainActivity : ComponentActivity() {
                                         terminalExportLauncher.launch("terminator-session.txt")
                                     },
                                     focusRequestSignal = multiPaneFocusRequestSignal,
+                                    // Collapses every tile's HiddenPaneInputField down to this
+                                    // file's single insetsController instead of each tile deriving
+                                    // its own separate WindowInsetsControllerCompat from LocalView -
+                                    // same fix, same reasoning as SplitTerminalPane's
+                                    // onImeRequestShow/onImeRequestHide above (see
+                                    // HiddenPaneInputField's own doc). Multi-pane tiling/floating
+                                    // showed the identical swipe-glitch symptom split screen did,
+                                    // for the identical root cause: a second, independent IME
+                                    // controller instance per tile that MainActivity's own
+                                    // imeAnimationSettled ground-truth callback was never attached
+                                    // to, so it could issue a show()/hide() the ground-truth ended
+                                    // up not knowing about no matter how correctly the ground-truth
+                                    // itself was timed.
+                                    onImeRequestShow = { insetsController.show(WindowInsetsCompat.Type.ime()) },
+                                    onImeRequestHide = { insetsController.hide(WindowInsetsCompat.Type.ime()) },
                                     modifier = Modifier.weight(1f)
                                 )
                                 // VirtualKeyBar for multi-pane mode. Was also shown whenever
@@ -1095,33 +1163,46 @@ class MainActivity : ComponentActivity() {
                                 // the same live WindowInsets.ime read the primary pane and split
                                 // both already rely on - is the correct signal here, matching
                                 // splitPaneFocused's role in the else branch below exactly.
+                                // Same keymap-trigger parsing VirtualKeyBar's onKeymapTriggered
+                                // used to have inlined - pulled out to a local val so both
+                                // VirtualKeyBar (CTRL/ALT/nav keys) and the now-independent
+                                // KeymapperRow (see its own doc, and KEYMAPPER_ENABLED) can
+                                // share the exact same trigger logic without duplicating it.
+                                val onMultiPaneKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit = { entry ->
+                                    var pendingCtrl = false
+                                    var pendingAlt = false
+                                    val sequence = StringBuilder()
+                                    entry.keys.forEach { keyName ->
+                                        val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
+                                        when (vk) {
+                                            VirtualKey.CTRL -> pendingCtrl = true
+                                            VirtualKey.ALT -> pendingAlt = true
+                                            null -> {}
+                                            else -> {
+                                                var seq = vk.sendSequence
+                                                if (pendingCtrl) { seq = seq.map(::applyCtrl).joinToString(""); pendingCtrl = false }
+                                                if (pendingAlt) { seq = "\u001B$seq"; pendingAlt = false }
+                                                sequence.append(seq)
+                                            }
+                                        }
+                                    }
+                                    if (sequence.isNotEmpty()) viewModel.sendPaneInput(sequence.toString(), broadcastAllPanes)
+                                }
+                                // Independent of virtualKeysEnabled - stays mounted/usable even
+                                // with the key bar itself turned off. See KeymapperRow's doc.
+                                if (keymapperEnabled) {
+                                    KeymapperRow(
+                                        keymaps = keymaps,
+                                        onKeymapTriggered = onMultiPaneKeymapTriggered,
+                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                    )
+                                }
                                 // Routes to the focused pane via sendPaneInput — no CTRL/ALT
                                 // state here, key presses go straight as sequences.
                                 if (virtualKeysEnabled && (!softKeyboardEnabled || keyboardOpen)) {
                                     VirtualKeyBar(
                                         ctrlActive = ctrlActive,
                                         altActive = altActive,
-                                        keymaps = keymaps,
-                                        onKeymapTriggered = { entry ->
-                                            var pendingCtrl = false
-                                            var pendingAlt = false
-                                            val sequence = StringBuilder()
-                                            entry.keys.forEach { keyName ->
-                                                val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
-                                                when (vk) {
-                                                    VirtualKey.CTRL -> pendingCtrl = true
-                                                    VirtualKey.ALT -> pendingAlt = true
-                                                    null -> {}
-                                                    else -> {
-                                                        var seq = vk.sendSequence
-                                                        if (pendingCtrl) { seq = seq.map(::applyCtrl).joinToString(""); pendingCtrl = false }
-                                                        if (pendingAlt) { seq = "\u001B$seq"; pendingAlt = false }
-                                                        sequence.append(seq)
-                                                    }
-                                                }
-                                            }
-                                            if (sequence.isNotEmpty()) viewModel.sendPaneInput(sequence.toString(), broadcastAllPanes)
-                                        },
                                         onTextSubmitted = { text -> viewModel.sendPaneInput(text, broadcastAllPanes) },
                                         onTextFieldFocusChanged = { focused -> textPageFieldFocused = focused },
                                         onTextEntryClosed = {
@@ -1135,10 +1216,23 @@ class MainActivity : ComponentActivity() {
                                             // page - "SANAL KLAVYE SWİPE ... İMEİ KENDİ KENDİNE
                                             // KAPANİYOR", multi-pane-only for the same reason
                                             // SplitTerminalPane's own splitFocusRequestSignal exists.
-                                            if (settledKeyboardOpen) {
-                                                multiPaneFocusRequestSignal++
-                                                lastKeyboardIntentOpen = true
-                                            }
+                                            //
+                                            // Fires unconditionally, NOT gated on
+                                            // settledKeyboardOpen - see the split branch's own
+                                            // onTextEntryClosed doc (identical bug, fixed there
+                                            // first): VirtualKeyBar's clearFocus(force = true) has
+                                            // already dropped Compose focus by the time this runs,
+                                            // with nothing else claiming it in the same frame - the
+                                            // real platform IME starts closing on its own the
+                                            // instant that happens, regardless of what
+                                            // settledKeyboardOpen's debounced guess currently reads.
+                                            // Gating this behind settledKeyboardOpen was exactly
+                                            // what let that unclaimed-focus gap go unfilled often
+                                            // enough to reproduce as "closes right after swipe-back"
+                                            // here too - this mirrors the split branch's now-
+                                            // synchronous, ungated fix instead of guessing.
+                                            multiPaneFocusRequestSignal++
+                                            lastKeyboardIntentOpen = true
                                         },
                                         onKeyPressed = { key ->
                                             when (key) {
@@ -1362,7 +1456,33 @@ class MainActivity : ComponentActivity() {
                                                         if (!viewModel.activeSessionInAlternateScreen()) {
                                                             val (_, charHeight) = charMetrics
                                                             if (charHeight > 0f) {
-                                                                viewModel.adjustScrollOffset(dy / charHeight)
+                                                                // isEdgeAutoScroll = true whenever a
+                                                                // selection is already active: a plain
+                                                                // one-finger drag ANYWHERE on the
+                                                                // terminal (not just near the top/bottom
+                                                                // 15% edge - see the edge-auto-scroll
+                                                                // pointerInput block above, which is a
+                                                                // SEPARATE gesture for dragging a
+                                                                // selection HANDLE near the edge) should
+                                                                // scroll scrollback while keeping the
+                                                                // selection intact, exactly like edge-
+                                                                // auto-scroll already does. Without this,
+                                                                // LaunchedEffect(state.scrollOffset)'s
+                                                                // guard (see its own doc) saw
+                                                                // lastScrollWasEdgeAutoScroll = false for
+                                                                // every plain drag and cleared the
+                                                                // selection on the very first pixel of
+                                                                // scroll motion - so scrolling while a
+                                                                // selection was active looked like it
+                                                                // "did nothing" (the drag consumed the
+                                                                // gesture but the selection vanished
+                                                                // instantly, reading as broken rather
+                                                                // than as an intentional selection-clear).
+                                                                val draggingWithSelection = selectionState.selectedTexts.isNotEmpty()
+                                                                viewModel.adjustScrollOffset(
+                                                                    dy / charHeight,
+                                                                    isEdgeAutoScroll = draggingWithSelection
+                                                                )
                                                             }
                                                         }
                                                         primary.consume()
@@ -1424,7 +1544,30 @@ class MainActivity : ComponentActivity() {
                                                                     val avgDy = ((p1.position.y - p1.previousPosition.y) +
                                                                         (p2.position.y - p2.previousPosition.y)) / 2f
                                                                     if (kotlin.math.abs(avgDy) > 0f) {
-                                                                        viewModel.adjustScrollOffset(avgDy / charHeight)
+                                                                        // isEdgeAutoScroll = true, not the
+                                                                        // default false: this whole branch
+                                                                        // exists so a user can hold a
+                                                                        // selection handle with one finger
+                                                                        // and scroll into history with a
+                                                                        // second finger to extend the
+                                                                        // selection further - see this
+                                                                        // block's own comment above and
+                                                                        // LaunchedEffect(state.scrollOffset)'s
+                                                                        // doc higher up in this file. That
+                                                                        // effect clears the selection on
+                                                                        // every scrollOffset change UNLESS
+                                                                        // isEdgeAutoScroll was true - passing
+                                                                        // the default false here meant every
+                                                                        // single tick of this exact gesture
+                                                                        // wiped the selection it was supposed
+                                                                        // to be extending, which is what read
+                                                                        // as "the selected region itself
+                                                                        // moves/slides" (selectionState kept
+                                                                        // getting cleared and re-anchored by
+                                                                        // SelectionContainer's own row-slot-
+                                                                        // reuse fallback) rather than actually
+                                                                        // growing to cover more scrollback.
+                                                                        viewModel.adjustScrollOffset(avgDy / charHeight, isEdgeAutoScroll = true)
                                                                     }
                                                                 }
                                                             }
@@ -1526,7 +1669,21 @@ class MainActivity : ComponentActivity() {
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
                                                                 val (_, charHeight) = charMetrics
                                                                 if (charHeight > 0f) {
-                                                                    viewModel.adjustScrollOffset(dy / charHeight)
+                                                                    // Same reasoning as the equivalent
+                                                                    // call above, right before this loop
+                                                                    // starts - see its own doc. This is
+                                                                    // the continuation of that SAME drag
+                                                                    // once it's already in progress, so
+                                                                    // it needs the identical guard or a
+                                                                    // selection that survived the drag's
+                                                                    // first pixel would still get wiped
+                                                                    // on every subsequent frame of the
+                                                                    // same gesture.
+                                                                    val draggingWithSelection = selectionState.selectedTexts.isNotEmpty()
+                                                                    viewModel.adjustScrollOffset(
+                                                                        dy / charHeight,
+                                                                        isEdgeAutoScroll = draggingWithSelection
+                                                                    )
                                                                 }
                                                             }
                                                             primary.consume()
@@ -2122,7 +2279,28 @@ class MainActivity : ComponentActivity() {
                                         bufferVersion = state.bufferVersion,
                                         palette = terminalPalette,
                                         fontFamily = terminalTypeface,
-                                        fontSizeSp = effectiveTextSize,
+                                        // Split's own per-session size (same
+                                        // state.sessionTextSizes map the primary
+                                        // pane's effectiveTextSize already reads,
+                                        // just keyed on the split partner's own
+                                        // runtimeId instead of activeSessionId) -
+                                        // falls back to the same global textSize
+                                        // the primary pane falls back to until
+                                        // this specific split session gets its
+                                        // own pinch. Previously this hardcoded
+                                        // effectiveTextSize, which meant a pinch
+                                        // on the PRIMARY pane also silently
+                                        // resized the split partner's text (they
+                                        // shared one value with no way to zoom
+                                        // either pane independently), and the
+                                        // split pane itself had no pinch gesture
+                                        // of its own to feed a different value in
+                                        // the first place.
+                                        fontSizeSp = state.sessionTextSizes[splitRuntimeId] ?: textSize,
+                                        zoomEnabled = zoomEnabled,
+                                        onZoomTextSize = { newSize ->
+                                            viewModel.setSessionTextSize(splitRuntimeId, newSize)
+                                        },
                                         broadcastInput = state.broadcastInput,
                                         onToggleBroadcast = { viewModel.setBroadcastInput(!state.broadcastInput) },
                                         onInput = { text ->
@@ -2207,6 +2385,25 @@ class MainActivity : ComponentActivity() {
                                             viewModel.adjustSplitScrollOffset(deltaLines, isEdgeAutoScroll = true)
                                         },
                                         wasLastScrollEdgeAutoScroll = { viewModel.lastSplitScrollWasEdgeAutoScroll },
+                                        // Collapses the split pane's HiddenPaneInputField down to
+                                        // MainActivity's own single insetsController instead of that
+                                        // field deriving its own separate WindowInsetsControllerCompat
+                                        // from LocalView - see HiddenPaneInputField's onRequestShow/
+                                        // onRequestHide doc for why. Before this, split screen had TWO
+                                        // independent controller instances (this file's insetsController,
+                                        // used for the primary pane and for splitFocusRequestSignal's
+                                        // own ground-truth WindowInsetsAnimationCompat.Callback below,
+                                        // AND HiddenPaneInputField's own locally-derived one) both able
+                                        // to issue show()/hide() against the same window - two call
+                                        // sites racing each other with neither aware of the other is
+                                        // exactly the kind of glitch a single ground-truth callback
+                                        // can't fully paper over no matter how correctly its own timing
+                                        // is read. Routing both calls through this same controller
+                                        // means every IME show/hide for split screen now goes through
+                                        // the one instance imeAnimationSettled's onEnd() callback is
+                                        // actually attached to.
+                                        onImeRequestShow = { insetsController.show(WindowInsetsCompat.Type.ime()) },
+                                        onImeRequestHide = { insetsController.hide(WindowInsetsCompat.Type.ime()) },
                                         // Supply More actions for the split pane's own
                                         // selection toolbar — clone opens a NEW split
                                         // with a copy of this split session (primary
@@ -2246,6 +2443,65 @@ class MainActivity : ComponentActivity() {
                                 // the keyboard showing or hiding, not just with the settings
                                 // toggle. When the soft keyboard is disabled entirely, the bar
                                 // just follows the settings toggle as before.
+                // Same keymap-trigger parsing the split branch's own
+                // VirtualKeyBar.onKeymapTriggered used to have inlined -
+                // pulled to a local val so it can be shared between
+                // VirtualKeyBar and the now-independent KeymapperRow (see
+                // KeymapperRow's own doc, and KEYMAPPER_ENABLED). Routing
+                // logic (splitPaneFocused/targetSplitId) is unchanged.
+                val onSplitKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit = { entry ->
+                    // Each saved shortcut is a short list of VirtualKey
+                    // names (e.g. ["CTRL", "ESC"]) - CTRL/ALT act as
+                    // modifiers on whatever key follows them, same as a
+                    // one-shot tap on the real key bar; every other key in
+                    // the list just sends its own escape sequence in order.
+                    var pendingCtrl = false
+                    var pendingAlt = false
+                    val sequence = StringBuilder()
+                    entry.keys.forEach { keyName ->
+                        val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
+                        when (vk) {
+                            VirtualKey.CTRL -> pendingCtrl = true
+                            VirtualKey.ALT -> pendingAlt = true
+                            null -> {}
+                            else -> {
+                                var seq = vk.sendSequence
+                                if (pendingCtrl) {
+                                    seq = seq.map(::applyCtrl).joinToString("")
+                                    pendingCtrl = false
+                                }
+                                if (pendingAlt) {
+                                    seq = "\u001B$seq"
+                                    pendingAlt = false
+                                }
+                                sequence.append(seq)
+                            }
+                        }
+                    }
+                    if (sequence.isNotEmpty()) {
+                        // Route to whichever pane last reported focus -
+                        // see splitPaneFocused's doc above. Without this,
+                        // a keymap tapped while the split pane is focused
+                        // silently landed in the primary session instead.
+                        val targetSplitId = splitRuntimeId
+                        if (splitPaneFocused && targetSplitId != null) {
+                            viewModel.sendInputTo(targetSplitId, sequence.toString())
+                        } else {
+                            viewModel.sendInput(sequence.toString())
+                        }
+                    }
+                }
+                // Independent of virtualKeysEnabled - same visibility
+                // condition as the key bar minus that one flag, so the
+                // keymap row stays usable even with the key bar itself
+                // turned off. See KeymapperRow's doc.
+                if (keymapperEnabled && (splitPaneFocused || !softKeyboardEnabled || keyboardOpen)) {
+                    KeymapperRow(
+                        keymaps = keymaps,
+                        onKeymapTriggered = onSplitKeymapTriggered,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
                 androidx.compose.animation.AnimatedVisibility(
                                     // While the split pane is focused, show the bar
                                     // unconditionally rather than gating on keyboardOpen.
@@ -2288,49 +2544,6 @@ class MainActivity : ComponentActivity() {
                                     VirtualKeyBar(
                                         ctrlActive = ctrlActive,
                                         altActive = altActive,
-                                        keymaps = keymaps,
-                                        onKeymapTriggered = { entry ->
-                                            // Each saved shortcut is a short list of VirtualKey
-                                            // names (e.g. ["CTRL", "ESC"]) - CTRL/ALT act as
-                                            // modifiers on whatever key follows them, same as a
-                                            // one-shot tap on the real key bar; every other key in
-                                            // the list just sends its own escape sequence in order.
-                                            var pendingCtrl = false
-                                            var pendingAlt = false
-                                            val sequence = StringBuilder()
-                                            entry.keys.forEach { keyName ->
-                                                val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
-                                                when (vk) {
-                                                    VirtualKey.CTRL -> pendingCtrl = true
-                                                    VirtualKey.ALT -> pendingAlt = true
-                                                    null -> {}
-                                                    else -> {
-                                                        var seq = vk.sendSequence
-                                                        if (pendingCtrl) {
-                                                            seq = seq.map(::applyCtrl).joinToString("")
-                                                            pendingCtrl = false
-                                                        }
-                                                        if (pendingAlt) {
-                                                            seq = "\u001B$seq"
-                                                            pendingAlt = false
-                                                        }
-                                                        sequence.append(seq)
-                                                    }
-                                                }
-                                            }
-                                            if (sequence.isNotEmpty()) {
-                                                // Route to whichever pane last reported focus -
-                                                // see splitPaneFocused's doc above. Without this,
-                                                // a keymap tapped while the split pane is focused
-                                                // silently landed in the primary session instead.
-                                                val targetSplitId = splitRuntimeId
-                                                if (splitPaneFocused && targetSplitId != null) {
-                                                    viewModel.sendInputTo(targetSplitId, sequence.toString())
-                                                } else {
-                                                    viewModel.sendInput(sequence.toString())
-                                                }
-                                            }
-                                        },
                                         onTextSubmitted = { text ->
                                             val targetSplitId = splitRuntimeId
                                             if (splitPaneFocused && targetSplitId != null) {
@@ -2359,36 +2572,31 @@ class MainActivity : ComponentActivity() {
                                             // long-text page while typing into the split pane.
                                             val targetSplitId = splitRuntimeId
                                             if (splitPaneFocused && targetSplitId != null) {
-                                                if (settledKeyboardOpen) {
-                                                    // Signal the split pane to reclaim its own
-                                                    // HiddenPaneInputField focus - this is the ONLY
-                                                    // show() call for this path. It used to be paired
-                                                    // with a direct
-                                                    // currentView.post { insetsController.show(...) }
-                                                    // fired right here (reasoned as "reinforcing" the
-                                                    // signal path in case it lost the race) - but that
-                                                    // direct call uses MainActivity's own
-                                                    // insetsController/view, completely independent of
-                                                    // HiddenPaneInputField's own focusRequester. At the
-                                                    // moment this fires there is no focused field yet
-                                                    // for the system to attach the keyboard to - the
-                                                    // signal chain (splitFocusRequestSignal++ ->
-                                                    // SplitTerminalPane's LaunchedEffect -> focusToken++
-                                                    // -> HiddenPaneInputField's own
-                                                    // LaunchedEffect(activationKey) -> requestFocus() +
-                                                    // show() together) hasn't run yet. A show() request
-                                                    // with nothing focused is a well-known Android/
-                                                    // Compose race that fails SILENTLY, and once real
-                                                    // focus lands a frame later nothing re-fires show()
-                                                    // for it - the IME never (re)appears. That silent
-                                                    // failure is exactly the "swipe-right in split
-                                                    // screen, IME closes itself" bug: this path only
-                                                    // runs in split screen (the primary branch below
-                                                    // never had this second call), which is why the
-                                                    // same swipe worked fine there.
-                                                    splitFocusRequestSignal++
-                                                    lastKeyboardIntentOpen = true
-                                                }
+                                                // Fire the split pane's own refocus synchronously,
+                                                // right here - same as the non-split branch below
+                                                // does with focusRequester.requestFocus(). The
+                                                // earlier version deferred this until
+                                                // imeAnimationSettled confirmed the platform's own
+                                                // WindowInsetsAnimationCompat.Callback.onEnd() had
+                                                // fired, reasoning that firing synchronously could
+                                                // race a still-running close animation. But
+                                                // clearFocus(force = true) just above (in
+                                                // VirtualKeyBar) already drops Compose focus with
+                                                // NOTHING else claiming it in the same frame - with
+                                                // no field holding an input connection, the real
+                                                // platform IME starts its own hide animation
+                                                // immediately, before imeAnimationSettled ever gets a
+                                                // chance to change. That's what actually surfaced as
+                                                // "opens for a split second and closes again" here:
+                                                // the keyboard was genuinely closing (unclaimed-focus
+                                                // gap), and only afterward did the deferred branch
+                                                // catch up and reopen it - a real close-then-reopen,
+                                                // not a settling-animation timing issue. Requesting
+                                                // focus synchronously, in the same frame clearFocus
+                                                // ran, closes that gap the same way the non-split
+                                                // branch already does.
+                                                splitFocusRequestSignal++
+                                                lastKeyboardIntentOpen = true
                                             } else if (settledKeyboardOpen) {
                                                 focusRequester.requestFocus()
                                                 currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }

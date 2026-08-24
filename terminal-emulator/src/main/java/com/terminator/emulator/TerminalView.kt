@@ -34,6 +34,7 @@ import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -332,36 +333,56 @@ fun TerminalView(
                 androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
                 }
                 // Freeze the row text this overlay shows while a selection is
-                // active. Without this, every bufferVersion bump (i.e. every
-                // burst of new terminal output - the textbook case: the user
-                // starts a long-press selection while a command is still
-                // producing output) recomposes this whole TerminalView
-                // function body, which re-reads buffer.rowPlainText(row,
-                // scrollOffset) for every row right under SelectionContainer.
-                // That handed the SAME row Composable slots DIFFERENT text
-                // mid-drag - exactly the "row slots get different text"
-                // problem this file's LaunchedEffect(state.scrollOffset) doc
-                // (in MainActivity) already describes for scrollOffset
-                // changes, just triggered by ordinary new output instead.
-                // SelectionContainer has no way to reconcile that: it found
-                // its selection pointing at text that's no longer there and
-                // silently collapsed it to empty (visible in logcat as
-                // selectedTexts changed, count=0 with no scrollOffset change
-                // anywhere near it - the actual bug report this fixes).
-                // remember + a manual snapshot, rather than reading
-                // buffer.rowPlainText directly in the loop below, means once
-                // a selection starts this Column keeps showing exactly the
-                // text it started with regardless of how many more
-                // bufferVersion bumps arrive - new output still lands on the
-                // Canvas (which isn't frozen and doesn't need to be, it owns
-                // no selection state), just not on this invisible text layer
-                // until the selection ends. isNotEmpty() re-snapshots on
-                // every recomposition while a selection is active so drag-
-                // to-extend still grows into freshly-frozen rows as the
-                // selection itself grows - only the "new output changed
-                // rows the user isn't touching" case is what's actually
-                // being guarded against here, not selection growth itself.
-                val frozenRowText = remember(debugLabel) { mutableStateOf<List<String>?>(null) }
+                // active, but re-freeze on every scrollOffset change - not
+                // just once when the selection starts. Without this, every
+                // bufferVersion bump (i.e. every burst of new terminal
+                // output - the textbook case: the user starts a long-press
+                // selection while a command is still producing output)
+                // recomposes this whole TerminalView function body, which
+                // re-reads buffer.rowPlainText(row, scrollOffset) for every
+                // row right under SelectionContainer. That handed the SAME
+                // row Composable slots DIFFERENT text mid-drag - exactly the
+                // "row slots get different text" problem this file's
+                // LaunchedEffect(state.scrollOffset) doc (in MainActivity)
+                // already describes for scrollOffset changes, just
+                // triggered by ordinary new output instead. SelectionContainer
+                // has no way to reconcile that: it found its selection
+                // pointing at text that's no longer there and silently
+                // collapsed it to empty (visible in logcat as selectedTexts
+                // changed, count=0 with no scrollOffset change anywhere near
+                // it - the actual bug report this fixes).
+                //
+                // remember(debugLabel, scrollOffset) - not just
+                // remember(debugLabel) - is what makes this re-freeze on
+                // scroll: MainActivity's own gesture code (see its
+                // isEdgeAutoScroll doc) now deliberately keeps a selection
+                // alive across a drag-to-scroll gesture instead of clearing
+                // it, specifically so the user can drag anywhere to scroll
+                // scrollback while extending what's selected. With the old
+                // remember(debugLabel) key, once a selection started this
+                // Column kept showing the ORIGINAL scrollOffset's text
+                // forever, so scrolling moved the live Canvas underneath but
+                // left this invisible selection layer (and therefore
+                // SelectionContainer's own idea of what's selected and where)
+                // pointed at stale, no-longer-visible rows - the selection
+                // looked like it "slid" along with the fixed set of frozen
+                // rows instead of growing to cover the newly-scrolled-into
+                // ones, and since the same *character offsets* mean
+                // completely different actual buffer rows after a scroll,
+                // SelectionContainer's own anchor/focus indices went stale
+                // against the frozen text and it silently collapsed the
+                // selection to empty on the very next recomposition - both
+                // halves of the reported bug at once.
+                //
+                // isNotEmpty() re-snapshots on every recomposition while a
+                // selection is active so drag-to-extend still grows into
+                // freshly-frozen rows as the selection itself grows - only
+                // the "new output changed rows the user isn't touching"
+                // case is what's actually being guarded against here (via
+                // the debugLabel/scrollOffset key staying put across
+                // ordinary bufferVersion-only recompositions), not selection
+                // growth or scroll-driven row changes.
+                val frozenRowText = remember(debugLabel, scrollOffset) { mutableStateOf<List<String>?>(null) }
                 if (selectionState.selectedTexts.isEmpty()) {
                     frozenRowText.value = null
                 } else if (frozenRowText.value == null) {
@@ -377,18 +398,46 @@ fun TerminalView(
                     val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
                     val frozen = frozenRowText.value
                     for (row in 0 until buffer.rows) {
-                        BasicText(
-                            text = frozen?.getOrNull(row) ?: buffer.rowPlainText(row, scrollOffset),
-                            style = TextStyle(
-                                color = Color.Transparent,
-                                fontSize = fontSizeSp.sp,
-                                fontFamily = FontFamily.Monospace
-                            ),
-                            softWrap = false,
-                            modifier = Modifier
-                                .height(rowHeightDp)
-                                .width(rowWidthDp)
-                        )
+                        // key(row) pins each row's BasicText to a stable slot
+                        // identity across recomposition, keyed on the ON-
+                        // SCREEN row index rather than Compose's default
+                        // position-in-parent identity. Without this,
+                        // JetBrains' own tracker documents SelectionContainer
+                        // silently collapsing an active selection to empty
+                        // once its anchor row scrolls out of view or the
+                        // underlying text-node count/identity churns enough
+                        // (compose-multiplatform#3550 - "stops being
+                        // selectable when logs get too long", and #5048699 -
+                        // "happens whenever the first item selected is
+                        // scrolled out") - SelectionContainer's own anchor/
+                        // focus tracking is built around each selectable
+                        // child being a stable, continuously-composed node,
+                        // not one whose identity is free to be torn down and
+                        // recreated on every scrollOffset-driven
+                        // recomposition the way an un-keyed loop allows.
+                        // key(row) instead of key(row, frozen) deliberately
+                        // keeps the SAME slot identity even as
+                        // frozenRowText's re-freeze (see its own doc above)
+                        // swaps in different scrolled-to text for that row -
+                        // that's exactly what lets SelectionContainer treat
+                        // this as "the same row showing updated content"
+                        // rather than "a different row entirely", which is
+                        // what the selection surviving a scroll actually
+                        // requires.
+                        key(row) {
+                            BasicText(
+                                text = frozen?.getOrNull(row) ?: buffer.rowPlainText(row, scrollOffset),
+                                style = TextStyle(
+                                    color = Color.Transparent,
+                                    fontSize = fontSizeSp.sp,
+                                    fontFamily = FontFamily.Monospace
+                                ),
+                                softWrap = false,
+                                modifier = Modifier
+                                    .height(rowHeightDp)
+                                    .width(rowWidthDp)
+                            )
+                        }
                     }
                 }
             }
