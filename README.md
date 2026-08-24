@@ -34,3 +34,11 @@ Keyboard shortcuts and keymapper support are also provided. You can assign or su
 ## Development status
 
 It is currently under development, more advanced features or improved features will be developed soon, but there may be minor bugs as it is in beta stage and not fully stable.
+
+# Support and Donate
+
+If you want to contribute to the development:
+
+[Support and Donate](https://www.patreon.com/Azccriminal)
+
+[Contributor](https://github.com/8dmusichannels-star/terminator/pulls)
