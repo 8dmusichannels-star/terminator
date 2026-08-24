@@ -24,7 +24,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -83,6 +82,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -130,6 +130,14 @@ fun MultiPaneContainer(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    // Settings > Appearance > Pinch to zoom. Threaded down through
+    // TilingLayout/FloatingLayout to PaneContent's own gesture loop, which
+    // previously ignored this setting entirely (it has its own local,
+    // unrelated-to-MainActivity pinch-zoom implementation - see this file's
+    // top-level doc) - toggling it off did nothing in split/multi-pane
+    // mode. Defaults to true so any other existing caller keeps today's
+    // behavior with no wiring needed.
+    zoomEnabled: Boolean = true,
     onInput: (runtimeId: String, text: String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -183,6 +191,7 @@ fun MultiPaneContainer(
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
+                    zoomEnabled = zoomEnabled,
                     onInput = onInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
@@ -206,6 +215,7 @@ fun MultiPaneContainer(
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
+                    zoomEnabled = zoomEnabled,
                     onInput = onInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
@@ -288,6 +298,7 @@ private fun TilingLayout(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    zoomEnabled: Boolean = true,
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -337,6 +348,27 @@ private fun TilingLayout(
                         val pane = panes.getOrNull(paneIndex)
                         val colWeight = colFractions.getOrElse(colIndex) { 1f / columns }
                         if (pane != null) {
+                            // Keyed on the pane's own runtimeId, not just
+                            // positional call order: without this, Compose
+                            // reuses the composable AT THIS GRID SLOT across
+                            // recompositions purely by call-site position -
+                            // so closing an earlier pane (shifting every
+                            // later pane's paneIndex down by one) silently
+                            // handed each remaining PaneContent instance's
+                            // remembered state (its own zoom level via
+                            // zoomSizeSp, its own text selection via
+                            // rememberSelectionState(), its own scrollOffset)
+                            // to whichever DIFFERENT pane's runtimeId now
+                            // landed on that slot - a stale, wrong-buffer
+                            // selection rectangle (or a zoom level that
+                            // belonged to a different, now-closed session)
+                            // could show up superimposed on the pane that
+                            // took its place. key() forces Compose to treat
+                            // a slot whose runtimeId changed as a brand-new
+                            // composable instance instead, so each pane's
+                            // own remembered state only ever follows that
+                            // pane, however the list reorders or shrinks.
+                            androidx.compose.runtime.key(pane.runtimeId) {
                             Box(modifier = Modifier.weight(colWeight).fillMaxHeight()) {
                                 PaneContent(
                                     runtimeId = pane.runtimeId,
@@ -347,6 +379,7 @@ private fun TilingLayout(
                                     palette = palette,
                                     fontFamily = fontFamily,
                                     fontSizeSp = fontSizeSp,
+                                    zoomEnabled = zoomEnabled,
                                     onInput = { text -> onInput(pane.runtimeId, text) },
                                     onFocus = { onFocusPane(pane.runtimeId) },
                                     onClose = { onClosePane(pane.runtimeId) },
@@ -364,6 +397,7 @@ private fun TilingLayout(
                                     onImeRequestHide = onImeRequestHide,
                                     modifier = Modifier.fillMaxSize()
                                 )
+                            }
                             }
                             // Vertical divider between columns (not after the
                             // last one) - drags redistribute width between
@@ -464,6 +498,7 @@ private fun FloatingLayout(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    zoomEnabled: Boolean = true,
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -488,6 +523,28 @@ private fun FloatingLayout(
         // Sorted by zIndex so later (higher-stacked) panes draw on top,
         // matching what bringPaneToFront just did to the underlying state.
         panes.sortedBy { it.zIndex }.forEach { pane ->
+            // Keyed on the pane's own runtimeId: this list is sorted by
+            // zIndex, which changes on every bringPaneToFront() -
+            // including the one PaneContent's own gesture loop fires via
+            // onFocus() on every single touch, even the initial down of a
+            // pinch. Without an explicit key(), Compose identifies each
+            // iteration's composable by its POSITION in this forEach, not
+            // by which pane it's showing - so the instant a touch
+            // reordered `panes` here, the composable sitting at a given
+            // position silently started rendering a DIFFERENT pane's
+            // content while still holding onto whatever remembered state
+            // (this pane's own zoomSizeSp, its own rememberSelectionState())
+            // belonged to whichever pane used to occupy that slot. That's
+            // what made pinch-zoom "geri tepiyor" (a touch reorders the
+            // stack the moment it lands, so the zoom level the user was
+            // mid-gesture on could get silently swapped for a different
+            // pane's remembered zoom) and could just as easily surface a
+            // stale, wrong-buffer text selection rectangle left over from
+            // whatever pane previously occupied that slot. key() forces a
+            // slot whose runtimeId changed to be torn down and recomposed
+            // as a genuinely new instance instead, so all of this state
+            // only ever follows its own pane regardless of stacking order.
+            androidx.compose.runtime.key(pane.runtimeId) {
             // Clamp so a window dragged/restored from a larger screen still
             // has at least its header reachable on a smaller one, rather
             // than becoming a permanently off-screen, unrecoverable pane.
@@ -520,6 +577,7 @@ private fun FloatingLayout(
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
+                    zoomEnabled = zoomEnabled,
                     onInput = { text -> onInput(pane.runtimeId, text) },
                     onFocus = { onFocusPane(pane.runtimeId) },
                     onClose = { onClosePane(pane.runtimeId) },
@@ -559,6 +617,7 @@ private fun FloatingLayout(
                     modifier = Modifier.fillMaxSize()
                 )
             }
+            }
         }
     }
 }
@@ -580,6 +639,11 @@ private fun PaneContent(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    // See MultiPaneContainer's own doc on this param - gates only the
+    // zoomSizeSp write below (the pinch/pan loop's scroll handling stays
+    // active either way, same as the primary pane's identical zoomEnabled
+    // gate in MainActivity).
+    zoomEnabled: Boolean = true,
     onInput: (String) -> Unit,
     onFocus: () -> Unit,
     onClose: () -> Unit,
@@ -645,6 +709,24 @@ private fun PaneContent(
     // pane's runtimeId changes (a different session took this slot).
     var zoomSizeSp by remember(runtimeId) { androidx.compose.runtime.mutableStateOf<Float?>(null) }
     val effectiveFontSizeSp = zoomSizeSp ?: fontSizeSp
+    // The pinch/pan gesture loop below lives inside a long-running
+    // awaitEachGesture { } coroutine launched once per pointerInput(runtimeId)
+    // key change - the plain `effectiveFontSizeSp` val above is only the
+    // value captured at that launch moment, not a live read. Every pinch
+    // frame recomputes zoomSizeSp from `effectiveFontSizeSp * frameZoom`
+    // (see the loop below), so once the loop's closure was holding a stale
+    // captured size, each frame's zoom ratio kept compounding against that
+    // same stale base instead of the size the previous frame just wrote -
+    // the result either ran away in one direction until it hit the
+    // coerceIn(8f, 32f) clamp and stopped dead ("takılıp kalıyor"), or the
+    // clamp let a large single-frame jump through and snapped back once a
+    // later frame recomputed against the real (much larger/smaller) live
+    // size - both read as "geri tepiyor". rememberUpdatedState mirrors
+    // MainActivity's own latestEffectiveTextSize fix for the identical
+    // primary-pane bug: reading .value inside the gesture loop always sees
+    // the size as of the most recent recomposition, so each frame's zoom
+    // compounds against the real current size instead of a stale snapshot.
+    val latestEffectiveFontSizeSp = rememberUpdatedState(effectiveFontSizeSp)
 
     // Same char-metric formula MainActivity's primary pane uses, scoped to
     // this pane's own current font size so its own resize computation is
@@ -685,6 +767,24 @@ private fun PaneContent(
     }
     val latestOnMeasuredSize = rememberUpdatedState(onMeasuredSize)
     val latestCharMetrics = rememberUpdatedState(charMetrics)
+    // Set true for the duration of a manual corner-handle resize drag (see
+    // onDragStart/onDragEnd below) so onSizeChanged's own debounce can tell
+    // "the IME is animating past this size" apart from "the user is
+    // actively dragging the resize handle and wants to see the terminal
+    // grid follow their finger". Both paths land in the same onSizeChanged
+    // callback (dragging the handle changes pane.floatSize, which resizes
+    // this Box, which is exactly what onSizeChanged already observes for
+    // the IME case) - previously both were debounced by the same fixed
+    // 120ms, which is short enough to be invisible for a one-shot IME
+    // animation but reads as a visible lag ("boyutlandirirken metinler gec
+    // boyutlaniyor") for a drag that keeps reporting a new size every
+    // frame: cancelling and restarting a 120ms timer on every single frame
+    // of a multi-second drag means the pty is never actually resized until
+    // the finger stops moving for a full 120ms, so the Canvas box visibly
+    // grows/shrinks under the user's finger while the character grid
+    // inside it stays pinned at its old column/row count the entire time.
+    var isManuallyResizing by remember(runtimeId) { mutableStateOf(false) }
+    val latestIsManuallyResizing = rememberUpdatedState(isManuallyResizing)
 
     // Local scroll offset into this pane's own scrollback - independent of
     // every other pane's, and of the classic single-pane view's scrollOffset.
@@ -809,10 +909,22 @@ private fun PaneContent(
                             // gets pushed to the pty; every transient size
                             // reported mid-IME-animation gets superseded
                             // before its own delay fires.
+                            //
+                            // While a manual corner-handle drag is in
+                            // progress (isManuallyResizing, see its own doc
+                            // just above), fall to a much shorter ~2-frame
+                            // delay instead of the full 120ms: still enough
+                            // to coalesce the handful of onSizeChanged calls
+                            // Compose can deliver within a single frame, but
+                            // short enough that the pty (and therefore the
+                            // Canvas grid actually drawing new content) keeps
+                            // up with the finger in real time rather than
+                            // only catching up once the whole drag ends.
                             latestPaneSizePx = sizePx
                             paneResizeDebounceJob?.cancel()
+                            val debounceMs = if (latestIsManuallyResizing.value) 32L else 120L
                             paneResizeDebounceJob = paneResizeScope.launch {
-                                delay(120)
+                                delay(debounceMs)
                                 val (charWidth, charHeight) = latestCharMetrics.value
                                 val finalSize = latestPaneSizePx
                                 if (charWidth > 0f && charHeight > 0f && finalSize != null) {
@@ -822,59 +934,179 @@ private fun PaneContent(
                                 }
                             }
                         }
-                        // Single gesture loop per pane. On tap: focus the pane
-                        // AND bump focusToken so HiddenPaneInputField's IME
-                        // show re-fires even when isFocused was already true —
-                        // see focusToken's doc above. Mouse reporting path
-                        // mirrors SplitTerminalPane: when the session has
-                        // enabled xterm mouse mode (DECSET 1000/1002/1003),
-                        // press/drag/release become mouse escape sequences
-                        // instead of plain tap-to-focus, so ncurses programs
-                        // (mc, vim, htop) running in a multi-pane tile
-                        // actually receive mouse input.
+                        // Single gesture loop per pane, merging what used to be
+                        // two independent, stacked pointerInput blocks (one
+                        // awaitEachGesture for tap-focus/mouse-reporting, one
+                        // detectTransformGestures for pinch-zoom/pan). Two
+                        // sibling pointerInput modifiers both read the SAME
+                        // raw pointer stream - Compose doesn't merge their
+                        // interpretation of it, so the first block's loop
+                        // (which starts consuming/awaiting on every down)
+                        // regularly finished or claimed the gesture before
+                        // detectTransformGestures ever saw a coherent second
+                        // pointer, which is why pinch-to-zoom (and, less
+                        // consistently, pan) never worked reliably here even
+                        // though the identical zoom math worked fine on the
+                        // primary pane. This is the exact hazard the primary
+                        // pane's own gesture loop in MainActivity documents
+                        // (see its "give the child first, uncontested crack
+                        // at every down" comment) - merging into one loop
+                        // here applies that same fix at the tile level: one
+                        // reader of the pointer stream, one place that
+                        // decides mouse vs. pinch vs. pan vs. tap, and (by
+                        // waiting rather than eagerly consuming single-finger
+                        // movement) an uncontested window for TerminalView's
+                        // own internal long-press-to-select detector to
+                        // claim the gesture first, same as the primary pane.
                         .pointerInput(runtimeId) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 onFocus()
                                 focusToken++
-                                val mouseWanted = onWantsMouseEvents()
-                                if (!mouseWanted || charMetrics.first <= 0f || charMetrics.second <= 0f) {
+
+                                if (onWantsMouseEvents() && charMetrics.first > 0f && charMetrics.second > 0f) {
+                                    // Mouse reporting owns the whole gesture,
+                                    // same as before: press/drag/release become
+                                    // xterm mouse escape sequences instead of
+                                    // tap-to-focus/pinch/pan.
+                                    down.consume()
+                                    fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
+                                        (offset.x / charMetrics.first).toInt() to (offset.y / charMetrics.second).toInt()
+                                    var (col, row) = cellOf(down.position)
+                                    onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull() ?: break
+                                        change.consume()
+                                        if (!change.pressed) {
+                                            val (rCol, rRow) = cellOf(change.position)
+                                            onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+                                            break
+                                        }
+                                        val (dCol, dRow) = cellOf(change.position)
+                                        if (dCol != col || dRow != row) {
+                                            col = dCol; row = dRow
+                                            onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                        }
+                                    }
                                     return@awaitEachGesture
                                 }
-                                down.consume()
-                                fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
-                                    (offset.x / charMetrics.first).toInt() to (offset.y / charMetrics.second).toInt()
-                                var (col, row) = cellOf(down.position)
-                                onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    val change = event.changes.firstOrNull() ?: break
-                                    change.consume()
-                                    if (!change.pressed) {
-                                        val (rCol, rRow) = cellOf(change.position)
-                                        onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
+
+                                // No mouse reporting: give TerminalView's own
+                                // long-press-select detector first crack at a
+                                // stationary single finger, exactly like the
+                                // primary pane. Watch without consuming until
+                                // either a second finger lands (pinch), the
+                                // finger moves past touch slop (pan), the
+                                // system long-press timeout elapses (hand off
+                                // to selection entirely), or the finger lifts
+                                // (plain tap - nothing left to do here).
+                                val longPressDeadline = System.nanoTime() +
+                                    viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                                var longPressCandidate = true
+                                var pinchStartMidY: Float? = null
+                                while (longPressCandidate) {
+                                    val remainingMillis = (longPressDeadline - System.nanoTime()) / 1_000_000L
+                                    if (remainingMillis <= 0L) break
+                                    val event = withTimeoutOrNull(remainingMillis) { awaitPointerEvent() } ?: break
+                                    val changes = event.changes
+                                    val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
+                                    if (primary == null || !changes.any { it.pressed }) {
+                                        // Lifted before the timeout - plain tap.
+                                        return@awaitEachGesture
+                                    }
+                                    val pressedNow = changes.filter { it.pressed }
+                                    if (pressedNow.size >= 2) {
+                                        // Second finger landed - pinch, not a
+                                        // long-press. Hand off to the merged
+                                        // pinch/pan loop below, seeded with
+                                        // this event's own midpoint so the
+                                        // very first pan delta is against a
+                                        // real previous position, not null.
+                                        val p1 = pressedNow[0]
+                                        val p2 = pressedNow[1]
+                                        pinchStartMidY = (p1.position.y + p2.position.y) / 2f
+                                        longPressCandidate = false
                                         break
                                     }
-                                    val (dCol, dRow) = cellOf(change.position)
-                                    if (dCol != col || dRow != row) {
-                                        col = dCol; row = dRow
-                                        onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
+                                    val totalDx = primary.position.x - down.position.x
+                                    val totalDy = primary.position.y - down.position.y
+                                    if (kotlin.math.sqrt(totalDx * totalDx + totalDy * totalDy) > viewConfiguration.touchSlop) {
+                                        // Real single-finger movement - this is
+                                        // a pan, not a long-press. Apply this
+                                        // event's own delta right away (same
+                                        // fix as the primary pane: otherwise
+                                        // the bit of motion that crossed touch
+                                        // slop is silently dropped) and fall
+                                        // through to the pan/pinch loop below.
+                                        primary.consume()
+                                        val (_, charHeight) = charMetrics
+                                        if (charHeight > 0f) {
+                                            val deltaLines = -(totalDy / charHeight)
+                                            val maxOffset = buffer.maxScrollOffset
+                                            scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                        }
+                                        longPressCandidate = false
+                                        break
                                     }
+                                    // Still down, stationary, timeout not yet
+                                    // reached - keep waiting without consuming.
                                 }
-                            }
-                        }
-                        .pointerInput(runtimeId) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                if (zoom != 1f) {
-                                    val newSize = (effectiveFontSizeSp * zoom).coerceIn(8f, 32f)
-                                    zoomSizeSp = newSize
+                                if (longPressCandidate) {
+                                    // Timeout reached, finger still down and
+                                    // stationary: this is a long-press. Don't
+                                    // read the pointer stream again - hand the
+                                    // rest of the gesture to TerminalView's own
+                                    // selection detector uncontested.
+                                    return@awaitEachGesture
                                 }
-                                if (pan.y != 0f) {
-                                    val (_, charHeight) = charMetrics
-                                    if (charHeight > 0f) {
-                                        val deltaLines = -(pan.y / charHeight)
-                                        val maxOffset = buffer.maxScrollOffset
-                                        scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+
+                                var lastMidY: Float? = pinchStartMidY
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val changes = event.changes
+                                    val pressed = changes.filter { it.pressed }
+                                    if (pressed.isEmpty()) break
+                                    if (pressed.size >= 2) {
+                                        val p1 = pressed[0]
+                                        val p2 = pressed[1]
+                                        p1.consume(); p2.consume()
+                                        val prevDist = (p1.previousPosition - p2.previousPosition).getDistance()
+                                        val curDist = (p1.position - p2.position).getDistance()
+                                        if (prevDist > 0f && zoomEnabled) {
+                                            val zoom = curDist / prevDist
+                                            if (zoom != 1f) {
+                                                val newSize = (latestEffectiveFontSizeSp.value * zoom).coerceIn(8f, 32f)
+                                                zoomSizeSp = newSize
+                                            }
+                                        }
+                                        val midY = (p1.position.y + p2.position.y) / 2f
+                                        val prevMidY = lastMidY
+                                        if (prevMidY != null) {
+                                            val (_, charHeight) = charMetrics
+                                            if (charHeight > 0f) {
+                                                val deltaLines = -((midY - prevMidY) / charHeight)
+                                                if (deltaLines != 0f) {
+                                                    val maxOffset = buffer.maxScrollOffset
+                                                    scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                                }
+                                            }
+                                        }
+                                        lastMidY = midY
+                                    } else {
+                                        lastMidY = null
+                                        val change = pressed.first()
+                                        change.consume()
+                                        val dy = change.position.y - change.previousPosition.y
+                                        if (dy != 0f) {
+                                            val (_, charHeight) = charMetrics
+                                            if (charHeight > 0f) {
+                                                val deltaLines = -(dy / charHeight)
+                                                val maxOffset = buffer.maxScrollOffset
+                                                scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1047,11 +1279,62 @@ private fun PaneContent(
                                 onDragStart = {
                                     accumulated = Offset.Zero
                                     onDragStart()
+                                    // See isManuallyResizing's own doc above -
+                                    // switches onSizeChanged's debounce down
+                                    // to a short throttle for the duration of
+                                    // this drag so the terminal grid actually
+                                    // follows the finger instead of only
+                                    // catching up once it lifts.
+                                    isManuallyResizing = true
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
                                     accumulated += dragAmount
                                     onResizeDrag(accumulated)
+                                },
+                                onDragEnd = {
+                                    // Drop straight back to the normal 120ms
+                                    // debounce, AND fire one final immediate
+                                    // commit of whatever size the last
+                                    // onSizeChanged reported - without this,
+                                    // if the finger lifts before the last
+                                    // in-flight 32ms job fires, the very last
+                                    // few pixels of the drag could otherwise
+                                    // wait out a full 120ms (the next
+                                    // onSizeChanged's debounce, now back to
+                                    // its normal length) before the pty
+                                    // caught up, reintroducing exactly the
+                                    // lag this change exists to remove right
+                                    // at the moment the drag ends.
+                                    isManuallyResizing = false
+                                    paneResizeDebounceJob?.cancel()
+                                    val (charWidth, charHeight) = latestCharMetrics.value
+                                    val finalSize = latestPaneSizePx
+                                    if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                        val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                        val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                        latestOnMeasuredSize.value(cols, rws)
+                                    }
+                                },
+                                onDragCancel = {
+                                    // Same immediate-commit reasoning as
+                                    // onDragEnd - a cancelled gesture still
+                                    // leaves pane.floatSize at wherever the
+                                    // drag last moved it, so the pty still
+                                    // needs to catch up to that final size
+                                    // rather than being left waiting on a
+                                    // debounce that a lifted/cancelled finger
+                                    // will never trigger another onSizeChanged
+                                    // to restart.
+                                    isManuallyResizing = false
+                                    paneResizeDebounceJob?.cancel()
+                                    val (charWidth, charHeight) = latestCharMetrics.value
+                                    val finalSize = latestPaneSizePx
+                                    if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                        val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                        val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                        latestOnMeasuredSize.value(cols, rws)
+                                    }
                                 }
                             )
                         }

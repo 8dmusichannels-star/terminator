@@ -141,6 +141,14 @@ object SettingsKeys {
     // Keyboard
     val SOFT_KEYBOARD = booleanPreferencesKey("soft_keyboard")
     val VIRTUAL_KEYS = booleanPreferencesKey("virtual_keys")
+    // Whether VirtualKeyBar's own keymap row (the user's saved keyboard
+    // shortcuts, shown as tappable chips inside the bar) is enabled.
+    // Previously there was no separate flag for this at all - the keymap
+    // row's visibility was entirely tied to VIRTUAL_KEYS, so turning the
+    // virtual key bar off also silently killed keymap shortcuts, and there
+    // was no way to have one without the other. Independent of VIRTUAL_KEYS
+    // and defaults to true so existing keymap users see no behavior change.
+    val KEYMAPPER_ENABLED = booleanPreferencesKey("keymapper_enabled")
     val INPUT_MODE = stringPreferencesKey("input_mode")
     val SECCOMP_ENABLED = booleanPreferencesKey("seccomp_enabled")
     val KEYMAPS = stringPreferencesKey("keymaps_json")
