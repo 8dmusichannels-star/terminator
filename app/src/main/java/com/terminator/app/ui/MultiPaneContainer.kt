@@ -78,6 +78,11 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
@@ -652,6 +657,35 @@ private fun PaneContent(
         metricsPaint.measureText("M") to metricsPaint.fontSpacing
     }
 
+    // Debounces this pane's own onSizeChanged the same way MainActivity's
+    // primary-pane Box already does (see its own onSizeChanged doc) -
+    // imePadding()-driven resizes report a new size on every frame of the
+    // IME's ~250-300ms show/hide animation, not just once at the end.
+    // MultiPaneContainer's per-tile onSizeChanged used to forward every one
+    // of those straight to onMeasuredSize -> onResizeSessionPty ->
+    // TerminalSession.resize(), so full-screen ncurses programs (vim, mc,
+    // htop) running in a tile got a burst of SIGWINCH + full-redraw cycles
+    // against transient mid-animation sizes on every keyboard open/close -
+    // each redraw against a size that was already stale a frame later is
+    // what showed up as a brief blackout/flicker right as the IME closed.
+    // The classic single/split-pane view never had this because its own
+    // resize goes through updateTerminalSize(), which every live session
+    // (including the split partner) shares - and that path already sits
+    // behind MainActivity's 120ms debounce. Multi-pane tiles use the
+    // separate per-runtime updateTerminalSizeFor() path instead (see its
+    // own doc: "each multi-pane pane has its own independent on-screen
+    // size"), which had no debounce of its own until now - this mirrors
+    // that same fix at this call site instead.
+    val paneResizeScope = rememberCoroutineScope()
+    var paneResizeDebounceJob by remember(runtimeId) {
+        mutableStateOf<Job?>(null)
+    }
+    var latestPaneSizePx by remember(runtimeId) {
+        mutableStateOf<IntSize?>(null)
+    }
+    val latestOnMeasuredSize = rememberUpdatedState(onMeasuredSize)
+    val latestCharMetrics = rememberUpdatedState(charMetrics)
+
     // Local scroll offset into this pane's own scrollback - independent of
     // every other pane's, and of the classic single-pane view's scrollOffset.
     var scrollOffset by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
@@ -769,11 +803,23 @@ private fun PaneContent(
                     modifier = Modifier
                         .fillMaxSize()
                         .onSizeChanged { sizePx ->
-                            val (charWidth, charHeight) = charMetrics
-                            if (charWidth > 0f && charHeight > 0f) {
-                                val cols = (sizePx.width / charWidth).toInt().coerceAtLeast(1)
-                                val rws = (sizePx.height / charHeight).toInt().coerceAtLeast(1)
-                                onMeasuredSize(cols, rws)
+                            // Debounced - see this pane's own resize-debounce
+                            // doc above. Only the size that's still current
+                            // 120ms after the LAST onSizeChanged call actually
+                            // gets pushed to the pty; every transient size
+                            // reported mid-IME-animation gets superseded
+                            // before its own delay fires.
+                            latestPaneSizePx = sizePx
+                            paneResizeDebounceJob?.cancel()
+                            paneResizeDebounceJob = paneResizeScope.launch {
+                                delay(120)
+                                val (charWidth, charHeight) = latestCharMetrics.value
+                                val finalSize = latestPaneSizePx
+                                if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                    val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                    val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                    latestOnMeasuredSize.value(cols, rws)
+                                }
                             }
                         }
                         // Single gesture loop per pane. On tap: focus the pane

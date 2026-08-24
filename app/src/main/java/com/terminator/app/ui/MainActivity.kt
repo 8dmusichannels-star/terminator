@@ -1116,7 +1116,7 @@ class MainActivity : ComponentActivity() {
                                     onExitMultiPane = { viewModel.exitMultiPaneMode() },
                                     onWantsMouseEvents = { runtimeId -> viewModel.sessionWantsMouseEvents(runtimeId) },
                                     onMouseEvent = { runtimeId, kind, col, row -> viewModel.sendMouseEventTo(runtimeId, kind, col, row) },
-                                    onCloneSession = { runtimeId -> viewModel.duplicateSession(runtimeId) },
+                                    onCloneSession = { runtimeId -> viewModel.clonePaneSession(runtimeId) },
                                     onToggleWakeUp = { runtimeId -> viewModel.toggleWakeUp(runtimeId) },
                                     wakeUpActiveFor = { runtimeId ->
                                         state.runningSessions.firstOrNull { it.runtimeId == runtimeId }?.wakeUp == true
