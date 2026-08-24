@@ -40,5 +40,7 @@ It is currently under development, more advanced features or improved features w
 
 If you want to contribute to the development:
 
-{Support and Donate}[https://www.patreon.com/Azccriminal]
-{Contributor}[https://github.com/8dmusichannels-star/terminator/pulls]
+[Support and Donate](https://www.patreon.com/Azccriminal)
+
+[Contributor](https://github.com/8dmusichannels-star/terminator/pulls)
+
