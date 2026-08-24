@@ -29,8 +29,15 @@ As keyboard, soft keyboard (tap to terminal open/close) and virtual key are supp
 - **VT100** — color support is limited and it does not work even without a terminfo entry
 - **ANSI** — color support, but it is compatible with DOS.
 
+
 Keyboard shortcuts and keymapper support are also provided. You can assign or support virtual keyboards directly from the physical keyboard. And there is also seccomp support to solve operation not permitted errors. and there are more features
 
 ## Development status
 
 It is currently under development, more advanced features or improved features will be developed soon, but there may be minor bugs as it is in beta stage and not fully stable.
+
+# Support and Donate
+
+If you want to contribute to the development:
+[Support and Donate]{https://www.patreon.com/Azccriminal}
+[Contributor]{https://github.com/8dmusichannels-star/terminator/pulls}
