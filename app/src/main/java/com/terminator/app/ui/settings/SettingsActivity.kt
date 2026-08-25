@@ -39,6 +39,8 @@ import androidx.compose.ui.Modifier
 import com.terminator.app.TerminatorApp
 import com.terminator.app.settings.SettingsKeys
 import com.terminator.app.ui.theme.TerminatorTheme
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 
 /**
  * Settings root: category list, each opening its own sub-page.
@@ -47,23 +49,37 @@ import com.terminator.app.ui.theme.TerminatorTheme
 class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Was TerminatorTheme {} with no argument, which always
+        // defaulted amoledBlack to false - Settings > Theme > AMOLED
+        // Black could be switched on and MainActivity's terminal
+        // screen would follow it correctly, but Settings itself (this
+        // screen and everything under it: Sessions, Appearance, Theme,
+        // Sound, Display, Keyboard, Storage) stayed on the plain
+        // Material You scheme regardless, since nothing here ever read
+        // the setting. Reading it the same way MainActivity and
+        // ThemeSettingsScreen already do and passing it through makes
+        // AMOLED Black an app-wide setting instead of one that only
+        // visibly did anything on the terminal screen.
+        val settingsRepo = (applicationContext as TerminatorApp).settingsRepository
+
+        // collectAsState(initial = false) always renders the very first
+        // frame with amoledBlack hard-coded to false, since Compose has no
+        // way to know the real DataStore value before the flow actually
+        // emits. If AMOLED Black is on, that first frame briefly shows the
+        // plain Material You scheme, then jumps to black the instant the
+        // flow's real value arrives a few ms later - a visible flash on
+        // every screen open. Reading the current value synchronously here,
+        // before setContent ever runs, means the very first frame already
+        // has the right value and collectAsState's "initial" is only ever
+        // used as a fallback that in practice never gets shown.
+        val initialAmoledBlack = runBlocking {
+            settingsRepo.flow(SettingsKeys.AMOLED_BLACK, false).first()
+        }
+
         setContent {
-            // Was TerminatorTheme {} with no argument, which always
-            // defaulted amoledBlack to false - Settings > Theme > AMOLED
-            // Black could be switched on and MainActivity's terminal
-            // screen would follow it correctly, but Settings itself (this
-            // screen and everything under it: Sessions, Appearance, Theme,
-            // Sound, Display, Keyboard, Storage) stayed on the plain
-            // Material You scheme regardless, since nothing here ever read
-            // the setting. Reading it the same way MainActivity and
-            // ThemeSettingsScreen already do and passing it through makes
-            // AMOLED Black an app-wide setting instead of one that only
-            // visibly did anything on the terminal screen.
-            val settingsRepo = remember {
-                (applicationContext as TerminatorApp).settingsRepository
-            }
             val amoledBlack by settingsRepo.flow(SettingsKeys.AMOLED_BLACK, false)
-                .collectAsState(initial = false)
+                .collectAsState(initial = initialAmoledBlack)
             TerminatorTheme(amoledBlack = amoledBlack) {
                 SettingsRoot()
             }
@@ -97,7 +113,15 @@ private fun SettingsRoot() {
         SettingsCategory.KEYBOARD -> KeyboardSettingsScreen(onBack = { openCategory = null })
         SettingsCategory.STORAGE -> StorageSettingsScreen(onBack = { openCategory = null })
         null -> Scaffold(
-            topBar = { TopAppBar(title = { Text("Settings") }) }
+            topBar = {
+                TopAppBar(
+                    title = { Text("Settings") },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        scrolledContainerColor = MaterialTheme.colorScheme.surface
+                    )
+                )
+            }
         ) { padding ->
             LazyColumn(modifier = Modifier.padding(padding).fillMaxSize()) {
                 items(SettingsCategory.values().toList()) { category ->

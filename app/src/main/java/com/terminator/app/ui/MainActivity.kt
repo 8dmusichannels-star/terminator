@@ -32,6 +32,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -128,6 +130,14 @@ class MainActivity : ComponentActivity() {
     // exactly like VirtualKeyBar's own default routing does.
     private var physicalKeyboardRouting = PhysicalKeyboardRouting()
 
+    // Physical-keyboard-to-app-action bindings (see AppShortcuts.kt),
+    // mirrored down from Compose the same way physicalKeyboardRouting
+    // itself is - dispatchKeyEvent runs outside Compose and needs a plain
+    // field it can read fresh on every key press. Empty until the first
+    // LaunchedEffect collection completes, same "no shortcuts yet" state
+    // as an empty KEYMAPS list.
+    private var appShortcuts: List<com.terminator.app.ui.AppShortcutEntry> = emptyList()
+
     // SelectionOverrideToolbar.kt's own doc says this is required
     // alongside the Compose-level NoOpTextToolbar block ("some
     // compose-foundation versions still go through real ActionMode
@@ -172,6 +182,23 @@ class MainActivity : ComponentActivity() {
         if (!PhysicalKeyEvent.isFromPhysicalKeyboard(event)) {
             return super.dispatchKeyEvent(event)
         }
+
+        // App-action shortcuts (see AppShortcuts.kt) are checked BEFORE
+        // the terminal-sequence path below: if the combo is bound to an
+        // app action, it's fully consumed here and never also reaches the
+        // PTY as a byte sequence - otherwise e.g. a letter key bound to
+        // an action would both trigger the action AND type that letter
+        // into the terminal. Only ACTION_DOWN triggers the action itself;
+        // ACTION_UP is still swallowed so it can't fall through to the
+        // platform's default handling either.
+        val matchedShortcut = appShortcuts.findMatch(event)
+        if (matchedShortcut != null) {
+            if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+                matchedShortcut.action.execute(viewModel, physicalKeyboardRouting)
+            }
+            return true
+        }
+
         val sequence = PhysicalKeyEvent.sequenceFor(event) ?: return super.dispatchKeyEvent(event)
         if (event.action == android.view.KeyEvent.ACTION_DOWN) {
             if (sequence.isNotEmpty()) {
@@ -240,11 +267,27 @@ class MainActivity : ComponentActivity() {
         gatingComposeView.setViewCompositionStrategy(
             ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
         )
+        // collectAsState(initial = false) below always renders the very
+        // first frame with amoledBlack hard-coded to false, since Compose
+        // has no way to know the real DataStore value before the flow
+        // actually emits. If AMOLED Black is on, that first frame briefly
+        // shows the plain Material You scheme, then jumps to black the
+        // instant the flow's real value arrives a few ms later - the same
+        // flash SettingsActivity had. Reading the current value
+        // synchronously here, before setContent ever runs, means the very
+        // first frame already has the right value and collectAsState's
+        // "initial" is only ever used as a fallback that in practice never
+        // gets shown.
+        val initialAmoledBlack = runBlocking {
+            (application as TerminatorApp).settingsRepository
+                .flow(SettingsKeys.AMOLED_BLACK, false).first()
+        }
+
         gatingComposeView.setContent {
             val app = application as TerminatorApp
             val repo = app.settingsRepository
 
-            val amoledBlack by repo.flow(SettingsKeys.AMOLED_BLACK, false).collectAsState(initial = false)
+            val amoledBlack by repo.flow(SettingsKeys.AMOLED_BLACK, false).collectAsState(initial = initialAmoledBlack)
             val wallpaperUriStr by repo.flow(SettingsKeys.WALLPAPER_URI, "").collectAsState(initial = "")
             // Runner toolbar's save icon - exports the active (or split
             // secondary) pane's full terminal output. Always available, no
@@ -635,8 +678,20 @@ class MainActivity : ComponentActivity() {
                         isMultiPane = state.panes.isNotEmpty(),
                         broadcastAllPanes = broadcastAllPanes,
                         splitPaneFocused = splitPaneFocused,
-                        splitRuntimeId = state.splitRuntimeId
+                        splitRuntimeId = state.splitRuntimeId,
+                        toggleSplitFocus = { splitPaneFocused = !splitPaneFocused }
                     )
+                }
+
+                // Mirrors the saved app-action shortcut table (see
+                // AppShortcuts.kt/KeymapperScreen's "App Actions" tab) down
+                // to the Activity-level field dispatchKeyEvent actually
+                // reads, same reasoning as physicalKeyboardRouting just
+                // above - dispatchKeyEvent runs outside Compose and can't
+                // collectAsState() the DataStore flow itself.
+                val appShortcutsJson by repo.flow(SettingsKeys.APP_SHORTCUTS, "").collectAsState(initial = "")
+                LaunchedEffect(appShortcutsJson) {
+                    appShortcuts = com.terminator.app.ui.decodeAppShortcuts(appShortcutsJson)
                 }
 
                 // Bell was previously visual-only (bellFlash was set but
@@ -2756,14 +2811,26 @@ class MainActivity : ComponentActivity() {
                                     )
                                 },
                                 // Multi-pane mode: which rows already show as
-                                // panes, and adding a row calls addPaneSession
-                                // directly - it already handles "not in
-                                // multi-pane mode yet" (auto-enters it seeded
-                                // with the active session + this one) and
-                                // "already a pane" (bring-to-front) itself,
-                                // see its doc.
+                                // panes. Tapping a row NOT yet a pane calls
+                                // addPaneSession (enters/joins multi-pane mode,
+                                // seeded with the active session + this one if
+                                // not already in it - see addPaneSession's
+                                // doc). Tapping a row that's ALREADY a pane
+                                // now calls removePane instead of
+                                // addPaneSession again - previously this was
+                                // wired to addPaneSession unconditionally,
+                                // which only ever bringPaneToFront()'d an
+                                // existing pane and never actually removed
+                                // it, so the icon looked "stuck" once tapped
+                                // on with no way back out from the drawer.
                                 paneRuntimeIds = state.panes.map { it.runtimeId }.toSet(),
-                                onAddPaneSession = { runtimeId -> viewModel.addPaneSession(runtimeId) },
+                                onAddPaneSession = { runtimeId ->
+                                    if (state.panes.any { it.runtimeId == runtimeId }) {
+                                        viewModel.detachPaneKeepAlive(runtimeId)
+                                    } else {
+                                        viewModel.addPaneSession(runtimeId)
+                                    }
+                                },
                                 showClearAllSessionsButton = showClearAllSessionsButton,
                                 onClearAllSessions = { viewModel.clearAllSessions() },
                                 onSettingsClicked = {

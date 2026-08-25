@@ -189,7 +189,15 @@ data class PhysicalKeyboardRouting(
     val isMultiPane: Boolean = false,
     val broadcastAllPanes: Boolean = false,
     val splitPaneFocused: Boolean = false,
-    val splitRuntimeId: String? = null
+    val splitRuntimeId: String? = null,
+    // Null in the default/no-op instance (e.g. before MainActivity's
+    // LaunchedEffect first runs) - AppAction.execute treats a null
+    // callback as "nothing to do" for SPLIT_SWAP_FOCUS rather than
+    // crashing, same as every other target-less action there. Set from
+    // MainActivity's own splitPaneFocused Compose state setter, mirrored
+    // down for the same reason the rest of this class already is - see
+    // this class's own top doc.
+    val toggleSplitFocus: (() -> Unit)? = null
 ) {
     /** Same three-way routing VirtualKeyBar's onKeyPressed/onKeymapTriggered
      *  callbacks already do by hand at each of MainActivity's two

@@ -831,10 +831,33 @@ class MainViewModel(
      * than resuming whatever ratio a previous, unrelated split left behind.
      */
     fun setSplitSession(runtimeId: String?) {
+        // Multi-pane mode and split-screen are two independent rendering
+        // paths (see MainActivity's top-level `if (state.panes.isNotEmpty())`
+        // branch) - that branch checks panes BEFORE splitRuntimeId, so
+        // setting splitRuntimeId while panes is still non-empty left the UI
+        // stuck on the multi-pane branch forever: the state genuinely
+        // changed (splitRuntimeId became non-null) but nothing on screen
+        // reflected it, reading as "the split button does nothing" from the
+        // drawer's per-row split icon. Closing multi-pane mode first -
+        // exactly like tapping its own exit control would - keeps the
+        // invariant "at most one of {panes, splitRuntimeId} is active at a
+        // time" true instead of letting both linger together, which is
+        // what actually broke here. The pane the user was focused on
+        // becomes the new primary/active session, same as exitMultiPaneMode
+        // on its own already does, so this doesn't silently drop whichever
+        // pane they were looking at.
+        if (_uiState.value.panes.isNotEmpty()) {
+            exitMultiPaneMode()
+        }
+
         // Guard against the active session being asked to split against
         // itself (the drawer already hides the split button on the active
         // row, but this keeps the invariant enforced at the state layer
-        // too, not just in one UI entry point).
+        // too, not just in one UI entry point). Re-read activeSessionId
+        // AFTER the exitMultiPaneMode() call above, since that call can
+        // itself change activeSessionId (to whichever pane was focused) -
+        // checking against the pre-exit value here would let a stale
+        // comparison through.
         val safeRuntimeId = runtimeId?.takeUnless { it == _uiState.value.activeSessionId }
         _uiState.value = _uiState.value.copy(
             splitRuntimeId = safeRuntimeId,
@@ -1036,6 +1059,38 @@ class MainViewModel(
         }
     }
 
+    /**
+     * Unlike [removePane] (a tile's own "X" - closes the tile AND kills its
+     * session, since that's what closing a pane's window should do), this
+     * only detaches [runtimeId] from the pane group - the session keeps
+     * running in the background, same as any other running session not
+     * currently shown as a pane. Backs the drawer's per-row "add to panes"
+     * icon (see SessionDrawer's onAddPaneSession/isPaneMember), which needs
+     * to be a genuine toggle: tapping a session already in the pane group
+     * should take it back OUT of the group, not kill it outright - that
+     * icon has no way to distinguish "close this tile's window" intent
+     * (removePane's job) from "stop showing this alongside the others, but
+     * keep it running" (this function's job), and killing a background
+     * session just because the user tapped its "remove from panes" icon
+     * would silently destroy work with no warning.
+     */
+    fun detachPaneKeepAlive(runtimeId: String) {
+        val state = _uiState.value
+        val remaining = state.panes.filterNot { it.runtimeId == runtimeId }
+        val nextFocused = if (state.focusedPaneRuntimeId == runtimeId) {
+            remaining.maxByOrNull { it.zIndex }?.runtimeId
+        } else {
+            state.focusedPaneRuntimeId
+        }
+        _uiState.value = state.copy(
+            panes = remaining,
+            focusedPaneRuntimeId = nextFocused
+        )
+        if (remaining.isEmpty()) {
+            exitMultiPaneMode()
+        }
+    }
+
     /** Tap-to-focus: makes this pane the target of typed input (when the
      *  broadcast-all-panes setting is off) and, in Floating mode, raises it
      *  to the top of the stack - same as clicking any desktop window. */
@@ -1049,6 +1104,25 @@ class MainViewModel(
             },
             focusedPaneRuntimeId = runtimeId
         )
+    }
+
+    /**
+     * Moves keyboard focus to the next/previous pane in [MainUiState.panes]
+     * order (wrapping both ways), relative to whichever pane is currently
+     * focused - falls back to the first pane if none is focused yet.
+     * Backs AppAction.PANE_CYCLE_FOCUS_NEXT/PREV (see AppShortcuts.kt):
+     * physical-keyboard-only navigation between multi-pane tiles without
+     * needing a tap, same underlying focus field [bringPaneToFront]
+     * already sets so scroll/input routing picks the new target up for
+     * free. No-op outside multi-pane mode (empty panes list).
+     */
+    fun cyclePaneFocus(direction: Int) {
+        val state = _uiState.value
+        if (state.panes.isEmpty()) return
+        val ids = state.panes.map { it.runtimeId }
+        val currentIndex = ids.indexOf(state.focusedPaneRuntimeId).let { if (it == -1) 0 else it }
+        val nextIndex = ((currentIndex + direction) % ids.size + ids.size) % ids.size
+        _uiState.value = state.copy(focusedPaneRuntimeId = ids[nextIndex])
     }
 
     /** Floating-mode drag: updates one pane's on-screen offset (dp), then
