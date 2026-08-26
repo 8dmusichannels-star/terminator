@@ -1,0 +1,105 @@
+name: Build TERMINATOR
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+      - name: Run unit tests
+        run: gradle test --stacktrace
+      - name: Run Android lint
+        run: gradle lint --stacktrace
+        continue-on-error: true
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: |
+            app/build/reports/lint-results-debug.txt
+            app/build/reports/lint-results-debug.html
+            terminal-emulator/build/reports/lint-results-debug.txt
+            terminal-emulator/build/reports/lint-results-debug.html
+          if-no-files-found: warn
+      - name: Fail build if lint found errors
+        run: |
+          if grep -q "Lint found" app/build/reports/lint-results-debug.txt 2>/dev/null || \
+             grep -q "Lint found" terminal-emulator/build/reports/lint-results-debug.txt 2>/dev/null; then
+            if grep -qE "^[1-9][0-9]* errors" app/build/reports/lint-results-debug.txt 2>/dev/null || \
+               grep -qE "[1-9][0-9]* errors" app/build/reports/lint-results-debug.txt 2>/dev/null; then
+              echo "Lint found errors - see uploaded lint-report artifact."
+              exit 1
+            fi
+          fi
+      - name: Build debug APK (all ABI splits + universal)
+        run: gradle assembleDebug --stacktrace
+      # Every push/PR to main: temporary artifact, 90-day retention, for
+      # quick testing from the Actions tab. Not a permanent distribution.
+      - name: Upload debug APKs (temporary artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminator-debug-apks
+          path: app/build/outputs/apk/debug/*.apk
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+      - name: Build release APK (signed, all ABIs + universal)
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease --stacktrace
+      - name: Clean up keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+      - name: Verify APK signatures
+        run: |
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n1)
+          for apk in app/build/outputs/apk/release/*.apk; do
+            echo "Verifying $apk"
+            "$BUILD_TOOLS/apksigner" verify --print-certs "$apk"
+          done
+      - name: Create GitHub Release with APKs
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
