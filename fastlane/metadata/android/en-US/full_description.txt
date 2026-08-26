@@ -1,36 +1,40 @@
-Terminator is a terminal emulator that offers comprehensive terminal emulation support with multiple session support that you can directly customize and control. Its main purpose is terminal emulation suitable for daily use. The main difference of Terminator is in the interface area: it comes with embedded terminal colors and a fully compact interface. It does not offer ready-made chroot/proot environment support; terminal tool infrastructure and other things are left to the user. It supports on Android.
+Terminator is a Terminal emulator, it offers comprehensive terminal emulator support with multi-session support that you can directly customize and control. Its main purpose is a terminal emulation that can only be read by the user and is suitable for daily use. The main difference from other Terminator apps is only in the interface area. It comes with embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot/proot environment support; the terminal tool infrastructure and other work is left to the users of the Terminator application. Other terminal environment and terminal user interface elements are modern. Supports Android.
 
 <b>Features</b>
 
-It comes with Material UI, supports all color matches, and the terminal applies it to its own color interface.
+It comes with a material user interface, supports all color mappings and the terminal implements it in its own color interface.
 
-It has AMOLED black support, but there is no dynamic color in the terminal itself; it only comes with blue and black terminal colors. If you want to keep it simple or plain, just enter the RGB color code. Custom CSS terminal color support is also offered, for example it comes with the Nord theme.
+There is AMOLED black support and also dynamic color material support in the terminal. If you want to keep it simple or plain, just enter the RGB color code — custom CSS terminal color support is also offered. It comes with support for color palettes including the following themes: default, solarized dark, gruvbox dark, dracula, nord. But you can configure the palettes yourself. Termcolor and CSS color support is also offered.
 
-It has multiple session support: you can create more than one session and choose default or favorite. After adding a session, there is file-based session or command-arg session support. In command-arg session you specify the executable file that should be spawned directly. If you are using root, you can activate the root session directly without using <i>/system/bin/su</i>, specify the entry path (the directory that will spawn as the starting directory), and the terminal can be started via the session you set as default. The file-based method works the same way: you can directly specify the directory to spawn by specifying the shell script file name and path, and run it with the entry path by activating the root session.
+There is multi-session support: you can create multiple sessions, choose default or favorite. After adding the session there is support for file-based session or command-arg session. In the session command-arg, you directly specify the executable that should be built. If you are using root, you can directly activate the root session without using /system/bin/su, specify the login path and the directory path that will create the startup directory, and start the terminal through the session you have set as default. The file-based method works the same way: by specifying the shell script file name and path, you can directly specify the directory to be created and run it with the login path and by activating the root session. But if you specify a chroot or proot-like environment as an argument, the starting directory may not work — it is only valid for arguments that support an entry path. There is a purge setting in "clear," which has terminal behavior, letting you determine whether old data remaining in the clear terminal pty buffer is actually cleared or not. The validity of chroot in proot-like environments is variable.
 
-Resizing the terminal by text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background transparency and background blur. There is font support: monospace, sans, mono, serif, and embedded fonts are available, plus special font support where you can add TTF/OTF fonts.
+Resizing the terminal size based on text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background support and background blur. It has font support — monospace, sans, mono, serif, and embedded fonts are available, plus custom font support for TTF/OTF fonts — and you can also control whether terminal screen zoom (pinch to zoom) is on or off. It is turned on by default.
 
-Bell sound is supported; you can choose custom or default system notification sound.
+Ringtone support is included; you can choose a custom or default notification sound from the system.
 
-You can hide or show the status bar and title bar on screen. Horizontal landscape mode is supported, and you can use the terminal that way as well.
+You can hide or show the status bar and title bar on the screen. Horizontal orientation mode is supported, and you can use the terminal this way too. You can export the terminal session as a .txt file and determine whether the save button appears in the bar or not. By managing the split-screen visibility switch toggle, you can turn on/off the buttons that enable split-screen and float-screen switching. Turning on the "broadcast to all panes" toggle lets you enter text or commands into more than one terminal session at the same time, across split-screen and float-screen modes. You can also manage all "clear session" behavior with a toggle, hiding the button when it's off but clearing all sessions when it's on.
 
-As keyboard, soft keyboard (tap to open/close terminal) and virtual keys are supported (as a key bar). As input mode:
+For keyboards, soft keyboard (tap to open/close terminal) and virtual key (keybar) are supported. Login modes include:
+
 <ul>
-<li><b>Default</b> — compatible with all IMEs, including CJK button strict terminal</li>
+<li><b>Default</b> — compatible with all IMEs, including CJK input, solid terminal</li>
 <li><b>Semantically correct</b> — may break some IMEs</li>
-<li><b>Legacy workaround</b> — fixes Samsung keyboard echo, may break Gboard</li>
-<li><b>CJK input</b> is supported but default is recommended</li>
+<li><b>Old workaround</b> — fixes Samsung keyboard echo, could break Gboard</li>
+<li><b>CJK input</b> — supported, but default is recommended</li>
 </ul>
 
-3 types of terminal types are supported:
+3 terminal types are supported:
+
 <ul>
-<li><b>xterm256-color</b> — recommended</li>
-<li><b>VT100</b> — color support is limited and does not work even without a terminfo entry</li>
+<li><b>xterm-256color</b> — recommended</li>
+<li><b>VT100</b> — color support is limited and won't work even without a terminfo entry</li>
 <li><b>ANSI</b> — color support, but compatible with DOS</li>
 </ul>
 
-Keyboard shortcuts and keymapper support are also provided; you can assign or support virtual keyboards directly from a physical keyboard. Seccomp support is included to solve "operation not permitted" errors, and there are more features.
+You can control whether the soft keyboard is on or off with a toggle. With the virtual keybar toggle, you can control whether the virtual keybar appears. With the keyboard shortcuts/keymapper toggle, you can control whether those buttons appear.
+
+Keyboard shortcuts and keymapper support are also provided — you can assign or map virtual keyboard actions directly from a physical keyboard. Additionally, seccomp support is available to resolve "operation not permitted" errors, and there are more features.
 
 <b>Development status</b>
 
-It is currently under development. More advanced or improved features will be developed soon, but there may be minor bugs since it is in beta stage and not fully stable.
+Terminator is currently under development. More advanced and improved features will be added soon, but since it is in beta phase and not fully stable, there may be minor bugs.
