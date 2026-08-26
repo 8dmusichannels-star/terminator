@@ -970,6 +970,62 @@ private fun PaneContent(
                                 }
                             }
                         }
+                        // Edge-scroll while selecting - same feature/mechanism as
+                        // SplitTerminalPane's own block and MainActivity's primary-
+                        // pane one: observe pointer position at
+                        // PointerEventPass.Initial (before SelectionContainer or the
+                        // gesture loop below consume anything) and, while
+                        // paneSelectionState has an active selection, keep revealing
+                        // scrollback near the top/bottom edge so the selection can be
+                        // extended into history by holding a finger near the edge.
+                        // Never consumes - purely a side-effecting observer.
+                        //
+                        // This tile never had this modifier at all (unlike
+                        // SplitTerminalPane), which is a separate gap from the
+                        // drag-to-scroll-while-selecting fix in the gesture loop
+                        // below: that fix only keeps a selection alive when the
+                        // USER's own finger-drag changes scrollOffset, but
+                        // SelectionContainer's own long-press-drag-to-extend can
+                        // itself need scrollback revealed near an edge without any
+                        // separate pan gesture ever starting - nothing here was
+                        // driving that reveal at all, so a selection that grew
+                        // toward the top/bottom of the visible pane simply couldn't
+                        // reach anything above/below the initial viewport.
+                        // lastScrollWasEdgeAutoScroll is set true here (matching the
+                        // gesture loop's own sites) so the LaunchedEffect(scrollOffset)
+                        // guard doesn't clear the very selection this scroll exists
+                        // to extend.
+                        .pointerInput(runtimeId) {
+                            val edgeFraction = 0.15f
+                            val maxLinesPerFrame = 1.5f
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                    if (paneSelectionState.selectedTexts.isEmpty()) continue
+                                    val pointer = event.changes.firstOrNull() ?: continue
+                                    if (!pointer.pressed) continue
+                                    val h = size.height.toFloat()
+                                    if (h <= 0f) continue
+                                    val y = pointer.position.y
+                                    val edgePx = h * edgeFraction
+                                    val (_, charHeight) = charMetrics
+                                    if (charHeight <= 0f) continue
+                                    val maxOffset = buffer.maxScrollOffset
+                                    when {
+                                        y < edgePx -> {
+                                            val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
+                                            lastScrollWasEdgeAutoScroll = true
+                                            scrollOffset = (scrollOffset + (strength * maxLinesPerFrame).roundToInt()).coerceIn(0, maxOffset)
+                                        }
+                                        y > h - edgePx -> {
+                                            val strength = ((y - (h - edgePx)) / edgePx).coerceIn(0f, 1f)
+                                            lastScrollWasEdgeAutoScroll = true
+                                            scrollOffset = (scrollOffset - (strength * maxLinesPerFrame).roundToInt()).coerceIn(0, maxOffset)
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Single gesture loop per pane, merging what used to be
                         // two independent, stacked pointerInput blocks (one
                         // awaitEachGesture for tap-focus/mouse-reporting, one
