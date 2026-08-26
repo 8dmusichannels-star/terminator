@@ -1,0 +1,56 @@
+name: Manual - Delete Completed Workflow Runs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete_completed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete completed runs only
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const perPage = 100;
+            let deleted = 0;
+            let skipped = 0;
+            let failed = 0;
+
+            core.info(`Collecting workflow runs (all) for ${owner}/${repo}...`);
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              { owner, repo, per_page: perPage }
+            );
+
+            core.info(`Total runs found: ${runs.length}`);
+
+            for (const run of runs) {
+              // Only attempt deletion when the run is completed
+              if (run.status !== 'completed') {
+                skipped++;
+                core.info(`Skip id=${run.id} status=${run.status}`);
+                continue;
+              }
+
+              try {
+                core.info(`Delete id=${run.id} conclusion=${run.conclusion}`);
+                await github.rest.actions.deleteWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id
+                });
+                deleted++;
+              } catch (e) {
+                failed++;
+                core.warning(`Failed id=${run.id}. ${e?.message || e}`);
+              }
+            }
+
+            core.info(`Done. deleted=${deleted} skipped=${skipped} failed=${failed}`);
