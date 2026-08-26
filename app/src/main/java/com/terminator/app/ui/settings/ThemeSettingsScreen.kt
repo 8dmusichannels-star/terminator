@@ -88,11 +88,16 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
         .collectAsState(initial = DEFAULT_STATUS_WARNING)
 
     // Accepts either:
-    //  - simple "key=value" lines, e.g. foreground=#E6E6E6 / background=#000000
-    //  - or a small JSON object, e.g. {"foreground":"#E6E6E6","background":"#000000"}
-    // (also accepts fg/bg as short aliases). Whatever is parsed is written
-    // straight into CUSTOM_FG/CUSTOM_BG, which MainActivity now actually
-    // reads for the "Import theme file" mode.
+    //  - simple "key=value" lines (also CSS custom-property or bash/export
+    //    style), e.g. foreground=#E6E6E6 / background=#000000 / color1=#BF616A
+    //  - or a JSON object, e.g. {"foreground":"#E6E6E6","background":"#000000",
+    //    "colors":[...16 hex strings...]}
+    // (fg/bg and per-slot ANSI names like "red"/"color1"/"ansi1" all work as
+    // aliases - see parseThemeFile's doc for the full list). fg/bg always go
+    // into CUSTOM_FG/CUSTOM_BG; if the file also defined the 16 ANSI slots,
+    // those are written into IMPORTED_PALETTE_COLORS/FG/BG too (kept separate
+    // from "Custom Palette"'s own CUSTOM_PALETTE_* keys), and MainActivity
+    // renders the full imported palette instead of just fg/bg for this mode.
     val themeFilePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -108,10 +113,20 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
         if (parsed == null) {
             importError = "Unrecognized theme file format"
         } else {
-            val (fg, bg) = parsed
             scope.launch {
-                repo.set(SettingsKeys.CUSTOM_FG, fg)
-                repo.set(SettingsKeys.CUSTOM_BG, bg)
+                repo.set(SettingsKeys.CUSTOM_FG, parsed.foreground)
+                repo.set(SettingsKeys.CUSTOM_BG, parsed.background)
+                if (parsed.ansiColors != null) {
+                    repo.set(SettingsKeys.IMPORTED_PALETTE_COLORS, encodePaletteColors(parsed.ansiColors))
+                    repo.set(SettingsKeys.IMPORTED_PALETTE_FG, parsed.foreground)
+                    repo.set(SettingsKeys.IMPORTED_PALETTE_BG, parsed.background)
+                } else {
+                    // This file only set fg/bg - clear out any 16-slot palette
+                    // left over from a previous import, so MainActivity falls
+                    // back to fg/bg-only rendering for it instead of reusing
+                    // stale ANSI colors from an earlier, different import.
+                    repo.set(SettingsKeys.IMPORTED_PALETTE_COLORS, "")
+                }
                 repo.set(SettingsKeys.COLOR_SCHEME_MODE, "Import theme file")
             }
             importError = null
@@ -230,6 +245,15 @@ fun ThemeSettingsScreen(onBack: () -> Unit) {
             }
 
             if (colorSchemeMode == "Import theme file") {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Accepts key=value lines (CSS custom-property or bash " +
+                        "export style also work) or a JSON object. Set just " +
+                        "foreground/background, or add the full 16-slot ANSI " +
+                        "palette (colors array, or color0-color15/ansi0-ansi15/" +
+                        "red/green/... keys) for a complete termcolor theme.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedButton(onClick = {
                     themeFilePicker.launch(arrayOf("text/*", "application/json", "*/*"))
@@ -463,13 +487,70 @@ private fun CustomPaletteEditor(
 }
 
 /**
- * Parses a small theme file into (foreground, background) ARGB ints.
- * Supports "key=value" lines and a flat JSON object; returns null if
- * neither foreground nor background could be found.
+ * Result of parsing a theme file: always a resolved foreground/background,
+ * plus the full 16-slot ANSI palette *if* the file actually defined one.
+ * Files that only set fg/bg (the old, still-supported format) leave
+ * [ansiColors] null - callers fall back to fg/bg-only behavior for those,
+ * exactly like before this function learned about ANSI palettes.
  */
-private fun parseThemeFile(text: String): Pair<Int, Int>? {
+data class ParsedTheme(
+    val foreground: Int,
+    val background: Int,
+    val ansiColors: IntArray?
+)
+
+/** Recognized names for each of the 16 ANSI slots, in index order. Each
+ *  slot accepts any of: bare index ("0".."15"), "color0".."color15" /
+ *  "colorN" (CSS-custom-property style, e.g. --color-0), "ansi0".."ansi15",
+ *  or the slot's own name/abbreviation (e.g. "red", "brightred", "br_red"). */
+private val ANSI_SLOT_ALIASES: List<List<String>> = listOf(
+    listOf("black", "color0", "ansi0", "0"),
+    listOf("red", "color1", "ansi1", "1"),
+    listOf("green", "color2", "ansi2", "2"),
+    listOf("yellow", "color3", "ansi3", "3"),
+    listOf("blue", "color4", "ansi4", "4"),
+    listOf("magenta", "color5", "ansi5", "5"),
+    listOf("cyan", "color6", "ansi6", "6"),
+    listOf("white", "color7", "ansi7", "7"),
+    listOf("brightblack", "bright_black", "br_black", "color8", "ansi8", "8"),
+    listOf("brightred", "bright_red", "br_red", "color9", "ansi9", "9"),
+    listOf("brightgreen", "bright_green", "br_green", "color10", "ansi10", "10"),
+    listOf("brightyellow", "bright_yellow", "br_yellow", "color11", "ansi11", "11"),
+    listOf("brightblue", "bright_blue", "br_blue", "color12", "ansi12", "12"),
+    listOf("brightmagenta", "bright_magenta", "br_magenta", "color13", "ansi13", "13"),
+    listOf("brightcyan", "bright_cyan", "br_cyan", "color14", "ansi14", "14"),
+    listOf("brightwhite", "bright_white", "br_white", "color15", "ansi15", "15")
+)
+
+/**
+ * Parses a theme file into a [ParsedTheme]. Three formats are accepted:
+ *
+ *  1. Simple "key=value" lines (CSS-custom-property or shell/bash-export
+ *     style both work, since '#'/';'/whitespace around '=' are tolerated):
+ *       foreground=#E6E6E6
+ *       background=#000000
+ *       color1=#BF616A
+ *       --color-2: #A3BE8C;
+ *       ansi15=#ECEFF4
+ *
+ *  2. A flat JSON object with foreground/background plus either a 16-entry
+ *     "colors" array (same order as [ANSI_SLOT_NAMES]) or individual
+ *     "color0".."color15"/"ansi0".."ansi15" keys:
+ *       {"foreground":"#E6E6E6","background":"#000000",
+ *        "colors":["#3B4252","#BF616A", ... 16 entries]}
+ *
+ *  3. The same JSON shape as (2) but with per-slot keys instead of an array:
+ *       {"fg":"#E6E6E6","bg":"#000000","color0":"#3B4252","red":"#BF616A"}
+ *
+ * A file only has to define foreground/background to be accepted (matching
+ * the original behavior) - the 16-slot palette is populated only when the
+ * file actually provides it, so [ParsedTheme.ansiColors] is null otherwise.
+ * Returns null if nothing recognizable (no fg, no bg, no ANSI slot) was found.
+ */
+private fun parseThemeFile(text: String): ParsedTheme? {
     var fg: Int? = null
     var bg: Int? = null
+    val ansi = arrayOfNulls<Int>(16)
 
     val trimmed = text.trim()
     if (trimmed.startsWith("{")) {
@@ -477,23 +558,66 @@ private fun parseThemeFile(text: String): Pair<Int, Int>? {
             val obj = JSONObject(trimmed)
             fg = firstColorKey(obj, "foreground", "fg", "text")
             bg = firstColorKey(obj, "background", "bg")
+
+            val colorsArray = obj.optJSONArray("colors")
+            if (colorsArray != null && colorsArray.length() == 16) {
+                for (i in 0 until 16) {
+                    parseHexColor(colorsArray.optString(i))?.let { ansi[i] = it }
+                }
+            } else {
+                ANSI_SLOT_ALIASES.forEachIndexed { index, aliases ->
+                    firstColorKey(obj, *aliases.toTypedArray())?.let { ansi[index] = it }
+                }
+            }
         }
     } else {
-        trimmed.lineSequence().forEach { line ->
-            val cleaned = line.trim()
-            if (cleaned.isBlank() || !cleaned.contains('=')) return@forEach
-            val (key, value) = cleaned.split('=', limit = 2).map { it.trim() }
+        trimmed.lineSequence().forEach { rawLine ->
+            // Tolerate CSS custom-property syntax ("--color-1: #BF616A;")
+            // and shell/bash export style ("export color1=#BF616A") in
+            // addition to plain "key=value" - strip a leading "--" and
+            // "export ", and treat ':' the same as '=' as the separator.
+            var cleaned = rawLine.trim().trimEnd(';').trim()
+            if (cleaned.isBlank() || cleaned.startsWith("#") && !cleaned.contains('=') && !cleaned.contains(':')) {
+                return@forEach
+            }
+            cleaned = cleaned.removePrefix("export ").trim()
+            if (cleaned.startsWith("--")) cleaned = cleaned.removePrefix("--")
+
+            val sepIndex = cleaned.indexOfFirst { it == '=' || it == ':' }
+            if (sepIndex <= 0) return@forEach
+            val key = cleaned.substring(0, sepIndex).trim().lowercase()
+                .removePrefix("--")
+                .replace("-", "")
+                .replace("_", "")
+            val value = cleaned.substring(sepIndex + 1).trim()
             val color = parseHexColor(value) ?: return@forEach
-            when (key.lowercase()) {
-                "foreground", "fg", "text" -> fg = color
-                "background", "bg" -> bg = color
+
+            when {
+                key == "foreground" || key == "fg" || key == "text" -> fg = color
+                key == "background" || key == "bg" -> bg = color
+                else -> {
+                    val slotIndex = ANSI_SLOT_ALIASES.indexOfFirst { aliases ->
+                        aliases.any { it.replace("_", "") == key }
+                    }
+                    if (slotIndex >= 0) ansi[slotIndex] = color
+                }
             }
         }
     }
 
     val resolvedFg = fg ?: DEFAULT_CUSTOM_FG
     val resolvedBg = bg ?: DEFAULT_CUSTOM_BG
-    return if (fg == null && bg == null) null else resolvedFg to resolvedBg
+    val ansiCount = ansi.count { it != null }
+    val resolvedAnsi: IntArray? = when {
+        ansiCount == 16 -> IntArray(16) { ansi[it]!! }
+        // Partial palette: fill any missing slots from the default preset
+        // rather than discarding the ones the file did specify.
+        ansiCount > 0 -> IntArray(16) { ansi[it] ?: PalettePresets.default.colors[it] }
+        else -> null
+    }
+
+    if (fg == null && bg == null && resolvedAnsi == null) return null
+    return ParsedTheme(resolvedFg, resolvedBg, resolvedAnsi)
 }
 
 private fun firstColorKey(obj: JSONObject, vararg keys: String): Int? {

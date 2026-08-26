@@ -341,6 +341,16 @@ class MainActivity : ComponentActivity() {
                 SettingsKeys.CUSTOM_PALETTE_BG,
                 com.terminator.app.ui.settings.PalettePresets.default.background
             ).collectAsState(initial = com.terminator.app.ui.settings.PalettePresets.default.background)
+            // Settings > Theme > "Import theme file" - its own 16-slot
+            // palette storage, separate from CUSTOM_PALETTE_* above (see
+            // SettingsKeys.IMPORTED_PALETTE_COLORS's doc). Empty when no
+            // imported file has defined a full ANSI palette yet.
+            val importedPaletteColorsJson by repo.flow(SettingsKeys.IMPORTED_PALETTE_COLORS, "")
+                .collectAsState(initial = "")
+            val importedPaletteFg by repo.flow(SettingsKeys.IMPORTED_PALETTE_FG, DEFAULT_CUSTOM_FG)
+                .collectAsState(initial = DEFAULT_CUSTOM_FG)
+            val importedPaletteBg by repo.flow(SettingsKeys.IMPORTED_PALETTE_BG, DEFAULT_CUSTOM_BG)
+                .collectAsState(initial = DEFAULT_CUSTOM_BG)
             // Settings > Theme > "Override ANSI colors too" and "Separate
             // error/status colors" - see TerminalPalette.materialOverride()/
             // withStatusColors() for what each actually changes.
@@ -768,7 +778,8 @@ class MainActivity : ComponentActivity() {
                 val terminalPalette = remember(
                     colorSchemeMode, customFg, customBg, materialColors,
                     materialColorOverride, statusColorsEnabled, statusErrorColor, statusWarningColor,
-                    customPaletteColorsJson, customPaletteFg, customPaletteBg
+                    customPaletteColorsJson, customPaletteFg, customPaletteBg,
+                    importedPaletteColorsJson, importedPaletteFg, importedPaletteBg
                 ) {
                     val basePalette = when (colorSchemeMode) {
                         "Nord" -> TerminalPalette.nord()
@@ -785,12 +796,27 @@ class MainActivity : ComponentActivity() {
                             foreground = customPaletteFg,
                             background = customPaletteBg
                         )
-                        // Imported theme files are parsed straight into CUSTOM_FG/CUSTOM_BG
-                        // (see ThemeSettingsScreen), so this now actually reflects what was
-                        // imported instead of silently falling back to flatBlack(). "Custom
-                        // RGB" is kept as an alias so a value persisted before the mode was
-                        // renamed to "Custom fg/bg" still resolves correctly.
-                        "Custom fg/bg", "Custom RGB", "Import theme file" ->
+                        // Imported theme files are parsed into CUSTOM_FG/CUSTOM_BG (see
+                        // ThemeSettingsScreen), and, when the file also defined the full
+                        // 16-slot ANSI palette, into IMPORTED_PALETTE_COLORS/FG/BG too
+                        // (kept separate from CUSTOM_PALETTE_* so this mode can't leak
+                        // into, or get clobbered by, "Custom Palette"'s own data). If a
+                        // palette was imported, render it in full instead of collapsing an
+                        // imported termcolor theme down to just fg/bg. "Custom RGB" is kept
+                        // as an alias so a value persisted before the mode was renamed to
+                        // "Custom fg/bg" still resolves correctly.
+                        "Import theme file" -> {
+                            if (importedPaletteColorsJson.isNotBlank()) {
+                                TerminalPalette.fromPalette(
+                                    colors = com.terminator.app.ui.settings.decodePaletteColors(importedPaletteColorsJson),
+                                    foreground = importedPaletteFg,
+                                    background = importedPaletteBg
+                                )
+                            } else {
+                                TerminalPalette.custom(foreground = customFg, background = customBg)
+                            }
+                        }
+                        "Custom fg/bg", "Custom RGB" ->
                             TerminalPalette.custom(foreground = customFg, background = customBg)
                         // "Material" mode: normally just fills fg/bg from the Material
                         // scheme (custom()), leaving the 16 ANSI accent colors fixed.

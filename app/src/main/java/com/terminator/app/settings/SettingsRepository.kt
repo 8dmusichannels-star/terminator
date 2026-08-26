@@ -90,6 +90,18 @@ object SettingsKeys {
     val CUSTOM_PALETTE_FG = intPreferencesKey("custom_palette_fg")
     val CUSTOM_PALETTE_BG = intPreferencesKey("custom_palette_bg")
 
+    // Theme > "Import theme file" mode's own 16-slot palette storage -
+    // deliberately separate from CUSTOM_PALETTE_COLORS/FG/BG above so
+    // switching between "Custom Palette" and "Import theme file" doesn't
+    // let one mode's data leak into (or get silently overwritten by) the
+    // other. Same JSON-array encoding as CUSTOM_PALETTE_COLORS (see
+    // PaletteThemes.kt); populated only when an imported file actually
+    // defines the full ANSI palette, not just foreground/background - see
+    // ThemeSettingsScreen's parseThemeFile().
+    val IMPORTED_PALETTE_COLORS = stringPreferencesKey("imported_palette_colors")
+    val IMPORTED_PALETTE_FG = intPreferencesKey("imported_palette_fg")
+    val IMPORTED_PALETTE_BG = intPreferencesKey("imported_palette_bg")
+
     // Appearance > pinch-to-zoom on/off. On by default (existing
     // behaviour). Off disables the two-finger pinch gesture entirely -
     // font size then only changes via the Text Size slider.
