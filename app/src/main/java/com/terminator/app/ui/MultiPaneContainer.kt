@@ -790,6 +790,42 @@ private fun PaneContent(
     // every other pane's, and of the classic single-pane view's scrollOffset.
     var scrollOffset by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
 
+    // Mirrors MainViewModel.lastScrollWasEdgeAutoScroll / the primary pane's
+    // LaunchedEffect(state.scrollOffset) guard, and SplitTerminalPane's
+    // wasLastScrollEdgeAutoScroll param - but local to this tile, since each
+    // pane's scrollOffset above is already local rather than routed through
+    // the shared ViewModel. Without this, EVERY scrollOffset change here
+    // unconditionally cleared paneSelectionState (see the LaunchedEffect
+    // right below the pointerInput block), so as soon as a drag moved even
+    // one line while a selection was active in a multi-pane/grid tile, the
+    // selection vanished instantly - "scrollback ile selection ile metin
+    // secme ozelligi yok" in multi-pane/split-grid modes specifically,
+    // while the classic single-pane view (which does have this guard) and
+    // split-screen mode (via wasLastScrollEdgeAutoScroll) worked fine.
+    var lastScrollWasEdgeAutoScroll by remember(runtimeId) { mutableStateOf(false) }
+
+    // Declared here (rather than down where it's read by TerminalView)
+    // specifically so the pointerInput gesture loop below - and the
+    // scrollOffset LaunchedEffect guard right after it - can both see it.
+    // Same instance is reused for TerminalView/SelectionActionBar/etc.
+    // further down in this composable.
+    val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
+    androidx.compose.runtime.LaunchedEffect(runtimeId) { paneSelectionState.clear() }
+
+    // Same reasoning as MainActivity's own LaunchedEffect(state.scrollOffset):
+    // a scrollOffset change clears the active selection UNLESS that specific
+    // scroll was flagged as an edge-auto-scroll-while-selecting (or, below,
+    // an ordinary drag that started with a non-empty selection) - otherwise
+    // scrolling scrollback out from under a selection (via drag or the
+    // auto-scroll-past-viewport-edge case TerminalView's SelectionContainer
+    // itself drives) invalidates the frozen row text's identity and the
+    // selection collapses to empty on the very next recomposition.
+    androidx.compose.runtime.LaunchedEffect(scrollOffset) {
+        if (!lastScrollWasEdgeAutoScroll) {
+            paneSelectionState.clear()
+        }
+    }
+
     // Same focusToken pattern SplitTerminalPane uses: bumped on every real
     // tap into this pane so HiddenPaneInputField's LaunchedEffect fires even
     // when isFocused was already true (a same-value write is a no-op for
@@ -1044,6 +1080,14 @@ private fun PaneContent(
                                         if (charHeight > 0f) {
                                             val deltaLines = -(totalDy / charHeight)
                                             val maxOffset = buffer.maxScrollOffset
+                                            // Flag before writing scrollOffset - see
+                                            // lastScrollWasEdgeAutoScroll's doc above.
+                                            // A drag that starts with an active
+                                            // selection should extend/preserve it
+                                            // instead of wiping it on this first
+                                            // motion, same as the primary pane's
+                                            // draggingWithSelection handling.
+                                            lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
                                             scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
                                         }
                                         longPressCandidate = false
@@ -1089,6 +1133,7 @@ private fun PaneContent(
                                                 val deltaLines = -((midY - prevMidY) / charHeight)
                                                 if (deltaLines != 0f) {
                                                     val maxOffset = buffer.maxScrollOffset
+                                                    lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
                                                     scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
                                                 }
                                             }
@@ -1104,6 +1149,7 @@ private fun PaneContent(
                                             if (charHeight > 0f) {
                                                 val deltaLines = -(dy / charHeight)
                                                 val maxOffset = buffer.maxScrollOffset
+                                                lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
                                                 scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
                                             }
                                         }
@@ -1134,8 +1180,10 @@ private fun PaneContent(
                     // highlight (SelectionContainer's own handles) but never
                     // any Copy/Paste/More bar - nothing was left to show one
                     // once the native fallback was suppressed.
-                    val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
-                    androidx.compose.runtime.LaunchedEffect(runtimeId) { paneSelectionState.clear() }
+                    // paneSelectionState/its clear-on-runtimeId effect are
+                    // declared up above this Box now, alongside
+                    // lastScrollWasEdgeAutoScroll, so the gesture loop can
+                    // read them - see that declaration's doc.
                     val actionModeController = rememberActionModeController()
                     val clipboardManager = LocalClipboardManager.current
                     var moreVisible by remember(runtimeId) { androidx.compose.runtime.mutableStateOf(false) }

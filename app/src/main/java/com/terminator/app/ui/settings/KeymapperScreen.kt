@@ -20,6 +20,7 @@
 
 package com.terminator.app.ui.settings
 
+import android.view.KeyEvent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,8 +32,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.unit.dp
 import com.terminator.app.settings.SettingsKeys
+import com.terminator.app.ui.AppAction
+import com.terminator.app.ui.AppShortcutEntry
+import com.terminator.app.ui.decodeAppShortcuts
+import com.terminator.app.ui.encodeAppShortcuts
+import com.terminator.app.ui.formatShortcutCombo
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -92,11 +104,55 @@ private fun encodeKeymaps(list: List<KeymapEntry>): String {
 
 /**
  * Opened from Settings > Keyboard > "Keyboard shortcuts & keymapper".
- * Lists saved named shortcuts; '+' opens an editor to create a new one.
+ * Two tabs: "Terminal Keys" (the original named keymap list above, sends
+ * terminal byte sequences) and "App Actions" (see AppShortcuts.kt - a
+ * physical key combo bound straight to a MainViewModel action instead).
+ * Kept as one screen/one entry point since both are "keyboard shortcuts"
+ * from the user's point of view even though they dispatch completely
+ * differently under the hood.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun KeymapperScreen(onBack: () -> Unit) {
+    var tab by remember { mutableIntStateOf(0) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Keyboard shortcuts") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    scrolledContainerColor = MaterialTheme.colorScheme.surface
+                )
+            )
+        }
+    ) { padding ->
+        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+            TabRow(selectedTabIndex = tab) {
+                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Terminal Keys") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("App Actions") })
+            }
+            when (tab) {
+                0 -> TerminalKeysTab()
+                else -> AppActionsTab()
+            }
+        }
+    }
+}
+
+/**
+ * Tab 1: the original keymap list/editor, unchanged in behavior - only
+ * extracted out of the old top-level KeymapperScreen body so it can sit
+ * alongside AppActionsTab under the new TabRow. Owns its own '+' FAB
+ * (Scaffold-in-Scaffold is fine here since this one has no topBar of its
+ * own) since the parent Scaffold's FAB slot can't switch per-tab cleanly.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TerminalKeysTab() {
     val repo = rememberSettingsRepository()
     val scope = rememberCoroutineScope()
     val keymapsJson by repo.flow(SettingsKeys.KEYMAPS, "").collectAsState(initial = "")
@@ -120,14 +176,6 @@ fun KeymapperScreen(onBack: () -> Unit) {
     }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Keyboard shortcuts") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
-                }
-            )
-        },
         floatingActionButton = {
             FloatingActionButton(onClick = { editing = null; showEditor = true }) {
                 Text("+")
@@ -194,7 +242,13 @@ private fun KeymapEditor(
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text(if (initial == null) "New shortcut" else "Edit shortcut") })
+            TopAppBar(
+                title = { Text(if (initial == null) "New shortcut" else "Edit shortcut") },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    scrolledContainerColor = MaterialTheme.colorScheme.surface
+                )
+            )
         },
         bottomBar = {
             Row(
@@ -278,3 +332,231 @@ private fun KeymapEditor(
         }
     }
 }
+
+/**
+ * Tab 2: shortcuts bound to app-level actions (new split, clear all
+ * sessions, kill focused pane, etc. - see AppShortcuts.kt's AppAction
+ * enum) rather than to terminal byte sequences. '+' opens a capture
+ * dialog: the user presses the real combo on their physical/Bluetooth
+ * keyboard, it's shown back to them live, then they pick which action it
+ * should trigger. Stored completely separately from KEYMAPS (its own
+ * SettingsKeys.APP_SHORTCUTS entry) since these two tables are read by
+ * different dispatch paths - see MainActivity's dispatchKeyEvent.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppActionsTab() {
+    val repo = rememberSettingsRepository()
+    val scope = rememberCoroutineScope()
+    val shortcutsJson by repo.flow(SettingsKeys.APP_SHORTCUTS, "").collectAsState(initial = "")
+    val shortcuts = remember(shortcutsJson) { decodeAppShortcuts(shortcutsJson) }
+
+    var showCapture by remember { mutableStateOf(false) }
+
+    fun persist(updated: List<AppShortcutEntry>) {
+        scope.launch { repo.set(SettingsKeys.APP_SHORTCUTS, encodeAppShortcuts(updated)) }
+    }
+
+    if (showCapture) {
+        AppShortcutCaptureDialog(
+            existing = shortcuts,
+            onDismiss = { showCapture = false },
+            onSave = { entry ->
+                persist(shortcuts.filterNot { it.id == entry.id } + entry)
+                showCapture = false
+            }
+        )
+    }
+
+    Scaffold(
+        floatingActionButton = {
+            FloatingActionButton(onClick = { showCapture = true }) {
+                Text("+")
+            }
+        }
+    ) { padding ->
+        if (shortcuts.isEmpty()) {
+            Column(
+                modifier = Modifier.padding(padding).fillMaxSize().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    "No app shortcuts yet. Tap + and press a key combo on your keyboard to bind it to an action.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+        } else {
+            LazyColumn(modifier = Modifier.padding(padding).fillMaxSize()) {
+                items(shortcuts, key = { it.id }) { entry ->
+                    ListItem(
+                        headlineContent = { Text(entry.action.label) },
+                        supportingContent = {
+                            Text(formatShortcutCombo(entry.keyCode, entry.metaState) + "  •  " + entry.action.group)
+                        },
+                        trailingContent = {
+                            IconButton(onClick = {
+                                persist(shortcuts.filterNot { it.id == entry.id })
+                            }) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Delete shortcut")
+                            }
+                        }
+                    )
+                    HorizontalDivider()
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Full-screen "press keys..." capture flow: an invisible-but-focused
+ * surface intercepts the next physical KeyEvent via Compose's own
+ * onKeyEvent (works here because this dialog, unlike the running
+ * terminal, has no PTY that also wants the keystroke - no
+ * dispatchKeyEvent-level interception needed). Once a non-modifier key
+ * lands, the combo is frozen and shown back to the user with the action
+ * picker below it; re-tapping "Press keys..." lets them redo the capture
+ * before saving. Warns (but doesn't block) if the combo is already bound
+ * to something else, since silently overwriting a forgotten shortcut is
+ * worse than one extra line of text.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppShortcutCaptureDialog(
+    existing: List<AppShortcutEntry>,
+    onDismiss: () -> Unit,
+    onSave: (AppShortcutEntry) -> Unit
+) {
+    var capturedKeyCode by remember { mutableStateOf<Int?>(null) }
+    var capturedMeta by remember { mutableStateOf(0) }
+    var selectedAction by remember { mutableStateOf<AppAction?>(null) }
+    var capturing by remember { mutableStateOf(true) }
+    val focusRequester = remember { FocusRequester() }
+
+    val conflict = capturedKeyCode?.let { code ->
+        existing.find { it.keyCode == code && it.normalizedMeta == (capturedMeta and AppShortcutEntry.RELEVANT_META_MASK) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New app shortcut") },
+        text = {
+            Column {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester)
+                        .focusable()
+                        .onKeyEvent { keyEvent ->
+                            if (!capturing) return@onKeyEvent false
+                            val native = keyEvent.nativeKeyEvent
+                            if (native.action != KeyEvent.ACTION_DOWN) return@onKeyEvent false
+                            // Ignore a bare modifier press - wait for the
+                            // real key so e.g. holding Ctrl alone doesn't
+                            // get captured as the whole shortcut.
+                            when (native.keyCode) {
+                                KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT,
+                                KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT,
+                                KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT,
+                                KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT ->
+                                    return@onKeyEvent true
+                                else -> {}
+                            }
+                            capturedKeyCode = native.keyCode
+                            capturedMeta = native.metaState
+                            capturing = false
+                            true
+                        }
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        when {
+                            capturing -> "Press a key combo…"
+                            else -> formatShortcutCombo(capturedKeyCode!!, capturedMeta)
+                        },
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+
+                if (!capturing) {
+                    TextButton(onClick = {
+                        capturedKeyCode = null
+                        capturedMeta = 0
+                        capturing = true
+                    }) {
+                        Text("Capture again")
+                    }
+                    if (conflict != null) {
+                        Text(
+                            "Already bound to \"${conflict.action.label}\" - saving will replace it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("Action", style = MaterialTheme.typography.labelLarge)
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Column(modifier = Modifier.heightIn(max = 280.dp).verticalScrollWorkaround()) {
+                        AppAction.groupsInOrder().forEach { group ->
+                            Text(
+                                group,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
+                            )
+                            AppAction.entries.filter { it.group == group }.forEach { action ->
+                                ListItem(
+                                    headlineContent = { Text(action.label) },
+                                    leadingContent = {
+                                        RadioButton(
+                                            selected = selectedAction == action,
+                                            onClick = { selectedAction = action }
+                                        )
+                                    },
+                                    modifier = Modifier.clickable { selectedAction = action }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val code = capturedKeyCode
+                    val action = selectedAction
+                    if (code != null && action != null) {
+                        val id = conflict?.id ?: UUID.randomUUID().toString()
+                        onSave(AppShortcutEntry(id = id, keyCode = code, metaState = capturedMeta, action = action))
+                    }
+                },
+                enabled = capturedKeyCode != null && selectedAction != null
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+}
+
+/** Small helper so the action picker list scrolls within its capped
+ *  height inside the AlertDialog instead of pushing the dialog itself
+ *  off-screen on smaller devices - a plain verticalScroll import kept
+ *  local to this file since nothing else here needs it. */
+@Composable
+private fun Modifier.verticalScrollWorkaround(): Modifier {
+    val scrollState = rememberScrollState()
+    return this.then(Modifier.verticalScroll(scrollState))
+}
+

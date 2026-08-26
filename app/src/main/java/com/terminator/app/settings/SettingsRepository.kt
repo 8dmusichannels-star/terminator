@@ -152,6 +152,14 @@ object SettingsKeys {
     val INPUT_MODE = stringPreferencesKey("input_mode")
     val SECCOMP_ENABLED = booleanPreferencesKey("seccomp_enabled")
     val KEYMAPS = stringPreferencesKey("keymaps_json")
+    // Physical-keyboard shortcuts bound to app-level actions (new split,
+    // clear all sessions, kill focused pane, etc.) rather than to terminal
+    // byte sequences - see AppShortcuts.kt. Fully separate table from
+    // KEYMAPS above: KEYMAPS are user-named combos of VirtualKey taps sent
+    // to the PTY, these are physical KeyEvent combos routed to a
+    // MainViewModel action instead. Independent JSON array, own key, so
+    // clearing/importing one never touches the other.
+    val APP_SHORTCUTS = stringPreferencesKey("app_shortcuts_json")
 
     // Terminal compatibility - which TERM value child processes see.
     // "xterm-256color" (default) gives full color/feature support. It used
