@@ -1,26 +1,18 @@
-# Changelog
+# 📋 Changelog
 
-All notable changes to Terminator are documented here.
+All notable changes to this project will be documented in this file.
 
-### ✨ Added
+## 🚀 Releases
 
-- ⌨️ Added physical keyboard shortcut support.
-- 🖼️ Added showcase screenshots to the README.
+### 🎨 Custom Color Palette Support
 
-### 🐛 Fixed
+- 🌈 Added support for importing custom **16-color ANSI palettes**.
+- 📥 Added `IMPORTED_PALETTE_COLORS` key.
+- 🖥️ Added `IMPORTED_PALETTE_COLORS/FG/BG` keys for imported foreground/background colors.
+- ⚡ Improved custom palette handling for terminal color configurations.
 
-- 🖤 Fixed the AMOLED black top bar bug.
-- 🪟 Fixed split-screen button state.
-- 🔲 Fixed GridView toggle behavior.
-- 🔄 Fixed scrollback selection reset issues.
-- 📜 Added/improved scrollback selection handling.
-- 🧩 Improved multipanel GridView and split-panel behavior.
+**Commit:** [`460e8b7`](https://github.com/8dmusichannels-star/terminator/commit/460e8b7)
 
-### 🎨 Improved
+---
 
-- 🎨 Applied `containerColor` consistently across Compose Material UI.
-- 📱 Updated and improved the README documentation.
-
-### 🔗 Commit
-
-[`960adf7`](https://github.com/8dmusichannels-star/terminator/commit/960adf7)
+_✨ More improvements and fixes coming soon!_
