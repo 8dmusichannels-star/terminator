@@ -1,5 +1,7 @@
 # TERMINATOR
 
+[![GitHub Downloads](https://img.shields.io/github/downloads/8dmusichannels-star/terminator/total)](https://github.com/8dmusichannels-star/terminator/releases)
+
 Terminator is Terminal emulator, it offers comprehensive terminal emulator support with multi-session support that you can directly customize and control. Its main purpose is a terminal emulation that can only be read by the user and is suitable for daily use. The main difference from Terminator is only in the Interface area. It comes with embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot proot envormient support, the terminal tool infrastructure and other works are left to the users of the Terminator application. Other terminal environment and terminal user interface are modern. Supports on Android.
 
 ## Features
