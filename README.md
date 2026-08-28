@@ -40,6 +40,39 @@ Keyboard shortcuts and keymapper support are also provided. You can assign or su
 
 It is currently under development, more advanced features or improved features will be developed soon, but since it is in beta phase and not fully stable, there may be minor bugs.
 
+## Build
+
+### Debug setup
+
+```bash
+gradle assembleDebug --stacktrace
+```
+
+### Release (signed) setup
+
+Keystore environment must be specified:
+
+| Variable | Value |
+|---|---|
+| `KEYSTORE_PATH` | `${{ runner.temp }}/release.keystore` |
+| `KEYSTORE_PASSWORD` | `${{ secrets.KEYSTORE_PASSWORD }}` |
+| `KEY_ALIAS` | `${{ secrets.KEY_ALIAS }}` |
+| `KEY_PASSWORD` | `${{ secrets.KEY_PASSWORD }}` |
+| `KEYSTORE_BASE64` | `${{ secrets.KEYSTORE_BASE64 }}` |
+
+Build command:
+
+```bash
+gradle assembleRelease --stacktrace
+```
+
+# Install
+
+<a href="https://www.openapk.net/terminator/com.terminator.app/"><img src="https://www.openapk.net/images/openapk-192.png" width="100" alt="OpenAPK"></a>
+<a href="https://f-droid.org/en/packages/com.terminator.app/"><img src="https://f-droid.org/badge/get-it-on.png" width="192" alt="F-Droid"></a>
+<a href="https://github.com/8dmusichannels-star/terminator/releases"><img src="https://cdn.simpleicons.org/github/black" width="100" alt="GitHub Releases"></a>
+
+
 ## Showcase
 
 [<img src="showcase/showcase1.png" width=19% alt="Showcase1">](showcase/showcase1.png)
