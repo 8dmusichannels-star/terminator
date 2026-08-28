@@ -68,9 +68,10 @@ gradle assembleRelease --stacktrace
 
 # Install
 
-[![OpenAPK](https://www.openapk.net/images/openapk-192.png)](https://www.openapk.net/terminator/com.terminator.app/)
-[![F-Droid](https://img.shields.io/badge/F--Droid-3B82F6?logo=fdroid&logoColor=white)](https://f-droid.org/en/packages/com.terminator.app/)
-[![GitHub Releases](https://img.shields.io/badge/GitHub_Releases-181717?logo=github&logoColor=white)](https://github.com/8dmusichannels-star/terminator/releases)
+<a href="https://www.openapk.net/terminator/com.terminator.app/"><img src="https://www.openapk.net/images/openapk-192.png" width="100" alt="OpenAPK"></a>
+<a href="https://f-droid.org/en/packages/com.terminator.app/"><img src="https://f-droid.org/badge/get-it-on.png" width="192" alt="F-Droid"></a>
+<a href="https://github.com/8dmusichannels-star/terminator/releases"><img src="https://cdn.simpleicons.org/github/black" width="100" alt="GitHub Releases"></a>
+
 
 ## Showcase
 
