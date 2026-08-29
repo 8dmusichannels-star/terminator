@@ -1,20 +1,20 @@
-Terminator is a Terminal emulator, it offers comprehensive terminal emulator support with multi-session support that you can directly customize and control. Its main purpose is a terminal emulation that can only be read by the user and is suitable for daily use. The main difference from other Terminator apps is only in the interface area. It comes with embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot/proot environment support; the terminal tool infrastructure and other work is left to the users of the Terminator application. Other terminal environment and terminal user interface elements are modern. Supports Android.
+Terminator is a Terminal emulator, offering comprehensive terminal emulator support with multi-session support you can directly customize and control. Its main purpose is a terminal emulation suitable for daily use. The main difference from other Terminator apps is only in the interface area — embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot/proot environment; that infrastructure is left to the users. Supports Android.
 
 <b>Features</b>
 
-It comes with a material user interface, supports all color mappings and the terminal implements it in its own color interface.
+Material user interface, supporting all color mappings in its own color interface.
 
-There is AMOLED black support and also dynamic color material support in the terminal. If you want to keep it simple or plain, just enter the RGB color code — custom CSS terminal color support is also offered. It comes with support for color palettes including the following themes: default, solarized dark, gruvbox dark, dracula, nord. But you can configure the palettes yourself. Termcolor and CSS color support is also offered.
+AMOLED black support and dynamic color material support in the terminal. If you want to keep it simple, just enter the RGB color code — custom CSS terminal color support is also offered. Comes with color palettes including default, solarized dark, gruvbox dark, dracula, nord, but you can configure the palettes yourself. Termcolor support is also offered.
 
-There is multi-session support: you can create multiple sessions, choose default or favorite. After adding the session there is support for file-based session or command-arg session. In the session command-arg, you directly specify the executable that should be built. If you are using root, you can directly activate the root session without using /system/bin/su, specify the login path and the directory path that will create the startup directory, and start the terminal through the session you have set as default. The file-based method works the same way: by specifying the shell script file name and path, you can directly specify the directory to be created and run it with the login path and by activating the root session. But if you specify a chroot or proot-like environment as an argument, the starting directory may not work — it is only valid for arguments that support an entry path. There is a purge setting in "clear," which has terminal behavior, letting you determine whether old data remaining in the clear terminal pty buffer is actually cleared or not. The validity of chroot in proot-like environments is variable.
+Multi-session support: create multiple sessions, choose default or favorite. There is support for file-based session or command-arg session. In session command-arg, you directly specify the executable to be built. If using root, you can activate the root session without /system/bin/su, specify the login path and directory path that creates the startup directory, and start the terminal through the session set as default. The file-based method works the same way: specify the shell script file name and path, specify the directory to be created, and run it with the login path while activating the root session. But if you specify a chroot or proot-like environment as an argument, the starting directory may not work — only valid for arguments that support an entry path. There is a purge setting in "clear," determining whether old data in the pty buffer is actually cleared. The validity of chroot in proot-like environments is variable.
 
-Resizing the terminal size based on text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background support and background blur. It has font support — monospace, sans, mono, serif, and embedded fonts are available, plus custom font support for TTF/OTF fonts — and you can also control whether terminal screen zoom (pinch to zoom) is on or off. It is turned on by default.
+Resizing terminal size based on text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background and background blur. Font support includes monospace, sans, mono, serif, and embedded fonts, plus custom TTF/OTF fonts — pinch-to-zoom can be toggled on or off (on by default).
 
-Ringtone support is included; you can choose a custom or default notification sound from the system.
+Ringtone support included; choose a custom or default notification sound.
 
-You can hide or show the status bar and title bar on the screen. Horizontal orientation mode is supported, and you can use the terminal this way too. You can export the terminal session as a .txt file and determine whether the save button appears in the bar or not. By managing the split-screen visibility switch toggle, you can turn on/off the buttons that enable split-screen and float-screen switching. Turning on the "broadcast to all panes" toggle lets you enter text or commands into more than one terminal session at the same time, across split-screen and float-screen modes. You can also manage all "clear session" behavior with a toggle, hiding the button when it's off but clearing all sessions when it's on.
+Hide or show the status bar and title bar. Horizontal orientation mode is supported. Export the terminal session as a .txt file and determine whether the save button appears in the bar. The split-screen visibility toggle turns on/off buttons enabling split-screen and float-screen switching. "Broadcast to all panes" lets you enter text or commands into more than one session at once, across split-screen and float-screen. "Clear session" behavior is managed with a toggle, hiding the button when off but clearing all sessions when on.
 
-For keyboards, soft keyboard (tap to open/close terminal) and virtual key (keybar) are supported. Login modes include:
+Soft keyboard (tap to open/close terminal) and virtual key (keybar) are supported. Login modes include:
 
 <ul>
 <li><b>Default</b> — compatible with all IMEs, including CJK input, solid terminal</li>
@@ -31,10 +31,11 @@ For keyboards, soft keyboard (tap to open/close terminal) and virtual key (keyba
 <li><b>ANSI</b> — color support, but compatible with DOS</li>
 </ul>
 
-You can control whether the soft keyboard is on or off with a toggle. With the virtual keybar toggle, you can control whether the virtual keybar appears. With the keyboard shortcuts/keymapper toggle, you can control whether those buttons appear.
+Control whether soft keyboard, virtual keybar, and keymapper appear, each with its own toggle.
 
-Keyboard shortcuts and keymapper support are also provided — you can assign or map virtual keyboard actions directly from a physical keyboard. Additionally, seccomp support is available to resolve "operation not permitted" errors, and there are more features.
+Keyboard shortcuts and keymapper support let you assign or map virtual keyboard actions from a physical keyboard. Seccomp support is available to resolve "operation not permitted" errors, and there are more features.
 
 <b>Development status</b>
 
-Terminator is currently under development. More advanced and improved features will be added soon, but since it is in beta phase and not fully stable, there may be minor bugs.
+Terminator is currently under development. More advanced features will be added soon, but since it is in beta and not fully stable, there may be minor bugs.
+
