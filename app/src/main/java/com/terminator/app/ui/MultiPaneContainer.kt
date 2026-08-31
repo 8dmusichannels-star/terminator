@@ -61,6 +61,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
@@ -75,6 +76,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
@@ -809,7 +811,7 @@ private fun PaneContent(
     // scrollOffset LaunchedEffect guard right after it - can both see it.
     // Same instance is reused for TerminalView/SelectionActionBar/etc.
     // further down in this composable.
-    val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
+    val paneSelectionState = com.terminator.emulator.rememberTerminalSelectionState()
     androidx.compose.runtime.LaunchedEffect(runtimeId) { paneSelectionState.clear() }
 
     // Same reasoning as MainActivity's own LaunchedEffect(state.scrollOffset):
@@ -933,7 +935,22 @@ private fun PaneContent(
             }
         }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        // clipToBounds: TerminalView's own selection-handle circles are
+        // drawn slightly BELOW the row they represent (see TerminalView's
+        // drawSelectionHandle doc: rowTop + rowHeight + radius*0.7f) - when
+        // a selection's end row is the LAST visible row, that circle can
+        // extend past this Box's own bottom edge. Without clipping here,
+        // Compose has nothing stopping that overdraw from painting over
+        // whatever sits above this pane in the shared Z-plane - in a
+        // multi-pane grid tile that's this SAME pane's own header row
+        // (the label/close-button Row just above, sharing this Column),
+        // and in a cramped tile it can reach further still. That's what
+        // showed up as a selection handle circle bleeding up into/through
+        // the pane header UI ("UI dışına sızıyor... her modda kuşçuk").
+        // clipToBounds() constrains all drawing (including this handle
+        // overdraw) to this Box's own layout bounds, same as any other
+        // scrollable/clipped content area.
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
             if (buffer != null) {
                 Box(
                     modifier = Modifier
@@ -1002,6 +1019,11 @@ private fun PaneContent(
                                 while (true) {
                                     val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
                                     if (paneSelectionState.selectedTexts.isEmpty()) continue
+                                    // Grace window right after a selection is (re)created -
+                                    // see TerminalSelectionState.lastStartAtNanos' own doc
+                                    // (same fix as the primary pane's identical block).
+                                    val sinceStartMs = (System.nanoTime() - paneSelectionState.lastStartAtNanos) / 1_000_000L
+                                    if (sinceStartMs < 200L) continue
                                     val pointer = event.changes.firstOrNull() ?: continue
                                     if (!pointer.pressed) continue
                                     val h = size.height.toFloat()
@@ -1015,12 +1037,31 @@ private fun PaneContent(
                                         y < edgePx -> {
                                             val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
                                             lastScrollWasEdgeAutoScroll = true
+                                            val prevOffset = scrollOffset
                                             scrollOffset = (scrollOffset + (strength * maxLinesPerFrame).roundToInt()).coerceIn(0, maxOffset)
+                                            // Keep anchor/focus pointing at the same buffer
+                                            // content now that scrollOffset just moved under
+                                            // them - see TerminalSelectionState.shiftRows' own
+                                            // doc. Without this the selection stayed alive
+                                            // (lastScrollWasEdgeAutoScroll above already
+                                            // prevents the clear) but silently slid/came out
+                                            // incomplete against the newly-scrolled buffer.
+                                            val applied = scrollOffset - prevOffset
+                                            if (applied != 0) {
+                                                paneSelectionState.shiftRows(applied)
+                                                paneSelectionState.recomputeFrom(buffer, scrollOffset)
+                                            }
                                         }
                                         y > h - edgePx -> {
                                             val strength = ((y - (h - edgePx)) / edgePx).coerceIn(0f, 1f)
                                             lastScrollWasEdgeAutoScroll = true
+                                            val prevOffset = scrollOffset
                                             scrollOffset = (scrollOffset - (strength * maxLinesPerFrame).roundToInt()).coerceIn(0, maxOffset)
+                                            val applied = scrollOffset - prevOffset
+                                            if (applied != 0) {
+                                                paneSelectionState.shiftRows(applied)
+                                                paneSelectionState.recomputeFrom(buffer, scrollOffset)
+                                            }
                                         }
                                     }
                                 }
@@ -1144,7 +1185,21 @@ private fun PaneContent(
                                             // motion, same as the primary pane's
                                             // draggingWithSelection handling.
                                             lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
+                                            val prevOffset = scrollOffset
                                             scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                            // Same shiftRows/recomputeFrom compensation as the
+                                            // edge-auto-scroll block above - a plain drag
+                                            // anywhere in the pane can also move scrollOffset
+                                            // while a selection stays alive, so it needs the
+                                            // identical fix or the selection slides/comes out
+                                            // incomplete just like the edge case did.
+                                            if (lastScrollWasEdgeAutoScroll) {
+                                                val applied = scrollOffset - prevOffset
+                                                if (applied != 0) {
+                                                    paneSelectionState.shiftRows(applied)
+                                                    paneSelectionState.recomputeFrom(buffer, scrollOffset)
+                                                }
+                                            }
                                         }
                                         longPressCandidate = false
                                         break
@@ -1190,7 +1245,15 @@ private fun PaneContent(
                                                 if (deltaLines != 0f) {
                                                     val maxOffset = buffer.maxScrollOffset
                                                     lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
+                                                    val prevOffset = scrollOffset
                                                     scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                                    if (lastScrollWasEdgeAutoScroll) {
+                                                        val applied = scrollOffset - prevOffset
+                                                        if (applied != 0) {
+                                                            paneSelectionState.shiftRows(applied)
+                                                            paneSelectionState.recomputeFrom(buffer, scrollOffset)
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1206,7 +1269,15 @@ private fun PaneContent(
                                                 val deltaLines = -(dy / charHeight)
                                                 val maxOffset = buffer.maxScrollOffset
                                                 lastScrollWasEdgeAutoScroll = paneSelectionState.selectedTexts.isNotEmpty()
+                                                val prevOffset = scrollOffset
                                                 scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                                if (lastScrollWasEdgeAutoScroll) {
+                                                    val applied = scrollOffset - prevOffset
+                                                    if (applied != 0) {
+                                                        paneSelectionState.shiftRows(applied)
+                                                        paneSelectionState.recomputeFrom(buffer, scrollOffset)
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1255,7 +1326,7 @@ private fun PaneContent(
                         } else {
                             actionModeController.show(
                                 onCopy = {
-                                    val text = paneSelectionState.selectedTexts.joinToString("\n") { it.text }
+                                    val text = paneSelectionState.selectedTexts.joinToString("\n")
                                     if (text.isNotEmpty()) clipboardManager.setText(AnnotatedString(text))
                                     paneSelectionState.clear()
                                     actionModeController.hide()
@@ -1315,6 +1386,11 @@ private fun PaneContent(
                         backgroundAlpha = 1f,
                         scrollOffset = scrollOffset,
                         selectionState = paneSelectionState,
+                        // Same Material primary @ ~25% alpha as the single-pane and
+                        // split-pane terminals - consistent selection highlight across
+                        // every multi-pane tile regardless of that tile's own palette.
+                        highlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f).toArgb(),
+                        handleColor = MaterialTheme.colorScheme.primary.toArgb(),
                         modifier = Modifier.fillMaxSize()
                     )
                     // Anchored in this same Box as TerminalView (top-center
