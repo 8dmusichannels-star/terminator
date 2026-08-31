@@ -4,8 +4,120 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24"
-    android:tint="#FFFFFF">
-    <path
-        android:fillColor="@android:color/white"
-        android:pathData="M2,4 L2,20 L22,20 L22,4 Z M4,6 L20,6 L20,18 L4,18 Z M6,9 L10,12 L6,15 Z M11,15 L16,15 L16,16.5 L11,16.5 Z" />
+    android:tint="?attr/colorControlNormal">
+
+    <group android:name="background_figure" android:alpha="0.5">
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M9.656,2.578 L14.344,2.578 L14.344,4.453 L13.359,6.094 L10.641,6.094 L9.656,4.453 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:fillAlpha="0.9"
+            android:pathData="M9.938,4.125 L14.062,4.125 L14.062,4.969 L12.0,5.156 L9.938,4.969 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M11.156,6.188 L12.844,6.188 L13.031,7.219 L10.969,7.219 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M6.562,9.188 L10.969,7.219 L13.031,7.219 L17.438,9.188 L16.406,10.312 L7.594,10.312 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M7.594,10.312 L16.406,10.312 L17.156,15.0 L15.938,19.219 L8.062,19.219 L6.844,15.0 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:fillAlpha="0.8"
+            android:pathData="M10.312,10.312 L12.0,11.25 L12.0,14.062 L10.5,13.594 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:fillAlpha="0.8"
+            android:pathData="M13.688,10.312 L12.0,11.25 L12.0,14.062 L13.5,13.594 Z" />
+
+        
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M11.812,11.25 L12.188,11.25 L12.188,18.75 L11.812,18.75 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M6.562,9.188 L6.844,15.0 L5.062,15.938 L3.656,15.0 L4.5,10.781 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M3.656,15.0 L5.062,15.938 L4.5,12.656 L6.094,8.438 L4.688,7.875 L2.906,11.719 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M17.438,9.188 L17.156,15.0 L18.938,18.938 L20.156,18.375 L18.562,10.781 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M18.938,18.938 L20.156,18.375 L19.312,20.625 L18.0,20.25 Z" />
+
+        <group
+            android:name="gun"
+            android:pivotX="0"
+            android:pivotY="0"
+            android:translateX="5.25"
+            android:translateY="8.203"
+            android:rotation="12">
+            <path
+                android:fillColor="@android:color/white"
+                android:pathData="M-0.516,-4.453 L0.516,-4.453 L0.516,-0.469 L-0.516,-0.469 Z" />
+            <path
+                android:fillColor="@android:color/white"
+                android:pathData="M-0.703,-4.828 L0.703,-4.828 L0.703,-4.266 L-0.703,-4.266 Z" />
+            <path
+                android:fillColor="@android:color/white"
+                android:pathData="M-0.75,-0.469 L0.75,-0.469 L0.75,0.844 L-0.75,0.844 Z" />
+            <path
+                android:fillColor="@android:color/white"
+                android:pathData="M-0.469,0.844 L-0.469,1.5 L0.188,1.5 L0.188,0.844 L-0.094,0.844 L-0.094,1.266 L-0.188,1.266 L-0.188,0.844 Z" />
+            <path
+                android:fillColor="@android:color/white"
+                android:pathData="M-0.609,0.844 L0.422,0.844 L0.562,2.344 L-0.75,2.344 Z" />
+        </group>
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M8.062,19.219 L11.719,19.219 L11.438,22.031 L8.344,22.031 Z" />
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M12.281,19.219 L15.938,19.219 L15.75,22.031 L12.562,22.031 Z" />
+
+    </group>
+
+    <group android:name="foreground_icon">
+
+        <path
+            android:fillColor="@android:color/white"
+            android:fillType="evenOdd"
+            android:pathData="
+                M1.13,1.13
+                L22.88,1.13
+                L22.88,22.88
+                L1.13,22.88
+                Z
+                M1.22,1.22
+                L1.22,22.78
+                L22.78,22.78
+                L22.78,1.22
+                Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M6.2,7.9 L8.7,7.9 L12.0,12 L8.7,16.1 L6.2,16.1 L6.2,14.6 L9.7,12 L6.2,9.4 Z" />
+
+        <path
+            android:fillColor="@android:color/white"
+            android:pathData="M12.66,14.81 L19.22,14.81 L19.22,16.12 L12.66,16.12 Z" />
+
+    </group>
+
 </vector>
