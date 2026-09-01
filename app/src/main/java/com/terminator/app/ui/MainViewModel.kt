@@ -1293,16 +1293,24 @@ class MainViewModel(
      *  something that should survive recomposition or be part of equality
      *  checks on the UI state.
      */
-    var lastScrollWasEdgeAutoScroll: Boolean = false
-        private set
-
     /** Returns the actual whole-line change applied (post-clamp, post-
      *  accumulator) - callers that track scroll-relative row coordinates
      *  (selection start/end while edge-auto-scrolling) need this to shift
      *  those coordinates by the same amount scrollOffset just moved, or
      *  their on-screen row numbers silently point at different content
      *  than the instant before the scroll happened. See the edge-auto-
-     *  scroll call site in MainActivity for why that matters. */
+     *  scroll call site in MainActivity for why that matters.
+     *
+     *  isEdgeAutoScroll no longer feeds a shared state field read later by
+     *  a LaunchedEffect - every call site now decides synchronously, right
+     *  after calling this, whether to preserve or clear the selection (see
+     *  MainActivity's own doc where selectionState is declared for why a
+     *  shared-flag-plus-LaunchedEffect version raced other callers of this
+     *  function and lost a selection specifically across a pause-then-
+     *  resume drag). The parameter is kept only because shiftRows/
+     *  recomputeFrom callers still want to distinguish their own tick from
+     *  a plain scroll for the return value's sake - it has no other
+     *  effect on state anymore. */
     fun adjustScrollOffset(deltaLines: Float, isEdgeAutoScroll: Boolean = false): Int {
         val buffer = activeBuffer() ?: return 0
         val current = _uiState.value.scrollOffset
@@ -1311,7 +1319,6 @@ class MainViewModel(
         scrollFractionCarry = combined - wholeLines
         val next = (current + wholeLines).coerceIn(0, buffer.maxScrollOffset)
         if (next != current) {
-            lastScrollWasEdgeAutoScroll = isEdgeAutoScroll
             _uiState.value = _uiState.value.copy(scrollOffset = next)
         }
         return next - current
@@ -1323,15 +1330,11 @@ class MainViewModel(
     // leftover fraction from a slow drag that happened in the other.
     private var splitScrollFractionCarry: Float = 0f
 
-    /** Same reasoning as [lastScrollWasEdgeAutoScroll], for the split
-     *  pane's own selection/scroll pair instead of the primary pane's. */
-    var lastSplitScrollWasEdgeAutoScroll: Boolean = false
-        private set
-
     /** Same as [adjustScrollOffset], but for the split-screen secondary
      *  pane's own scrollback (splitScrollOffset) against its own buffer,
      *  rather than the active session's. See SplitTerminalPane's drag
-     *  gesture for the call site. */
+     *  gesture for the call site - same synchronous preserve-or-clear
+     *  reasoning as adjustScrollOffset's own doc. */
     fun adjustSplitScrollOffset(deltaLines: Float, isEdgeAutoScroll: Boolean = false): Int {
         val runtimeId = _uiState.value.splitRuntimeId ?: return 0
         val buffer = liveSessions[runtimeId]?.buffer ?: return 0
@@ -1341,7 +1344,6 @@ class MainViewModel(
         splitScrollFractionCarry = combined - wholeLines
         val next = (current + wholeLines).coerceIn(0, buffer.maxScrollOffset)
         if (next != current) {
-            lastSplitScrollWasEdgeAutoScroll = isEdgeAutoScroll
             _uiState.value = _uiState.value.copy(splitScrollOffset = next)
         }
         return next - current

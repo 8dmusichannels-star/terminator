@@ -34,7 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
-import androidx.compose.foundation.text.selection.rememberSelectionState
+import com.terminator.emulator.rememberTerminalSelectionState
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -52,6 +52,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -951,44 +952,51 @@ class MainActivity : ComponentActivity() {
                             // that actually mutates it (via long-press/drag). Reset whenever the
                             // active session changes so a leftover selection from a different
                             // session's screen can never linger.
-                            val selectionState = rememberSelectionState()
+                            val selectionState = rememberTerminalSelectionState()
                             LaunchedEffect(activeSessionId) { selectionState.clear() }
                             // Clears any active selection the instant state.scrollOffset
-                            // changes (dragging into scrollback, or back toward the live
-                            // screen) - see TerminalView's row loop doc: each row is a
-                            // fixed Composable slot that gets DIFFERENT text handed to it
-                            // as scrollOffset changes, which SelectionContainer has no
-                            // reliable way to track (native selection is only well-defined
-                            // when the text under a given node stays the same - see
-                            // Compose's own "undefined behavior" warning on lazy layouts
-                            // for the same underlying reason, just triggered here without
-                            // a lazy layout at all). Previously the highlight would freeze
-                            // on whatever was selected before the scroll, but silently stop
-                            // tracking real text underneath it and the Copy/Paste toolbar
-                            // would go stale or never reappear - explicitly clearing here
-                            // makes the cutoff clean and immediate instead of leaving a
-                            // highlight on screen that no longer corresponds to anything
-                            // selectable. Keyed on the value itself (not Unit/a boolean) so
-                            // every distinct offset - including scrolling back to exactly
-                            // where a selection started - reruns this.
-                            // isEdgeAutoScroll guard: edge-auto-scroll-while-selecting
-                            // (the pointerInput block below, PointerEventPass.Initial)
-                            // calls adjustScrollOffset() specifically so the user can
-                            // extend a selection into scrollback by dragging a handle
-                            // to the top/bottom edge. Clearing the selection on every
-                            // scrollOffset change unconditionally - as this used to do -
-                            // deleted the selection on the very first auto-scroll tick,
-                            // defeating the feature it was meant to support (see
-                            // MainViewModel.lastScrollWasEdgeAutoScroll's doc). Free
-                            // drag-to-pan / pinch-zoom still clear as before: those
-                            // aren't driven by an active selection, so there's nothing
-                            // worth preserving and the row-slot-reuse problem this
-                            // effect exists for (see below) still applies.
-                            LaunchedEffect(state.scrollOffset) {
-                                if (!viewModel.lastScrollWasEdgeAutoScroll) {
-                                    selectionState.clear()
-                                }
-                            }
+                            // changes for a reason OTHER than actively dragging/extending
+                            // that same selection (dragging into scrollback, or back
+                            // toward the live screen) - see TerminalView's row loop doc:
+                            // each row is a fixed Composable slot that gets DIFFERENT text
+                            // handed to it as scrollOffset changes, which SelectionContainer
+                            // has no reliable way to track (native selection is only
+                            // well-defined when the text under a given node stays the
+                            // same - see Compose's own "undefined behavior" warning on lazy
+                            // layouts for the same underlying reason, just triggered here
+                            // without a lazy layout at all).
+                            //
+                            // Previously this was a LaunchedEffect(state.scrollOffset)
+                            // that read a separate "was this an edge-auto-scroll" flag
+                            // AFTER the state write, asynchronously, to decide whether to
+                            // skip the clear. That flag lived on shared state
+                            // (scrollOffsetWasEdgeAutoScroll) written by EVERY caller of
+                            // adjustScrollOffset - the dedicated edge-auto-scroll gesture,
+                            // the plain drag-while-selecting path, AND unrelated callers
+                            // like pinch-zoom's re-anchor (isEdgeAutoScroll=false by
+                            // default). Because Compose can coalesce multiple scrollOffset-
+                            // changing calls into the state snapshot a single LaunchedEffect
+                            // re-run actually observes, the flag value that effect read
+                            // wasn't guaranteed to correspond to the specific scroll change
+                            // that triggered the effect - a pause-then-resume drag could see
+                            // an interleaved unrelated call's flag value instead of its own,
+                            // clearing the selection out from under a drag that was still
+                            // actively extending it. Worse, once that happened once,
+                            // draggingWithSelection at the NEXT drag frame read
+                            // selectedTexts as already empty, so it itself passed
+                            // isEdgeAutoScroll=false for that frame too - a single
+                            // mis-timed read cascaded into every subsequent frame of the
+                            // same gesture permanently losing the selection, which is what
+                            // read as "scrollback ileri geri yaparken geri tepiyor" (the
+                            // selection resetting mid pause-then-continue drag).
+                            //
+                            // Fixed by removing the asynchronous read entirely: every call
+                            // site that scrolls now decides SYNCHRONOUSLY, in the same
+                            // gesture-loop iteration that calls adjustScrollOffset, whether
+                            // to preserve or clear the selection - see each call site's own
+                            // comment (search "clears selection: not preserving" below).
+                            // There is no longer a state field or LaunchedEffect racing
+                            // those decisions.
                             val clipboardManager = LocalClipboardManager.current
                             // Copy/Paste/More bar - a plain Compose popup
                             // (SelectionActionBar), not a native android.view.ActionMode or a
@@ -1343,6 +1351,15 @@ class MainActivity : ComponentActivity() {
                                         .weight(primaryWeight)
                                         .fillMaxWidth()
                                         .background(Color.Black)
+                                        // clipToBounds: same reasoning as MultiPaneContainer's
+                                        // and SplitTerminalPane's identical fix -
+                                        // TerminalView's selection-handle circles draw
+                                        // slightly below their row and can extend past this
+                                        // Box's own bottom edge when the selection's end row
+                                        // is the last visible one. Without clipping, that
+                                        // overdraw could bleed into the titlebar/status area
+                                        // above this Box in the shared Z-plane.
+                                        .clipToBounds()
                                         .onSizeChanged { size: IntSize ->
                                             // imePadding() reports a new size on every frame of
                                             // the IME's show/hide animation (~250-300ms of
@@ -1398,6 +1415,36 @@ class MainActivity : ComponentActivity() {
                                                     // scrollback doesn't apply).
                                                     if (selectionState.selectedTexts.isEmpty()) continue
                                                     if (viewModel.activeSessionInAlternateScreen()) continue
+                                                    // Only act while a selection HANDLE is actually
+                                                    // being held/dragged (see draggingHandle's own
+                                                    // doc in TerminalSelectionState) - not merely
+                                                    // because a selection exists somewhere. Without
+                                                    // this, this block fires for ANY pressed pointer
+                                                    // in the top/bottom 15% band while a selection is
+                                                    // active - a plain long-press (or even an
+                                                    // ordinary tap held a beat too long) on empty
+                                                    // space near an edge auto-scrolled the
+                                                    // scrollback on its own, stepping on normal
+                                                    // tap/short-press scroll in that same band. Edge-
+                                                    // auto-scroll is meant only for "drag the handle
+                                                    // to the edge to extend the selection into
+                                                    // history".
+                                                    if (!selectionState.draggingHandle) continue
+                                                    // Grace window right after a selection is
+                                                    // (re)created (see TerminalSelectionState.
+                                                    // lastStartAtNanos' own doc): a long-press
+                                                    // landing in the bottom/top 15% band left the
+                                                    // finger already resting inside the auto-scroll
+                                                    // zone the instant selectedTexts went non-empty,
+                                                    // firing this immediately - before any actual
+                                                    // drag - and reading as the fresh selection
+                                                    // randomly "dropping" to a different spot.
+                                                    // Requiring real elapsed time since startAt
+                                                    // means only a finger that's still there AFTER
+                                                    // this window - i.e. genuinely being held/
+                                                    // dragged near the edge - triggers scrolling.
+                                                    val sinceStartMs = (System.nanoTime() - selectionState.lastStartAtNanos) / 1_000_000L
+                                                    if (sinceStartMs < 200L) continue
                                                     val pointer = event.changes.firstOrNull() ?: continue
                                                     if (!pointer.pressed) continue
                                                     val h = size.height.toFloat()
@@ -1410,12 +1457,39 @@ class MainActivity : ComponentActivity() {
                                                         // Top edge — scroll up into scrollback
                                                         y < edgePx -> {
                                                             val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
-                                                            viewModel.adjustScrollOffset(strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                            val applied = viewModel.adjustScrollOffset(strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                            // adjustScrollOffset returns the actual
+                                                            // whole-line change just applied to
+                                                            // scrollOffset - shiftRows keeps
+                                                            // anchorRow/focusRow pointing at the same
+                                                            // BUFFER content instead of the same
+                                                            // screen-relative row numbers now that the
+                                                            // screen just scrolled under them. See
+                                                            // shiftRows' own doc for why this was
+                                                            // missing entirely before: nothing here
+                                                            // ever adjusted the selection's row
+                                                            // bookkeeping to match a scrollOffset
+                                                            // change, which is what made a selection
+                                                            // look like it was being dragged along
+                                                            // with the scroll instead of staying put
+                                                            // and growing into the newly-revealed rows.
+                                                            if (applied != 0) {
+                                                                selectionState.shiftRows(applied)
+                                                                viewModel.activeBuffer()?.let { buf ->
+                                                                    selectionState.recomputeFrom(buf, viewModel.uiState.value.scrollOffset)
+                                                                }
+                                                            }
                                                         }
                                                         // Bottom edge — scroll back toward live output
                                                         y > h - edgePx -> {
                                                             val strength = ((y - (h - edgePx)) / edgePx).coerceIn(0f, 1f)
-                                                            viewModel.adjustScrollOffset(-strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                            val applied = viewModel.adjustScrollOffset(-strength * maxLinesPerFrame, isEdgeAutoScroll = true)
+                                                            if (applied != 0) {
+                                                                selectionState.shiftRows(applied)
+                                                                viewModel.activeBuffer()?.let { buf ->
+                                                                    selectionState.recomputeFrom(buf, viewModel.uiState.value.scrollOffset)
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1467,29 +1541,23 @@ class MainActivity : ComponentActivity() {
                                                 var lastPos = down.position
                                                 var pointerCount = 1
 
-                                                // Long-press-to-select is handled natively by the
-                                                // SelectionContainer overlay wrapping the terminal
-                                                // (see TerminalView.kt), which runs its own
-                                                // long-press detector as a coroutine on this same
-                                                // pointerInput subtree. In practice that detector
-                                                // never got an uncontested window to actually
-                                                // reach its timeout: as long as this loop kept
-                                                // calling awaitPointerEvent() itself on every
-                                                // frame, it kept "winning" that shared input
-                                                // queue first, so the child's timer effectively
-                                                // never elapsed (confirmed via logging - the
-                                                // child's selectedTexts never changed and this
-                                                // loop never saw a consumed change either).
-                                                //
-                                                // The fix: give the child first, uncontested
-                                                // crack at every down. Wait here - without
+                                                // Long-press-to-select is now handled by
+                                                // TerminalView's own pointerInput block (see
+                                                // TerminalView.kt) rather than a native
+                                                // SelectionContainer detector - but the two
+                                                // pointerInput modifiers still see the same
+                                                // event stream, so this loop still needs to give
+                                                // TerminalView's block first crack at every down
+                                                // rather than racing it. Wait here - without
                                                 // calling awaitPointerEvent() in a competing loop,
                                                 // just watching for movement - for up to the
                                                 // system's own long-press timeout. If the finger
                                                 // hasn't moved past touch slop by then, treat this
                                                 // as a long-press: stop reading the pointer stream
                                                 // entirely and return, handing the rest of the
-                                                // gesture to SelectionContainer completely.
+                                                // gesture to TerminalView's own selection block
+                                                // completely (it independently reaches the same
+                                                // timeout and takes over from there).
                                                 val longPressDeadline = System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
                                                 var longPressCandidate = true
                                                 var fingerLifted = false
@@ -1547,23 +1615,42 @@ class MainActivity : ComponentActivity() {
                                                                 // selection HANDLE near the edge) should
                                                                 // scroll scrollback while keeping the
                                                                 // selection intact, exactly like edge-
-                                                                // auto-scroll already does. Without this,
-                                                                // LaunchedEffect(state.scrollOffset)'s
-                                                                // guard (see its own doc) saw
-                                                                // lastScrollWasEdgeAutoScroll = false for
-                                                                // every plain drag and cleared the
-                                                                // selection on the very first pixel of
-                                                                // scroll motion - so scrolling while a
-                                                                // selection was active looked like it
-                                                                // "did nothing" (the drag consumed the
-                                                                // gesture but the selection vanished
-                                                                // instantly, reading as broken rather
-                                                                // than as an intentional selection-clear).
+                                                                // auto-scroll already does.
                                                                 val draggingWithSelection = selectionState.selectedTexts.isNotEmpty()
-                                                                viewModel.adjustScrollOffset(
+                                                                val applied = viewModel.adjustScrollOffset(
                                                                     dy / charHeight,
                                                                     isEdgeAutoScroll = draggingWithSelection
                                                                 )
+                                                                // Same compensation as the dedicated
+                                                                // edge-auto-scroll block above - see
+                                                                // shiftRows' own doc. This is the OTHER
+                                                                // path that can move scrollOffset while
+                                                                // a selection stays alive (a plain drag
+                                                                // anywhere on the terminal, not just
+                                                                // near the top/bottom edge), so it needs
+                                                                // the identical fix or a selection could
+                                                                // still slide during this kind of scroll
+                                                                // even with the edge-drag path fixed.
+                                                                //
+                                                                // Decided SYNCHRONOUSLY, right here in
+                                                                // the same iteration that just scrolled -
+                                                                // not via a separate LaunchedEffect
+                                                                // reading a flag written elsewhere (see
+                                                                // this file's own doc, above where
+                                                                // selectionState is declared, for why
+                                                                // that raced and lost the selection mid
+                                                                // pause-then-resume drag). No selection
+                                                                // to begin with -> nothing to preserve,
+                                                                // clear defensively in case a stray
+                                                                // one-cell/degenerate selection exists.
+                                                                if (draggingWithSelection && applied != 0) {
+                                                                    selectionState.shiftRows(applied)
+                                                                    viewModel.activeBuffer()?.let { buf ->
+                                                                        selectionState.recomputeFrom(buf, viewModel.uiState.value.scrollOffset)
+                                                                    }
+                                                                } else if (!draggingWithSelection && applied != 0) {
+                                                                    selectionState.clear()
+                                                                }
                                                             }
                                                         }
                                                         primary.consume()
@@ -1586,6 +1673,7 @@ class MainActivity : ComponentActivity() {
                                                     return@awaitEachGesture
                                                 }
 
+                                                var stolenByTerminalView = false
                                                 while (!fingerLifted) {
                                                     val event = awaitPointerEvent()
 
@@ -1595,6 +1683,25 @@ class MainActivity : ComponentActivity() {
                                                     if (primary == null || !changes.any { it.pressed }) break
 
                                                     if (changes.any { it.isConsumed }) {
+                                                        // TerminalView's own selection block has
+                                                        // taken this gesture - most commonly a
+                                                        // fresh down that landed on an existing
+                                                        // selection handle, which it grabs and
+                                                        // drags entirely on its own (see its own
+                                                        // grabbedStart/grabbedEnd doc). Recording
+                                                        // that here (rather than just breaking, as
+                                                        // before) is what stops the tap-to-toggle-
+                                                        // keyboard check below from firing once this
+                                                        // gesture ends: moved never gets set to true
+                                                        // by any of the branches below - they never
+                                                        // run once this break fires - so on lift
+                                                        // "!moved" still read true and treated a
+                                                        // finished handle-drag as a plain tap,
+                                                        // toggling the keyboard as an unwanted side
+                                                        // effect of moving a selection handle. A
+                                                        // handle drag should only ever move the
+                                                        // selection, nothing else.
+                                                        stolenByTerminalView = true
                                                         break
                                                     }
 
@@ -1649,6 +1756,19 @@ class MainActivity : ComponentActivity() {
                                                                         // reuse fallback) rather than actually
                                                                         // growing to cover more scrollback.
                                                                         viewModel.adjustScrollOffset(avgDy / charHeight, isEdgeAutoScroll = true)
+                                                                            .let { applied ->
+                                                                                // Same shiftRows compensation
+                                                                                // as every other adjustScrollOffset
+                                                                                // call site that can fire while a
+                                                                                // selection is active - see
+                                                                                // shiftRows' own doc.
+                                                                                if (applied != 0) {
+                                                                                    selectionState.shiftRows(applied)
+                                                                                    viewModel.activeBuffer()?.let { buf ->
+                                                                                        selectionState.recomputeFrom(buf, viewModel.uiState.value.scrollOffset)
+                                                                                    }
+                                                                                }
+                                                                            }
                                                                     }
                                                                 }
                                                             }
@@ -1721,6 +1841,15 @@ class MainActivity : ComponentActivity() {
                                                                             val anchorDelta = (desiredRowAtMidY - anchorRow)
                                                                             if (kotlin.math.abs(anchorDelta) >= 1f) {
                                                                                 viewModel.adjustScrollOffset(-anchorDelta)
+                                                                                // Pinch-zoom's re-anchor only runs
+                                                                                // from the !selectionActive branch
+                                                                                // of the two-finger gesture above,
+                                                                                // so there's normally nothing to
+                                                                                // preserve here - clear defensively
+                                                                                // in case a stray/degenerate
+                                                                                // selection is still around, same
+                                                                                // as free drag-to-pan below.
+                                                                                selectionState.clear()
                                                                             }
                                                                         }
                                                                     }
@@ -1754,17 +1883,34 @@ class MainActivity : ComponentActivity() {
                                                                     // call above, right before this loop
                                                                     // starts - see its own doc. This is
                                                                     // the continuation of that SAME drag
-                                                                    // once it's already in progress, so
-                                                                    // it needs the identical guard or a
-                                                                    // selection that survived the drag's
-                                                                    // first pixel would still get wiped
-                                                                    // on every subsequent frame of the
-                                                                    // same gesture.
+                                                                    // once it's already in progress -
+                                                                    // this is exactly the frame that runs
+                                                                    // when the user pauses mid-drag and
+                                                                    // then keeps moving, so it needs the
+                                                                    // identical synchronous
+                                                                    // preserve-or-clear decision as the
+                                                                    // very first frame (see this file's
+                                                                    // own doc, above where selectionState
+                                                                    // is declared, for why a
+                                                                    // LaunchedEffect-based version raced
+                                                                    // and lost the selection specifically
+                                                                    // across a pause).
                                                                     val draggingWithSelection = selectionState.selectedTexts.isNotEmpty()
-                                                                    viewModel.adjustScrollOffset(
+                                                                    val applied = viewModel.adjustScrollOffset(
                                                                         dy / charHeight,
                                                                         isEdgeAutoScroll = draggingWithSelection
                                                                     )
+                                                                    // Same shiftRows compensation as the
+                                                                    // other adjustScrollOffset call sites
+                                                                    // above - see shiftRows' own doc.
+                                                                    if (draggingWithSelection && applied != 0) {
+                                                                        selectionState.shiftRows(applied)
+                                                                        viewModel.activeBuffer()?.let { buf ->
+                                                                            selectionState.recomputeFrom(buf, viewModel.uiState.value.scrollOffset)
+                                                                        }
+                                                                    } else if (!draggingWithSelection && applied != 0) {
+                                                                        selectionState.clear()
+                                                                    }
                                                                 }
                                                             }
                                                             primary.consume()
@@ -1773,7 +1919,7 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
 
-                                                if (!moved && softKeyboardEnabled) {
+                                                if (!moved && !stolenByTerminalView && softKeyboardEnabled) {
                                                     // Was keyboardController?.hide()/show() (the
                                                     // Compose IME abstraction) - left over from
                                                     // before the toolbar's Copy/Paste/Cancel
@@ -1875,6 +2021,20 @@ class MainActivity : ComponentActivity() {
                                             backgroundAlpha = if (wallpaperUriStr.isNotBlank()) blurAlpha else 1f,
                                             scrollOffset = state.scrollOffset,
                                             selectionState = selectionState,
+                                            // Whole-row selection highlight color - always
+                                            // Material's own primary (accent) at ~25% alpha,
+                                            // independent of colorSchemeMode/terminalPalette
+                                            // above. Selection highlight is a UI affordance,
+                                            // not terminal content, so it stays tied to the
+                                            // app's own Material scheme even when the
+                                            // terminal screen itself is rendering Nord/
+                                            // flatBlack/a custom palette.
+                                            highlightColor = materialColors.primary.copy(alpha = 0.25f).toArgb(),
+                                            // Fully-opaque version of the same Material primary
+                                            // for the two draggable selection handles - needs to
+                                            // stay clearly visible/grabbable, unlike the
+                                            // translucent row-fill highlight above.
+                                            handleColor = materialColors.primary.toArgb(),
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     }
@@ -1917,14 +2077,13 @@ class MainActivity : ComponentActivity() {
                                         }
                                         actionModeController.show(
                                             onCopy = {
-                                                // selectedTexts is one AnnotatedString per Text
-                                                // composable the selection spans (i.e. one per
-                                                // terminal row in TerminalView's overlay) -
-                                                // Compose Foundation joins these with "\n" when
-                                                // multiple Text composables are involved (see the
-                                                // Compose 1.12 changelog), so this doesn't need to
-                                                // add its own line separators.
-                                                val text = selectionState.selectedTexts.joinToString("\n") { it.text }
+                                                // selectedTexts is one plain String per row the
+                                                // selection spans (see TerminalSelectionState.
+                                                // recomputeFrom) - join with "\n" ourselves,
+                                                // same separator the old AnnotatedString-based
+                                                // selectedTexts used to get from Compose
+                                                // Foundation automatically.
+                                                val text = selectionState.selectedTexts.joinToString("\n")
                                                 if (text.isNotEmpty()) {
                                                     clipboardManager.setText(AnnotatedString(text))
                                                 }
@@ -2462,10 +2621,13 @@ class MainActivity : ComponentActivity() {
                                         },
                                         scrollOffset = state.splitScrollOffset,
                                         onScroll = { deltaLines -> viewModel.adjustSplitScrollOffset(deltaLines) },
+                                        // Returns the applied whole-line delta so
+                                        // SplitTerminalPane can shiftRows()/recomputeFrom()
+                                        // its own paneSelectionState right after - see
+                                        // onEdgeAutoScroll's doc in SplitTerminalPane.kt.
                                         onEdgeAutoScroll = { deltaLines ->
                                             viewModel.adjustSplitScrollOffset(deltaLines, isEdgeAutoScroll = true)
                                         },
-                                        wasLastScrollEdgeAutoScroll = { viewModel.lastSplitScrollWasEdgeAutoScroll },
                                         // Collapses the split pane's HiddenPaneInputField down to
                                         // MainActivity's own single insetsController instead of that
                                         // field deriving its own separate WindowInsetsControllerCompat

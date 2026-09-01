@@ -51,7 +51,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
@@ -267,14 +269,19 @@ fun SplitTerminalPane(
     // call as isEdgeAutoScroll=true and avoid wiping the very selection
     // this is trying to extend (see MainViewModel.lastSplitScrollWasEdge-
     // AutoScroll's doc for why that flag exists).
-    onEdgeAutoScroll: (deltaLines: Float) -> Unit = {},
-    // Read right after scrollOffset changes to decide whether this was an
-    // edge-auto-scroll tick (preserve the selection it's trying to extend)
-    // or a manual pan (clear it) - same same-frame-signal shape as
-    // MainViewModel.lastScrollWasEdgeAutoScroll on the primary pane, just
-    // threaded through as a plain lambda since this composable doesn't
-    // hold a MainViewModel reference itself.
-    wasLastScrollEdgeAutoScroll: () -> Boolean = { false },
+    //
+    // Returns the actual whole-line delta MainViewModel.
+    // adjustSplitScrollOffset just applied to splitScrollOffset (same
+    // contract as the primary pane's adjustScrollOffset) - this pane needs
+    // that value back to call paneSelectionState.shiftRows()/recomputeFrom()
+    // itself right below, exactly like MainActivity does for the primary
+    // pane's own selectionState after every adjustScrollOffset call. Without
+    // this, the pane's selection stayed "active" (not cleared, since
+    // isEdgeAutoScroll=true already prevents that) but its anchor/focus rows
+    // kept pointing at the same screen-relative row numbers while the text
+    // underneath scrolled - the exact "selection slides / comes out partial"
+    // symptom shiftRows exists to fix, just never wired up on this pane.
+    onEdgeAutoScroll: (deltaLines: Float) -> Int = { 0 },
     // "More" popup actions for this pane's own selection toolbar (clone,
     // wake lock, split toggle, save). Null hides the More button entirely
     // (same treatment as the primary pane when activeSessionId is null) -
@@ -408,33 +415,38 @@ fun SplitTerminalPane(
                 }
             }
 
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            // clipToBounds: see MultiPaneContainer's identical fix for the
+            // full reasoning - TerminalView's selection-handle circles are
+            // drawn slightly below their row and can extend past this
+            // Box's bottom edge when the selection's end row is the last
+            // visible one. Without clipping, that overdraw could bleed up
+            // into this pane's own header Row just above ("UI dışına
+            // sızıyor... split panel her modda kuşçuk").
+            Box(modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                 if (buffer != null) {
                     // Own native selection state (see TerminalView's
                     // selectionState param doc) - independent of the
                     // primary pane's, long-press/drag selection works on
                     // this pane using the OS's own selection UI same as
                     // the primary pane, no separate toolbar wiring needed.
-                    val paneSelectionState = androidx.compose.foundation.text.selection.rememberSelectionState()
+                    val paneSelectionState = com.terminator.emulator.rememberTerminalSelectionState()
                     LaunchedEffect(runtimeId) { paneSelectionState.clear() }
-                    // Same reasoning as MainActivity's identical effect on
-                    // state.scrollOffset - this pane's own scrollOffset
-                    // param changing means TerminalView's row Composables
-                    // just got handed different text at the same slot,
-                    // which SelectionContainer can't reliably track. Clear
-                    // immediately rather than leaving a highlight on
-                    // screen that no longer points at anything selectable.
-                    // Guarded the same way as the primary pane: skip the
-                    // clear when this scrollOffset change came from edge-
-                    // auto-scroll-while-selecting (onEdgeAutoScroll above),
-                    // since that gesture exists specifically to grow the
-                    // selection into scrollback - clearing on every tick
-                    // deleted the selection it was trying to extend.
-                    LaunchedEffect(scrollOffset) {
-                        if (!wasLastScrollEdgeAutoScroll()) {
-                            paneSelectionState.clear()
-                        }
-                    }
+                    // No LaunchedEffect(scrollOffset) here (unlike an
+                    // earlier version of this fix) - this pane's own drag/
+                    // edge-auto-scroll gesture (the pointerInput block
+                    // further down) already decides SYNCHRONOUSLY, in the
+                    // same iteration that changes scrollOffset, whether to
+                    // preserve the selection (paneSelectionState.selectedTexts
+                    // .isNotEmpty() -> onEdgeAutoScroll + shiftRows/
+                    // recomputeFrom) or clear it (the plain onScroll branch,
+                    // see its own call site's doc) - see that block's own
+                    // doc just below (search "Route through onEdgeAutoScroll").
+                    // A LaunchedEffect reacting to scrollOffset AFTER the
+                    // fact, gated on a separately-read flag, is exactly the
+                    // pattern that raced other scroll callers and lost a
+                    // selection mid pause-then-resume drag on the primary
+                    // pane - not repeating that here now that this pane's
+                    // gesture handles both outcomes itself, inline.
                     // This pane's own native Copy/Paste bubble
                     // (ActionModeController, same mechanism the primary
                     // pane uses - see SelectionOverrideToolbar.kt). This
@@ -469,7 +481,7 @@ fun SplitTerminalPane(
                         } else {
                             actionModeController.show(
                                 onCopy = {
-                                    val text = paneSelectionState.selectedTexts.joinToString("\n") { it.text }
+                                    val text = paneSelectionState.selectedTexts.joinToString("\n")
                                     if (text.isNotEmpty()) clipboardManager.setText(AnnotatedString(text))
                                     paneSelectionState.clear()
                                     actionModeController.hide()
@@ -580,6 +592,11 @@ fun SplitTerminalPane(
                                     while (true) {
                                         val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
                                         if (paneSelectionState.selectedTexts.isEmpty()) continue
+                                        // Grace window right after a selection is (re)created -
+                                        // see TerminalSelectionState.lastStartAtNanos' own doc
+                                        // (same fix as the primary pane's identical block).
+                                        val sinceStartMs = (System.nanoTime() - paneSelectionState.lastStartAtNanos) / 1_000_000L
+                                        if (sinceStartMs < 200L) continue
                                         val pointer = event.changes.firstOrNull() ?: continue
                                         if (!pointer.pressed) continue
                                         val h = size.height.toFloat()
@@ -785,9 +802,26 @@ fun SplitTerminalPane(
                                                     // like it did nothing, since the selection
                                                     // vanished the instant the drag started.
                                                     if (paneSelectionState.selectedTexts.isNotEmpty()) {
-                                                        onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                        val applied = onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                        // Keep anchor/focus pointing at the same
+                                                        // buffer content now that splitScrollOffset
+                                                        // just moved under them - see shiftRows' own
+                                                        // doc and onEdgeAutoScroll's doc above.
+                                                        if (applied != 0) {
+                                                            paneSelectionState.shiftRows(applied)
+                                                            buffer?.let { buf ->
+                                                                paneSelectionState.recomputeFrom(buf, scrollOffset)
+                                                            }
+                                                        }
                                                     } else {
                                                         onScroll(pendingDy / charHeightPx)
+                                                        // No selection to preserve - clear
+                                                        // defensively here rather than via a
+                                                        // scrollOffset-keyed LaunchedEffect (see
+                                                        // this pane's own doc above for why that
+                                                        // separate-effect version raced other
+                                                        // scroll callers).
+                                                        paneSelectionState.clear()
                                                     }
                                                     pendingDy = 0f
                                                 }
@@ -830,9 +864,16 @@ fun SplitTerminalPane(
                                             frameJob.cancel()
                                             if (pendingDy != 0f && charHeightPx > 0f) {
                                                 if (paneSelectionState.selectedTexts.isNotEmpty()) {
-                                                    onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                    val applied = onEdgeAutoScroll(pendingDy / charHeightPx)
+                                                    if (applied != 0) {
+                                                        paneSelectionState.shiftRows(applied)
+                                                        buffer?.let { buf ->
+                                                            paneSelectionState.recomputeFrom(buf, scrollOffset)
+                                                        }
+                                                    }
                                                 } else {
                                                     onScroll(pendingDy / charHeightPx)
+                                                    paneSelectionState.clear()
                                                 }
                                                 pendingDy = 0f
                                             }
@@ -874,6 +915,12 @@ fun SplitTerminalPane(
                             backgroundAlpha = 1f,
                             scrollOffset = scrollOffset,
                             selectionState = paneSelectionState,
+                            // Same Material primary @ ~25% alpha as the single-pane
+                            // terminal (MainActivity) - keeps the selection highlight
+                            // visually consistent across split panes regardless of
+                            // each pane's own terminal color scheme.
+                            highlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f).toArgb(),
+                            handleColor = MaterialTheme.colorScheme.primary.toArgb(),
                             modifier = Modifier.fillMaxWidth().fillMaxHeight(),
                             debugLabel = "split"
                         )

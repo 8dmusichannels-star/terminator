@@ -21,42 +21,236 @@
 package com.terminator.emulator
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.width
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.foundation.text.BasicText
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.text.selection.SelectionState
-import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.platform.LocalTextToolbar
-import androidx.compose.ui.platform.TextToolbar
-import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.unit.dp
 import android.graphics.Paint
 import android.graphics.Typeface
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.text.contextmenu.provider.LocalTextContextMenuDropdownProvider
-import androidx.compose.foundation.text.contextmenu.provider.LocalTextContextMenuToolbarProvider
-import androidx.compose.foundation.text.contextmenu.provider.TextContextMenuDataProvider
-import androidx.compose.foundation.text.contextmenu.provider.TextContextMenuProvider
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Replaces androidx.compose.foundation.text.selection.SelectionState now
+ * that TerminalView owns its own long-press/drag/handle selection instead
+ * of delegating to Compose's native SelectionContainer (see TerminalView's
+ * own doc for why - the native handle drawables don't track this app's
+ * actual char grid across zoom/font-scale, which read as the handle
+ * "jumping" away from the finger).
+ *
+ * Deliberately keeps the same two-member surface SelectionState had -
+ * `selectedTexts: List<String>` and `clear()` - because MainActivity has
+ * ~40 call sites reading selectionState.selectedTexts.isEmpty()/
+ * isNotEmpty()/joinToString and calling selectionState.clear() (edge
+ * auto-scroll guard, the Copy toolbar's LaunchedEffect, the toolbar's
+ * onCopy body, session-switch resets...). Swapping this in for the old
+ * SelectionState as a drop-in - same shape, different implementation -
+ * meant none of those call sites needed to change at all.
+ *
+ * Internally this is anchor/focus row+col pairs (character offsets into
+ * TerminalBuffer's grid) rather than a text-layout selection - TerminalView
+ * turns those into per-row substrings via TerminalBuffer.rowPlainText()
+ * whenever selectedTexts is read (see the private rowTexts() below),
+ * instead of Compose's own text-node-based tracking.
+ */
+class TerminalSelectionState {
+    var active by mutableStateOf(false)
+        private set
+
+    // Row/col are character-grid coordinates (buffer.rows x buffer.columns),
+    // NOT pixels - converting pixel->cell happens once, at the point a
+    // pointerInput callback reads a raw touch Offset (see startAt/
+    // updateFocusAt/updateAnchorAt below and TerminalView's gesture block).
+    var anchorRow by mutableStateOf(0)
+        private set
+    var anchorCol by mutableStateOf(0)
+        private set
+    var focusRow by mutableStateOf(0)
+        private set
+    var focusCol by mutableStateOf(0)
+        private set
+
+    // Backing list for selectedTexts - a SnapshotStateList so Compose
+    // recomposes anywhere selectedTexts is read (LaunchedEffect keys,
+    // selectedRows further down) exactly like the old SelectionState's own
+    // reactive list did. Rebuilt in full on every anchor/focus change via
+    // recomputeFrom() rather than mutated cell-by-cell, since a drag can
+    // jump several rows in one pointer event and there's no cheaper partial
+    // update that stays correct in every direction (dragging up vs down,
+    // shrinking vs growing).
+    private val _selectedTexts = SnapshotStateList<String>()
+    val selectedTexts: List<String> get() = _selectedTexts
+
+    // Timestamp (System.nanoTime()) of the most recent startAt() call - lets
+    // a caller distinguish "a selection was just created by this long-press,
+    // finger hasn't actually moved yet" from "a selection has been alive for
+    // a while and the finger is now genuinely dragging". MainActivity's edge-
+    // auto-scroll observer (PointerEventPass.Initial) reads this: without it,
+    // a long-press that happened to land in the bottom ~15% of the visible
+    // terminal (very common - people select the last few lines of output,
+    // which sit near the bottom of the screen) made selectedTexts go from
+    // empty to non-empty while the finger was ALREADY resting inside the
+    // auto-scroll band, so the very next Initial-pass tick auto-scrolled
+    // immediately - before the user had dragged anywhere - which both moved
+    // the freshly-created one-cell selection to point at different buffer
+    // content (shiftRows compensates for the offset change, but the visual
+    // effect is still the selection appearing to "drop" to a new spot the
+    // instant it's created) and only reproduced intermittently, exactly
+    // matching "bazen küçücük selection aşağıya düşüyor... sık olmuyor ama
+    // bazen oluyor" - it only happened when the long-press itself landed in
+    // that bottom band, not on every selection.
+    var lastStartAtNanos: Long = 0L
+        private set
+
+    // True only for the duration a selection HANDLE is actually being
+    // held/dragged (the grabbedStart/grabbedEnd branch in TerminalView's
+    // gesture block, between down.consume() and the drag loop ending) -
+    // NOT true merely because `active`/`selectedTexts` is non-empty.
+    // MainActivity's edge-auto-scroll observer (PointerEventPass.Initial,
+    // watching every pointer event regardless of consumption) used to gate
+    // only on selectedTexts.isEmpty()+position, which meant ANY press in
+    // the top/bottom 15% band while a selection existed elsewhere on
+    // screen - a plain long-press on empty space, or even an ordinary tap
+    // held a beat too long - auto-scrolled the scrollback on its own. That
+    // read as "selection seçip duraksadıktan sonra long press ile
+    // scrollback kendi kendine scroll oluyor" and stepped on ordinary
+    // short-press/tap scroll interactions in that same band. Edge-auto-
+    // scroll should only ever fire while the user is actually holding a
+    // handle to extend the selection into scrollback - this flag is what
+    // lets that block tell the difference.
+    var draggingHandle by mutableStateOf(false)
+        private set
+
+    fun beginHandleDrag() {
+        draggingHandle = true
+    }
+
+    fun endHandleDrag() {
+        draggingHandle = false
+    }
+
+    fun clear() {
+        active = false
+        _selectedTexts.clear()
+        // Defensive: if something external (session switch, etc.) clears
+        // the selection out from under an in-progress handle drag, don't
+        // leave edge-auto-scroll permanently gated open afterward.
+        draggingHandle = false
+    }
+
+    /** Begins a new selection anchored at (row, col) - called once, from
+     *  the long-press timeout in TerminalView's gesture block. */
+    fun startAt(row: Int, col: Int) {
+        anchorRow = row; anchorCol = col
+        focusRow = row; focusCol = col
+        active = true
+        lastStartAtNanos = System.nanoTime()
+    }
+
+    /** Moves the FOCUS (the end being dragged) to (row, col), keeping the
+     *  anchor fixed - called on every drag frame once a selection is
+     *  active. Anchor/focus can be in either order (focus above or below
+     *  anchor); recomputeFrom normalizes that when building row text. */
+    fun updateFocusAt(row: Int, col: Int) {
+        focusRow = row; focusCol = col
+    }
+
+    /** Shifts both anchorRow and focusRow by [deltaRows] - call whenever
+     *  scrollOffset itself just changed (edge-auto-scroll while dragging a
+     *  handle) so the selection keeps pointing at the same BUFFER content
+     *  instead of silently sliding to whatever now occupies those same
+     *  screen-relative row numbers.
+     *
+     *  anchorRow/focusRow are screen-relative (0..buffer.rows-1), the same
+     *  coordinate space TerminalView's cellOf() and TerminalBuffer's own
+     *  row/scrollOffset addressing use - they say nothing on their own
+     *  about WHICH buffer content they point at without also knowing
+     *  scrollOffset at the moment they were set (see TerminalBuffer.lineAt's
+     *  own doc: row N at scrollOffset S and row N at scrollOffset S+1 are
+     *  two different lines of actual text). Edge-auto-scroll changes
+     *  scrollOffset out from under an in-progress drag specifically so the
+     *  user can extend a selection into scrollback by holding a handle at
+     *  the screen edge - but changing scrollOffset alone, with nothing
+     *  adjusting anchorRow/focusRow to match, left both of them pointing at
+     *  the SAME row numbers as before against a screen that had just
+     *  scrolled past them. That's what made a selection appear to get
+     *  dragged/slide along with the scroll instead of staying anchored to
+     *  the text it started on and simply growing into the newly-revealed
+     *  rows: every tick moved the content under the selection without
+     *  moving the selection's own row bookkeeping to compensate, in either
+     *  scroll direction (up or down) equally - this fixes both.
+     *
+     *  Call this BEFORE recomputeFrom() for the same scroll tick so
+     *  recomputeFrom reads already-corrected rows against the new
+     *  scrollOffset, not the stale ones against a scrollOffset that no
+     *  longer matches them.
+     */
+    fun shiftRows(deltaRows: Int) {
+        if (deltaRows == 0 || !active) return
+        anchorRow += deltaRows
+        focusRow += deltaRows
+    }
+
+    /** Recomputes selectedTexts from the current anchor/focus against
+     *  [buffer] at [scrollOffset] - call after startAt/updateFocusAt
+     *  whenever the caller wants selectedTexts to reflect the latest
+     *  drag position (TerminalView does this once per gesture-loop frame,
+     *  not on every intermediate pointer event, to avoid rebuilding up to
+     *  buffer.rows row strings more often than the screen can actually
+     *  redraw). No-op (leaves selectedTexts as-is) when `active` is
+     *  false - clear() already emptied the list in that case. */
+    fun recomputeFrom(buffer: TerminalBuffer, scrollOffset: Int) {
+        if (!active) return
+        val (startRow, startCol, endRow, endCol) = normalized()
+        val rows = mutableListOf<String>()
+        for (row in startRow..endRow) {
+            val line = buffer.rowPlainText(row, scrollOffset)
+            val fromCol = if (row == startRow) startCol else 0
+            // line.length can be shorter than buffer.columns would
+            // suggest if the caller ever changes that invariant - coerce
+            // defensively rather than throwing on a stale/racy read.
+            val toColExclusive = if (row == endRow) (endCol + 1).coerceAtMost(line.length) else line.length
+            rows += if (fromCol < toColExclusive) line.substring(fromCol.coerceIn(0, line.length), toColExclusive) else ""
+        }
+        _selectedTexts.clear()
+        _selectedTexts.addAll(rows)
+    }
+
+    /** Anchor/focus in top-to-bottom, left-to-right order regardless of
+     *  which one the user actually dragged - a drag that moves the focus
+     *  ABOVE the anchor (selecting upward) still needs startRow <= endRow
+     *  for recomputeFrom's row loop and for TerminalView's handle
+     *  placement (the "start" handle is always the visually-earlier one,
+     *  not always the anchor). */
+    fun normalized(): SelectionRange {
+        return if (anchorRow < focusRow || (anchorRow == focusRow && anchorCol <= focusCol)) {
+            SelectionRange(anchorRow, anchorCol, focusRow, focusCol)
+        } else {
+            SelectionRange(focusRow, focusCol, anchorRow, anchorCol)
+        }
+    }
+}
+
+/** Normalized (start <= end) selection bounds in buffer row/col
+ *  coordinates - see [TerminalSelectionState.normalized]. */
+data class SelectionRange(val startRow: Int, val startCol: Int, val endRow: Int, val endCol: Int)
+
+@Composable
+fun rememberTerminalSelectionState(): TerminalSelectionState = remember { TerminalSelectionState() }
 
 /**
  * Renders a TerminalBuffer to a Compose Canvas using a monospace font.
@@ -249,12 +443,27 @@ fun TerminalView(
     // terminal down to look at scrollback history, this many lines back.
     scrollOffset: Int = 0,
     // Hoisted by the caller (MainActivity) so its own Copy/Paste/Close
-    // toolbar can read selectionState.selectedTexts and call .clear() -
-    // see that file's SelectionToolbar wiring. Callers that don't need to
-    // observe/drive selection themselves (SplitTerminalPane's panes) can
-    // just leave the default, which still gets full native long-press/
-    // drag selection - they just don't read anything back out of it.
-    selectionState: SelectionState = rememberSelectionState(),
+    // toolbar can read selectionState.selectedTexts and call .clear().
+    // Callers that don't need to observe/drive selection themselves
+    // (SplitTerminalPane's panes) can just leave the default - they still
+    // get full long-press/drag selection, they just don't read anything
+    // back out of it.
+    selectionState: TerminalSelectionState = rememberTerminalSelectionState(),
+    // Full-row selection highlight color (ARGB int, alpha already baked
+    // in by the caller - MainActivity passes Material's primary at ~25%
+    // alpha, see its own comment there). Painted as a whole-row block
+    // behind the glyphs, text/whitespace alike, for every row that has
+    // any selected text on it - not a per-character highlight. Stays
+    // visible for exactly as long as selectionState.selectedTexts is
+    // non-empty for that row, which is what makes it disappear the
+    // instant selectionState.clear() runs (tapping empty space) - see
+    // drawTerminal below for where it's actually painted.
+    highlightColor: Int = 0x407EC8FF.toInt(),
+    // Selection handle color (ARGB int) - the two draggable teardrop
+    // markers at the start/end of an active selection. Defaults to the
+    // same blue as highlightColor's base hue but fully opaque (handles
+    // need to stay visible/grabbable, unlike the translucent row fill).
+    handleColor: Int = 0xFF7EC8FF.toInt(),
     modifier: Modifier = Modifier,
     // Debug-only tag prefixed onto this instance's SelDebug/ToolbarDebug
     // logcat lines so a log spanning both the primary pane's TerminalView
@@ -264,11 +473,17 @@ fun TerminalView(
     debugLabel: String = "primary"
 ) {
     val density = LocalDensity.current
+    val viewConfiguration = LocalViewConfiguration.current
     // Same px math drawTerminal uses below (sp -> px via density * fontScale,
-    // then Paint's own font metrics) computed once here too, so the invisible
-    // selection overlay's row height/column width in dp lines up with the
-    // actual glyph grid the Canvas paints. Recomputed only when one of the
-    // inputs that could change it actually changes, not on every frame.
+    // then Paint's own font metrics) computed once here too, so handle
+    // placement and hit-testing in dp/px line up with the actual glyph grid
+    // the Canvas paints - this is the actual fix for the handle "jumping"
+    // away from the finger the native SelectionContainer handles used to
+    // do: those were positioned via Compose's own text-layout bounds, which
+    // didn't always agree with this exact charWidth/charHeight math,
+    // especially right after a pinch-zoom font-size change. Recomputed only
+    // when one of the inputs that could change it actually changes, not on
+    // every frame.
     val (charWidthPx, charHeightPx) = remember(fontFamily, fontSizeSp, density.density, density.fontScale) {
         val measuringPaint = Paint().apply {
             typeface = fontFamily
@@ -282,252 +497,475 @@ fun TerminalView(
         // TerminalEmulator.Listener callback (cursor move / content change).
         // Reading it here (even though drawTerminal reads straight from
         // `buffer`) is what makes Compose actually recompose on new output.
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            @Suppress("UNUSED_EXPRESSION")
-            bufferVersion
-            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset)
-        }
+        // Which on-screen rows currently carry any selected text, read
+        // fresh on every recomposition. selectionState.selectedTexts is a
+        // SnapshotStateList - its CONTENTS change (via recomputeFrom's
+        // clear()+addAll()) but the list object itself never does, so
+        // remember(selectedTexts) here would key off a reference that
+        // never changes and permanently cache the very first (empty,
+        // pre-selection) result forever - that was the actual bug behind
+        // "highlight never shows up at all": selectedRows silently stayed
+        // the empty set from the first composition onward regardless of
+        // how many rows actually became selected afterward. Recomputing
+        // plainly on every recomposition (no remember) is correct here:
+        // reading selectedTexts's contents is itself what subscribes this
+        // composable to the SnapshotStateList's structural changes, so it
+        // reruns exactly when the selection actually changes - the same
+        // mechanism that already makes plain (non-remembered) reads of
+        // other Compose State work everywhere else in this file.
+        val selectedTexts = selectionState.selectedTexts
+        // Handle positions, in buffer row/col coordinates - only
+        // meaningful while selectionState.active is true. Read here (not
+        // inside the gesture block) so the Canvas draw call below
+        // recomposes on every anchor/focus change, same as selectedRows.
+        // Read BEFORE selectedRows below: selectedTexts[i] corresponds to
+        // buffer row range.startRow + i (recomputeFrom builds one string
+        // per row starting at normalized() 's startRow, not per absolute
+        // buffer row - see its own doc), so mapping a plain list index
+        // straight to a buffer row number is only correct when
+        // startRow == 0. That held by coincidence for a downward drag
+        // started at the very top of the visible screen (the common
+        // manual test), which is exactly why an upward drag - or any
+        // selection that doesn't start at row 0 - highlighted/handled the
+        // wrong rows: e.g. a 3-row selection from row 5 to row 7 produced
+        // selectedTexts of size 3 at indices 0/1/2, which this used to
+        // read directly as rows 0/1/2 instead of offsetting by startRow.
+        val range = if (selectionState.active) selectionState.normalized() else null
+        val selectedRows = selectedTexts.withIndex()
+            .filter { (_, text) -> text.isNotEmpty() }
+            .mapTo(HashSet()) { (index, _) -> (range?.startRow ?: 0) + index }
 
-        // Native text-selection overlay (requires Compose BOM 2026.08.00 /
-        // Compose Foundation 1.12+, which added edge auto-scroll-while-
-        // selecting to SelectionContainer - see build.gradle.kts). This is
-        // an invisible, real-text row stack positioned exactly over the
-        // Canvas above it. Long-press-to-select, drag-to-extend, the
-        // system's own selection handles, auto-scroll past the viewport
-        // edge, and the floating Copy/Select All toolbar are now all
-        // Android's job via SelectionContainer - none of it is hand-rolled
-        // pointerInput math anymore (see MainActivity's gesture loop,
-        // which no longer starts a selection on long-press for exactly
-        // this reason). The Canvas above still owns everything actually
-        // painted (ANSI colors, bold/italic, the block cursor); this layer
-        // only has to carry the right characters in the right on-screen
-        // positions for selection/copy to work correctly - text color is
-        // fully transparent so it never visually doubles the glyphs
-        // Canvas already drew. It intentionally uses FontFamily.Monospace
-        // rather than the caller's own `fontFamily` Typeface: Compose's
-        // font APIs don't take an android.graphics.Typeface directly, and
-        // since this layer is invisible its glyph shapes don't matter -
-        // only that it stays reasonably monospaced so column positions
-        // (and therefore where a drag lands / where handles appear) stay
-        // close to the Canvas grid underneath. bufferVersion is read via
-        // the enclosing composable's own recomposition (see the Canvas
-        // comment above) rather than a second explicit read here.
-        // See NoOpTextToolbar's doc above: this is what stops
-        // SelectionContainer's platform fallback bubble from ever
-        // starting alongside ActionModeController's own bubble. remember()
-        // (not a shared object/companion) so each TerminalView instance -
-        // primary pane and split pane each render their own - tracks its
-        // own independent shown/hidden status rather than one instance's
-        // selection state leaking into the other's.
-        val noOpTextToolbar = remember { NoOpTextToolbar() }
-        CompositionLocalProvider(
-            LocalTextToolbar provides noOpTextToolbar,
-            // Blocks the newer contextmenu-package path too - see
-            // NoOpTextContextMenuProvider's doc above for why the old
-            // LocalTextToolbar override alone left a second native bubble
-            // able to fire during an active selection drag.
-            LocalTextContextMenuToolbarProvider provides NoOpTextContextMenuProvider,
-            LocalTextContextMenuDropdownProvider provides NoOpTextContextMenuProvider,
-        ) {
-            SelectionContainer(state = selectionState) {
-                androidx.compose.runtime.LaunchedEffect(selectionState.selectedTexts) {
-                }
-                // Freeze the row text this overlay shows while a selection is
-                // active, but re-freeze on every scrollOffset change - not
-                // just once when the selection starts. Without this, every
-                // bufferVersion bump (i.e. every burst of new terminal
-                // output - the textbook case: the user starts a long-press
-                // selection while a command is still producing output)
-                // recomposes this whole TerminalView function body, which
-                // re-reads buffer.rowPlainText(row, scrollOffset) for every
-                // row right under SelectionContainer. That handed the SAME
-                // row Composable slots DIFFERENT text mid-drag - exactly the
-                // "row slots get different text" problem this file's
-                // LaunchedEffect(state.scrollOffset) doc (in MainActivity)
-                // already describes for scrollOffset changes, just
-                // triggered by ordinary new output instead. SelectionContainer
-                // has no way to reconcile that: it found its selection
-                // pointing at text that's no longer there and silently
-                // collapsed it to empty (visible in logcat as selectedTexts
-                // changed, count=0 with no scrollOffset change anywhere near
-                // it - the actual bug report this fixes).
-                //
-                // remember(debugLabel, scrollOffset) - not just
-                // remember(debugLabel) - is what makes this re-freeze on
-                // scroll: MainActivity's own gesture code (see its
-                // isEdgeAutoScroll doc) now deliberately keeps a selection
-                // alive across a drag-to-scroll gesture instead of clearing
-                // it, specifically so the user can drag anywhere to scroll
-                // scrollback while extending what's selected. With the old
-                // remember(debugLabel) key, once a selection started this
-                // Column kept showing the ORIGINAL scrollOffset's text
-                // forever, so scrolling moved the live Canvas underneath but
-                // left this invisible selection layer (and therefore
-                // SelectionContainer's own idea of what's selected and where)
-                // pointed at stale, no-longer-visible rows - the selection
-                // looked like it "slid" along with the fixed set of frozen
-                // rows instead of growing to cover the newly-scrolled-into
-                // ones, and since the same *character offsets* mean
-                // completely different actual buffer rows after a scroll,
-                // SelectionContainer's own anchor/focus indices went stale
-                // against the frozen text and it silently collapsed the
-                // selection to empty on the very next recomposition - both
-                // halves of the reported bug at once.
-                //
-                // isNotEmpty() re-snapshots on every recomposition while a
-                // selection is active so drag-to-extend still grows into
-                // freshly-frozen rows as the selection itself grows - only
-                // the "new output changed rows the user isn't touching"
-                // case is what's actually being guarded against here (via
-                // the debugLabel/scrollOffset key staying put across
-                // ordinary bufferVersion-only recompositions), not selection
-                // growth or scroll-driven row changes.
-                val frozenRowText = remember(debugLabel, scrollOffset) { mutableStateOf<List<String>?>(null) }
-                if (selectionState.selectedTexts.isEmpty()) {
-                    frozenRowText.value = null
-                } else if (frozenRowText.value == null) {
-                    frozenRowText.value = (0 until buffer.rows).map { row -> buffer.rowPlainText(row, scrollOffset) }
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .onGloballyPositioned { coords ->
+        // The gesture block below is long-lived (its pointerInput key list
+        // deliberately does NOT include scrollOffset - restarting mid-drag
+        // on every edge-auto-scroll tick would cancel the drag itself).
+        // That means the block's own closure can't just capture
+        // `scrollOffset` by value; it needs to read whatever the CURRENT
+        // scrollOffset is on every drag frame so recomputeFrom() selects
+        // against the right rows as the user scrolls into history mid-
+        // selection - see MainActivity's own edge-auto-scroll doc for why
+        // that has to keep working while a selection is active. Without
+        // this, every recomputeFrom() call during a drag used whatever
+        // scrollOffset happened to be in effect when the gesture started,
+        // so dragging a handle toward the edge scrolled the view but the
+        // selection itself stayed pinned to the pre-scroll rows - the
+        // "scrollback yapinca genislemiyor" bug.
+        val latestScrollOffset = androidx.compose.runtime.rememberUpdatedState(scrollOffset)
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                // Long-press-to-select + drag-to-extend, replacing
+                // Compose Foundation's native SelectionContainer detector
+                // (see TerminalSelectionState's own doc for why: the
+                // native handle drawables didn't track this app's actual
+                // char grid across zoom/font-scale changes). Runs at the
+                // default (Main) pass, same as any ordinary tap/drag
+                // handler - MainActivity's own gesture pointerInput
+                // no longer needs to race this one for the first crack
+                // at a down event, since there's no separate native
+                // detector left to contend with; this block and
+                // MainActivity's tap/pinch/pan block simply run as two
+                // independent pointerInput modifiers on the same Box,
+                // and Compose delivers every event to both. Cancelling
+                // out of this block on ordinary taps/short drags (see
+                // the wasLongPress check below) leaves those events
+                // fully unconsumed for MainActivity's own block to
+                // handle exactly as before.
+                .pointerInput(debugLabel, buffer.rows, buffer.columns) {
+                    fun cellOf(x: Float, y: Float): Pair<Int, Int> {
+                        val rawCol = (x / charWidthPx).toInt().coerceIn(0, buffer.columns - 1)
+                        val rawRow = (y / charHeightPx).toInt().coerceIn(0, buffer.rows - 1)
+                        return rawRow to rawCol
+                    }
+                    // Snaps a touch that landed past the end of real
+                    // content on its row onto the last non-blank column
+                    // instead - mirrors the old SelectionContainer-era
+                    // lastNonBlankColumn doc: most of a terminal screen
+                    // below the prompt is blank, and selecting/copying
+                    // nothing from a tap on obviously-empty space read as
+                    // broken.
+                    fun snappedCellOf(x: Float, y: Float): Pair<Int, Int> {
+                        val (row, col) = cellOf(x, y)
+                        val lastCol = buffer.lastNonBlankColumn(row, latestScrollOffset.value)
+                        return if (lastCol != null && col > lastCol) row to lastCol else row to col
+                    }
+
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+
+                        // If a selection is already active, a fresh down
+                        // ON one of its own handles re-grabs that handle
+                        // for dragging instead of starting a brand new
+                        // long-press cycle - without this, touching the
+                        // handle you just placed would wait out another
+                        // full long-press timeout before doing anything.
+                        //
+                        // Two DIFFERENT radii on purpose now: visualRadius
+                        // must match drawSelectionHandle's own formula
+                        // exactly (0.22f / 10dp floor) so the CENTER of
+                        // the hit-test region lines up with the center of
+                        // the circle actually drawn (cy depends on the
+                        // handle's own radius - see drawSelectionHandle's
+                        // doc). hitRadius is kept separately larger (real
+                        // 24dp/48dp-diameter touch-target territory) so
+                        // shrinking the visible circle - the "kuşçuklar
+                        // dana boyda" complaint - doesn't also shrink how
+                        // easy the handle is to grab. Coupling these two
+                        // into one value (as before) meant every attempt
+                        // to make the circle look smaller made it
+                        // proportionally harder to hit, which is why the
+                        // radius kept getting bumped back up instead of
+                        // actually shrinking.
+                        val visualRadius = (charHeightPx * 0.22f).coerceAtLeast(with(density) { 10.dp.toPx() })
+                        val hitRadius = (charHeightPx * 0.45f).coerceAtLeast(with(density) { 24.dp.toPx() })
+                        // hy must match the CIRCLE's actual drawn center, not
+                        // the row's bottom edge/bar line. drawSelectionHandle
+                        // draws the bar spanning [rowTop, rowTop+rowHeight]
+                        // and the circle centered BELOW that, at
+                        // rowTop + rowHeight + radius*0.7f using ITS OWN
+                        // (visual) radius - so this offset must use
+                        // visualRadius, not hitRadius, even though the
+                        // surrounding box you're allowed to tap within
+                        // uses the larger hitRadius.
+                        // Only offer handle re-grab for a selection that's
+                        // actually visible (non-empty selectedTexts) - not
+                        // merely selectionState.active, which stays true for
+                        // a one-cell degenerate selection too (the instant
+                        // after startAt(), before any drag). Guarding on
+                        // active alone meant a fresh long-press landing near
+                        // where an old selection's handle used to sit could
+                        // silently re-grab that stale handle instead of
+                        // starting an independent new selection - the new
+                        // touch then re-anchored from the OLD selection's far
+                        // end straight to wherever this new touch is, which
+                        // reads as "I started selecting near blank space and
+                        // it immediately jumped/dropped somewhere else"
+                        // rather than growing naturally from the new touch
+                        // point.
+                        val existingRange = if (selectionState.active && selectionState.selectedTexts.isNotEmpty()) {
+                            selectionState.normalized()
+                        } else null
+                        val grabbedStart = existingRange != null && run {
+                            val hx = existingRange.startCol * charWidthPx
+                            val hy = (existingRange.startRow + 1) * charHeightPx + visualRadius * 0.7f
+                            kotlin.math.abs(down.position.x - hx) < hitRadius && kotlin.math.abs(down.position.y - hy) < hitRadius * 1.5f
                         }
-                ) {
-                    val rowHeightDp = with(density) { charHeightPx.toDp() }
-                    val rowWidthDp = with(density) { (charWidthPx * buffer.columns).toDp() }
-                    val frozen = frozenRowText.value
-                    for (row in 0 until buffer.rows) {
-                        // key(row) pins each row's BasicText to a stable slot
-                        // identity across recomposition, keyed on the ON-
-                        // SCREEN row index rather than Compose's default
-                        // position-in-parent identity. Without this,
-                        // JetBrains' own tracker documents SelectionContainer
-                        // silently collapsing an active selection to empty
-                        // once its anchor row scrolls out of view or the
-                        // underlying text-node count/identity churns enough
-                        // (compose-multiplatform#3550 - "stops being
-                        // selectable when logs get too long", and #5048699 -
-                        // "happens whenever the first item selected is
-                        // scrolled out") - SelectionContainer's own anchor/
-                        // focus tracking is built around each selectable
-                        // child being a stable, continuously-composed node,
-                        // not one whose identity is free to be torn down and
-                        // recreated on every scrollOffset-driven
-                        // recomposition the way an un-keyed loop allows.
-                        // key(row) instead of key(row, frozen) deliberately
-                        // keeps the SAME slot identity even as
-                        // frozenRowText's re-freeze (see its own doc above)
-                        // swaps in different scrolled-to text for that row -
-                        // that's exactly what lets SelectionContainer treat
-                        // this as "the same row showing updated content"
-                        // rather than "a different row entirely", which is
-                        // what the selection surviving a scroll actually
-                        // requires.
-                        key(row) {
-                            BasicText(
-                                text = frozen?.getOrNull(row) ?: buffer.rowPlainText(row, scrollOffset),
-                                style = TextStyle(
-                                    color = Color.Transparent,
-                                    fontSize = fontSizeSp.sp,
-                                    fontFamily = FontFamily.Monospace
-                                ),
-                                softWrap = false,
-                                modifier = Modifier
-                                    .height(rowHeightDp)
-                                    .width(rowWidthDp)
-                            )
+                        val grabbedEnd = !grabbedStart && existingRange != null && run {
+                            val hx = (existingRange.endCol + 1) * charWidthPx
+                            val hy = (existingRange.endRow + 1) * charHeightPx + visualRadius * 0.7f
+                            kotlin.math.abs(down.position.x - hx) < hitRadius && kotlin.math.abs(down.position.y - hy) < hitRadius * 1.5f
+                        }
+
+                        if (grabbedStart || grabbedEnd) {
+                            down.consume()
+                            // The finger's raw y at grab time is NOT over
+                            // the row the handle represents - it's over
+                            // the circle, which drawSelectionHandle draws
+                            // visualRadius*0.7f BELOW that row's bottom
+                            // edge (see its own doc, and the hy formula
+                            // just above this block, which accounts for
+                            // that same offset for hit-testing the grab
+                            // itself). Every subsequent drag frame below
+                            // used to feed the finger's raw y straight
+                            // into cellOf(), which does a plain
+                            // (y / charHeightPx) row division with no
+                            // knowledge of that offset - so the row it
+                            // computed was consistently the finger's
+                            // ACTUAL row, not the row the handle visually
+                            // sat on when first grabbed, off by however
+                            // many pixels the circle hangs below the bar.
+                            // Dragging down mostly hid this (the error
+                            // pointed the same direction as the drag), but
+                            // dragging the start handle UP to shrink/grow
+                            // the selection consistently landed the new
+                            // boundary a row lower than the finger really
+                            // was - the selected block visibly failing to
+                            // keep up with an upward drag, ending up
+                            // "left behind" below where the finger
+                            // actually stopped. Recording the gap between
+                            // the raw grab point and the row's own
+                            // coordinate here, then subtracting it from
+                            // every later position, makes the drag track
+                            // the finger's MOVEMENT from where it actually
+                            // grabbed rather than re-deriving an absolute
+                            // row from a touch point that was never on the
+                            // row to begin with - the same "grab offset"
+                            // approach ordinary drag handles use.
+                            val grabRow = if (grabbedStart) existingRange!!.startRow else existingRange!!.endRow
+                            val grabRowCenterY = (grabRow + 1) * charHeightPx + visualRadius * 0.7f
+                            val verticalGrabOffset = down.position.y - grabRowCenterY
+                            // Dragging the START handle: keep the OTHER
+                            // end (endRow/endCol) fixed as the anchor and
+                            // move this handle as the focus - but since
+                            // TerminalSelectionState always stores
+                            // anchor/focus (not start/end), re-anchor at
+                            // the fixed end first so updateFocusAt below
+                            // moves the right one.
+                            val fixed = existingRange!!
+                            // Re-anchor at the fixed (non-grabbed) end, but
+                            // ALSO seed the focus at the grabbed handle's
+                            // own current position (not left equal to the
+                            // anchor) - startAt() always sets focus==anchor,
+                            // which for one tick makes the selection a
+                            // single collapsed point at the fixed end. If
+                            // the finger pauses right here (down, then no
+                            // move before lifting - the "duraksayıp tekrar
+                            // selection seçmeye çalıştığında" case) and lifts
+                            // without ever generating a move event, the loop
+                            // below never runs updateFocusAt at all, so the
+                            // selection was left collapsed at that single
+                            // point - the two handles visibly "yaklaşıyor"
+                            // (snap together) onto the fixed end instead of
+                            // staying where they were. Restoring the grabbed
+                            // end's own row/col as the initial focus means a
+                            // zero-movement grab reproduces the ORIGINAL
+                            // range exactly (nothing to snap together), and
+                            // a real drag still calls updateFocusAt from
+                            // that same correct starting point as before.
+                            if (grabbedStart) {
+                                selectionState.startAt(fixed.endRow, fixed.endCol)
+                                selectionState.updateFocusAt(fixed.startRow, fixed.startCol)
+                            } else {
+                                selectionState.startAt(fixed.startRow, fixed.startCol)
+                                selectionState.updateFocusAt(fixed.endRow, fixed.endCol)
+                            }
+                            selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                            // Marks this as a genuine handle drag for the
+                            // whole lifetime of the loop below - this is
+                            // what MainActivity's edge-auto-scroll observer
+                            // gates on now, instead of just "a selection
+                            // exists somewhere" (see draggingHandle's own
+                            // doc). try/finally so it's cleared on every
+                            // exit path (release, or the pointer's id
+                            // disappearing from the event stream) and never
+                            // gets stuck true if this loop exits abnormally.
+                            selectionState.beginHandleDrag()
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    change.consume()
+                                    if (!change.pressed) {
+                                        selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                        break
+                                    }
+                                    val (row, col) = cellOf(change.position.x, change.position.y - verticalGrabOffset)
+                                    selectionState.updateFocusAt(row, col)
+                                    selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                }
+                            } finally {
+                                selectionState.endHandleDrag()
+                            }
+                            return@awaitEachGesture
+                        }
+
+                        // Not on a handle: wait out the long-press
+                        // timeout, watching for movement/lift/a second
+                        // finger exactly like MainActivity's own
+                        // long-press-candidate window used to (back when
+                        // it had to yield to a native detector) - the
+                        // difference is this loop no longer has anything
+                        // else to defer to, it IS the detector now.
+                        //
+                        // BUT only when there's no existing selection to
+                        // protect. If a selection is already active and
+                        // this down landed away from both its handles
+                        // (existingRange != null, grabbedStart/grabbedEnd
+                        // both false), consuming the long-press here to
+                        // start a BRAND NEW one-cell selection at the touch
+                        // point silently overwrote/replaced the selection
+                        // the user already had - the classic case being
+                        // "select everything, pause, then long-press empty
+                        // space intending to scroll scrollback up/down" -
+                        // the long-press timeout fires here first, plants a
+                        // fresh degenerate selection wherever the finger
+                        // happened to land, and the drag that follows
+                        // extends THAT new selection instead of ever
+                        // reaching MainActivity's own scroll/pan handling,
+                        // which is what actually drives scrollOffset. The
+                        // result read as "scrollback ileri geri yaparken
+                        // geri tepiyor" - the existing selection appearing
+                        // to snap/reset the instant the long-press timeout
+                        // elapsed, because it effectively had been replaced
+                        // by a new one that then got dragged around instead
+                        // of scrolling anything. Falling through
+                        // unconsumed here for this case hands the whole
+                        // gesture to MainActivity's own pointerInput block,
+                        // exactly like an ordinary tap/pan on empty space
+                        // with no selection at all - which already knows
+                        // how to scroll scrollback while preserving an
+                        // active selection (see its own draggingWithSelection
+                        // handling). A tap on empty space still needs to be
+                        // able to DISMISS an existing selection (tapping
+                        // away from it is the normal way to clear a
+                        // selection) - that path is unaffected, since a
+                        // short tap here still won't be consumed by this
+                        // block either way and MainActivity's own tap
+                        // handling has no selection-awareness of its own to
+                        // clear it, so TerminalView still needs to do that;
+                        // ordinary taps are handled by the `aborted` branch
+                        // below exactly as before. Only the LONG-PRESS path
+                        // (below, past the timeout) is skipped when there's
+                        // an existing selection - and that skip has to
+                        // happen AFTER the wait loop, not before it: an
+                        // early return here (as this used to do) bailed out
+                        // of the whole block before the wait loop ever ran,
+                        // which meant the `aborted` branch below - the one
+                        // that actually clears the selection on a short tap
+                        // - never got a chance to execute either. The net
+                        // effect was a plain tap on empty space no longer
+                        // dismissing an active selection at all, since the
+                        // code path that does that dismissal is downstream
+                        // of this point. So: always run the wait loop and
+                        // let `aborted` handling do its job; only the
+                        // long-press-confirmed branch further below checks
+                        // existingRange to decide whether to plant a new
+                        // selection.
+                        val longPressDeadline = System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                        var aborted = false
+                        // Distinguishes WHY the long-press wait was aborted:
+                        // a plain tap (lifted, or a second finger landed)
+                        // should dismiss an active selection same as before,
+                        // but movement past touch slop should NOT - that's
+                        // the start of a scroll/pan gesture, and MainActivity's
+                        // own block (which reads this same down afterward)
+                        // already knows to treat a drag while a selection is
+                        // active as scroll-while-selecting (draggingWithSelection)
+                        // and keep the selection alive via isEdgeAutoScroll.
+                        // Clearing it here first - as this used to do
+                        // unconditionally on ANY abort reason - raced that
+                        // logic and won: the selection was gone by the time
+                        // MainActivity's block ever got to check it, so any
+                        // one-finger scroll attempt while text was selected
+                        // (typically starting with the finger somewhere in
+                        // ordinary space, not on a handle - "boşluğa yakın
+                        // yerde" and "scrollback yaparken kapanıyor") silently
+                        // dismissed the very selection the user was trying to
+                        // extend, before the drag had scrolled anything at all.
+                        var abortedByMovement = false
+                        while (true) {
+                            val remainingMillis = (longPressDeadline - System.nanoTime()) / 1_000_000L
+                            if (remainingMillis <= 0L) break
+                            val event = withTimeoutOrNull(remainingMillis) { awaitPointerEvent(PointerEventPass.Initial) }
+                            if (event == null) break
+                            val changes = event.changes
+                            val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
+                            if (primary == null || !changes.any { it.pressed }) { aborted = true; break }
+                            if (changes.count { it.pressed } >= 2) { aborted = true; break }
+                            val dx = primary.position.x - down.position.x
+                            val dy = primary.position.y - down.position.y
+                            if (kotlin.math.sqrt(dx * dx + dy * dy) > viewConfiguration.touchSlop) {
+                                aborted = true; abortedByMovement = true; break
+                            }
+                        }
+                        if (aborted) {
+                            // A short tap (lifted before the long-press
+                            // timeout, and not on either handle - the
+                            // grabbedStart/grabbedEnd check above already
+                            // returned early for those) on empty terminal
+                            // space while a selection is active should
+                            // dismiss that selection, the same way tapping
+                            // empty space always has for text selection
+                            // elsewhere in Android. Previously this block
+                            // only ever STARTED a selection (on long-press)
+                            // and never had a path that ENDED one - a plain
+                            // tap fell all the way through, unconsumed, to
+                            // MainActivity's own tap-to-toggle-keyboard
+                            // handler, which knows nothing about selection
+                            // state at all. That's what made an active
+                            // selection stick around forever (highlight,
+                            // handles, the Copy/Paste toolbar) until the
+                            // user happened to long-press again or switched
+                            // sessions - tapping away from it, the obvious
+                            // way to dismiss it, silently did nothing. Only
+                            // clearing (not consuming) here: the tap should
+                            // still fall through and toggle the keyboard
+                            // exactly as it did before, this just
+                            // additionally drops the selection first.
+                            //
+                            // Skipped entirely when the abort reason was
+                            // movement (abortedByMovement) - see that flag's
+                            // own doc above.
+                            if (selectionState.active && !abortedByMovement) {
+                                selectionState.clear()
+                            }
+                            return@awaitEachGesture
+                        }
+
+                        // Long-press confirmed. If there's already an
+                        // active selection and this down landed away from
+                        // both its handles (existingRange != null - the
+                        // grabbedStart/grabbedEnd cases returned earlier,
+                        // above this whole block), do NOT plant a brand
+                        // new one-cell selection here: that used to
+                        // silently overwrite the user's existing selection
+                        // the instant the long-press timeout elapsed (see
+                        // the long doc comment above). Fall through
+                        // unconsumed instead, exactly like an ordinary
+                        // long-press on empty space with no selection at
+                        // all, so MainActivity's own pointerInput block
+                        // handles it (e.g. scroll/pan while preserving the
+                        // active selection).
+                        if (existingRange != null) {
+                            return@awaitEachGesture
+                        }
+
+                        // Start a selection at the touch point (snapped
+                        // away from trailing blank space) and consume
+                        // every event for the rest of this gesture so
+                        // MainActivity's own tap/pan block never sees it
+                        // as a tap-to-toggle-keyboard or a pan.
+                        down.consume()
+                        val (startRow, startCol) = snappedCellOf(down.position.x, down.position.y)
+                        selectionState.startAt(startRow, startCol)
+                        selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            change.consume()
+                            if (!change.pressed) {
+                                selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                break
+                            }
+                            val (row, col) = cellOf(change.position.x, change.position.y)
+                            selectionState.updateFocusAt(row, col)
+                            selectionState.recomputeFrom(buffer, latestScrollOffset.value)
                         }
                     }
                 }
+        ) {
+            @Suppress("UNUSED_EXPRESSION")
+            bufferVersion
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedRows, highlightColor)
+            // Custom selection handles - two small teardrop markers at the
+            // normalized start/end of the active selection, drawn directly
+            // against the same charWidthPx/charHeightPx grid the gesture
+            // block above hit-tests against (see its own doc: this is the
+            // actual fix for handles not tracking the finger/zoom level,
+            // since there's now only ONE source of truth for cell<->pixel
+            // math instead of a separate native text-layout computing its
+            // own). Drawn after drawTerminal so they sit on top of the
+            // glyphs/highlight, not under them.
+            if (range != null) {
+                drawSelectionHandle(range.startCol * charWidthPx, (range.startRow) * charHeightPx, charHeightPx, handleColor, leading = true)
+                drawSelectionHandle((range.endCol + 1) * charWidthPx, (range.endRow) * charHeightPx, charHeightPx, handleColor, leading = false)
             }
         }
     }
 }
 
 /**
- * SelectionContainer's default behavior, when no [LocalTextToolbar] is
- * provided, is to fall back to the platform's own AndroidTextToolbar -
- * which calls the View's default `startActionMode` with the system's
- * stock Copy/Select All items the moment a selection becomes non-empty.
- * That fires independently of - and at the same time as -
- * ActionModeController's own bar in MainActivity (see
- * SelectionOverrideToolbar.kt), so two unrelated selection UIs were racing
- * on the same selection: the platform's stock bubble and this app's Copy/
- * Paste/More bubble both showing at once ("android kendi native toolbar
- * menu secenekleri bizim copy paste more menumuzle ayni anda devreye
- * giriyor").
- *
- * NoOpTextToolbar replaces that fallback with a toolbar that never shows
- * anything. SelectionContainer still owns everything it's supposed to -
- * long-press-to-select, drag handles, drag-to-extend, edge auto-scroll -
- * none of that goes through TextToolbar at all, it's a separate internal
- * mechanism. TextToolbar is *only* the "show a Copy/Paste bubble" call,
- * so suppressing it leaves selection itself fully intact and simply stops
- * the platform from ever starting its own competing bubble.
- * ActionModeController (SelectionActionBar) remains the only Copy/Paste UI
- * that's ever shown for this selection.
+ * Note on why there's no NoOpTextToolbar/NoOpTextContextMenuProvider here
+ * anymore: those existed solely to suppress Compose Foundation's
+ * SelectionContainer from popping its own native Copy/Paste bubble
+ * alongside ActionModeController's own bar (see SelectionOverrideToolbar.kt).
+ * Now that TerminalView owns selection directly via its own pointerInput
+ * gesture block instead of SelectionContainer, there's no native bubble
+ * left to race - ActionModeController/SelectionActionBar remains the only
+ * Copy/Paste UI, same as before, just without needing to suppress a
+ * competing native path.
  */
-private class NoOpTextToolbar : TextToolbar {
-    // status is pinned permanently to Shown, never Hidden - not tied to
-    // whether showMenu()/hide() were actually called. The previous version
-    // tracked a real shown/hidden flag (flipping to Shown only inside
-    // showMenu()), on the theory that SelectionContainer reads this status
-    // back to decide whether it believes a toolbar is already up. In
-    // practice the native bubble still appeared on finger-up: showMenu()
-    // is only one of the internal paths SelectionContainer can take on
-    // selection-finalize, and on this Foundation version (1.12,
-    // compose-bom:2026.08.00) that finalize step doesn't reliably call
-    // showMenu() at all before falling back - so a flag that only flips on
-    // showMenu() stayed Hidden right through the moment the fallback
-    // check ran. Reporting Shown unconditionally, from the moment this
-    // toolbar exists, removes that race entirely: whichever internal path
-    // SelectionContainer takes, its "is a toolbar already showing"
-    // check sees Shown and never reaches for its own default bubble.
-    override val status: TextToolbarStatus
-        get() = TextToolbarStatus.Shown
-    override fun showMenu(
-        rect: Rect,
-        onCopyRequested: (() -> Unit)?,
-        onPasteRequested: (() -> Unit)?,
-        onCutRequested: (() -> Unit)?,
-        onSelectAllRequested: (() -> Unit)?
-    ) {
-        // Intentionally renders nothing - ActionModeController/
-        // SelectionActionBar (in MainActivity) is the real, visible bar.
-    }
-    override fun hide() {
-    }
-}
-
-/**
- * The second, independent toolbar path that made "iki tane toolbar" (two
- * toolbars) possible even with NoOpTextToolbar above fully wired up and
- * MainActivity.onWindowStartingActionMode() blocking every ActionMode:
- * this Compose Foundation version (1.12 / compose-bom:2026.08.00) ships
- * its own newer text-context-menu system - androidx.compose.foundation.
- * text.contextmenu.* - added around Foundation 1.9, which SelectionContainer
- * on this version goes through directly for its in-drag/finalize bubble,
- * separately from (and in addition to) the older LocalTextToolbar path
- * NoOpTextToolbar targets above. It has its own pair of composition
- * locals - LocalTextContextMenuToolbarProvider and
- * LocalTextContextMenuDropdownProvider - each expecting a
- * TextContextMenuProvider. Its default Android implementation
- * (AndroidTextContextMenuToolbarProvider) is what was still calling
- * View.startActionMode() during an active drag on this path, racing our
- * own SelectionActionBar exactly the way the old fallback used to before
- * NoOpTextToolbar existed. showTextContextMenu() simply never opening a
- * session is this path's equivalent of NoOpTextToolbar.showMenu() being
- * empty - SelectionActionBar (driven off selectionState directly, same as
- * before) remains the only Copy/Paste UI that can ever appear.
- */
-@OptIn(ExperimentalFoundationApi::class)
-private object NoOpTextContextMenuProvider : TextContextMenuProvider {
-    override suspend fun showTextContextMenu(dataProvider: TextContextMenuDataProvider) {
-        // Intentionally never opens a menu session - ActionModeController/
-        // SelectionActionBar is the real, visible bar.
-    }
-}
 
 private fun DrawScope.drawTerminal(
     buffer: TerminalBuffer,
@@ -535,7 +973,9 @@ private fun DrawScope.drawTerminal(
     fontFamily: Typeface,
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
-    scrollOffset: Int = 0
+    scrollOffset: Int = 0,
+    selectedRows: Set<Int> = emptySet(),
+    highlightColor: Int = 0x407EC8FF.toInt()
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -562,12 +1002,33 @@ private fun DrawScope.drawTerminal(
 
     drawRect(color = Color(palette.defaultBackground).copy(alpha = backgroundAlpha.coerceIn(0f, 1f)), size = size)
 
-    // Selection highlight used to be drawn here by hand (blue rect per
-    // row, normalized/clamped against buffer.lastNonBlankColumn) - removed
-    // now that selection is owned by TerminalView's native
-    // SelectionContainer overlay, which draws its own highlight behind the
-    // (invisible) text it manages. That overlay sits directly on top of
-    // this Canvas, so nothing here needs to paint a highlight anymore.
+    // Selection highlight: painted by hand again (was removed when
+    // selection moved to TerminalView's native SelectionContainer
+    // overlay, which drew its own highlight - but that highlight came
+    // from Compose's default text-selection color, not the app's
+    // Material palette, and didn't reliably cover blank/whitespace
+    // columns). Drawn here, under the glyph loop below, as one full-width
+    // rect per row in `selectedRows` - every row SelectionContainer
+    // reports as carrying selected text gets its ENTIRE width painted,
+    // text and whitespace alike (see TerminalView's highlightColor doc:
+    // this is deliberately whole-row, not per-character). Must happen
+    // before the glyph/cursor drawing loop so the highlight sits behind
+    // the text instead of covering it.
+    if (selectedRows.isNotEmpty()) {
+        val hlPaint = Paint().apply { color = highlightColor }
+        val rowCharHeight = Paint().apply {
+            typeface = fontFamily
+            textSize = fontSizeSp * density * fontScale
+        }.fontSpacing
+        val rowWidth = size.width
+        drawIntoCanvas { hlCanvas ->
+            for (row in selectedRows) {
+                if (row !in 0 until buffer.rows) continue
+                val top = row * rowCharHeight
+                hlCanvas.nativeCanvas.drawRect(0f, top, rowWidth, top + rowCharHeight, hlPaint)
+            }
+        }
+    }
 
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {
@@ -626,5 +1087,61 @@ private fun DrawScope.drawTerminal(
             paint.isFakeBoldText = cursorCell.bold
             canvas.nativeCanvas.drawText(cursorCell.text, cursorX, cursorY, paint)
         }
+    }
+}
+
+/**
+ * Draws one custom selection handle: a small filled circle sitting at the
+ * text baseline (y = row's bottom edge, matching where SelectionActionBar/
+ * the old native handles anchored) with a teardrop "tail" pointing up into
+ * the row it marks, plus a thin vertical bar spanning that row's full
+ * height so the exact column boundary stays visible even when the finger
+ * is covering the circle itself.
+ *
+ * [x] is the column boundary in px (left edge of the first selected
+ * column for the leading/start handle, right edge of the last selected
+ * column for the trailing/end handle - see TerminalView's two call sites).
+ * [rowTop] is that row's top edge in px; [rowHeight] is charHeightPx.
+ * [leading] only affects which side of the vertical bar the circle center
+ * sits on (start handle hangs to the left of its column boundary, end
+ * handle to the right) - purely cosmetic, doesn't affect hit-testing
+ * (TerminalView's gesture block hit-tests both handles with the same
+ * generous radius regardless of this offset).
+ */
+private fun DrawScope.drawSelectionHandle(x: Float, rowTop: Float, rowHeight: Float, color: Int, leading: Boolean) {
+    val handlePaint = Paint().apply {
+        this.color = color
+        isAntiAlias = true
+    }
+    // Computed outside drawIntoCanvas so `this` unambiguously refers to
+    // the outer DrawScope (needed for the .dp.toPx() density conversion)
+    // rather than relying on drawIntoCanvas's lambda not shadowing it.
+    // Purely the VISUAL size now - the grabbable hit-test area is
+    // computed separately in TerminalView's gesture block (see
+    // hitRadius there) and is deliberately kept bigger than this so the
+    // circle can look small while still being easy to grab with a real
+    // finger. Earlier this same value drove both the drawn size AND the
+    // hit-test radius, which meant shrinking one always shrank the
+    // other - every attempt to make the handle look less oversized also
+    // made it harder to actually grab, so it kept getting bumped back up.
+    // 0.22f/10dp draws a clearly smaller circle at ordinary terminal
+    // font sizes (charHeightPx ~30-40px -> roughly 7-9px radius, close
+    // to a real text-cursor handle) without needing a large touch-target
+    // floor here at all, since that floor now lives on the separate
+    // hit-test radius instead.
+    val radius = (rowHeight * 0.22f).coerceAtLeast(10.dp.toPx())
+    drawIntoCanvas { canvas ->
+        // Vertical bar spanning the row, thin enough not to obscure the
+        // glyphs it's marking the edge of.
+        val barHalfWidth = rowHeight * 0.08f
+        canvas.nativeCanvas.drawRect(x - barHalfWidth, rowTop, x + barHalfWidth, rowTop + rowHeight, handlePaint)
+
+        // Teardrop circle below the row (thumb-sized touch target).
+        // Offset left/right of the bar by its own radius so the two
+        // handles' circles hang away from the selection rather than
+        // overlapping the selected text between them.
+        val cx = if (leading) x - radius * 0.3f else x + radius * 0.3f
+        val cy = rowTop + rowHeight + radius * 0.7f
+        canvas.nativeCanvas.drawCircle(cx, cy, radius, handlePaint)
     }
 }

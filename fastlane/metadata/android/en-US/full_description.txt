@@ -38,4 +38,3 @@ Keyboard shortcuts and keymapper support let you assign or map virtual keyboard 
 <b>Development status</b>
 
 Terminator is currently under development. More advanced features will be added soon, but since it is in beta and not fully stable, there may be minor bugs.
-
