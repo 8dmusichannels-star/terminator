@@ -196,28 +196,83 @@ private fun Modifier.repeatingKeyPress(
  * fixed key list, since which shortcuts should repeat is the user's own
  * per-shortcut choice made in KeymapperScreen's editor (see that flag's
  * doc), not something this bar can decide by key identity the way the
- * fixed nav-key row can. Purely additive, same as repeatingKeyPress:
- * TextButton's own onClick still fires exactly once per tap; this only
- * adds repeats on top once the entry itself opts in and the press is
- * actually held past the initial delay.
+ * fixed nav-key row can.
+ *
+ * Unlike [repeatingKeyPress] (which is safe to layer on top of
+ * TextButton's own onClick because VirtualKey presses aren't stateful -
+ * sending the same escape sequence twice for one tap is harmless), a
+ * CTRL/ALT-only "vurgu" entry toggles keymapperCtrlActive/keymapperAltActive
+ * (see MainActivity's onMultiPaneKeymapTriggered/onSplitKeymapTriggered).
+ * Toggling twice for a single real press - once from this gesture's own
+ * up-handling and once more from TextButton's onClick firing on the same
+ * release - flips the flag there and immediately back, so the chip
+ * visually never appears armed: press-and-hold-then-release read as a
+ * complete no-op no matter how long the hold lasted, and there was no way
+ * to un-arm an already-armed chip with a plain tap either, since every
+ * trigger source toggled it an even number of times before anything else
+ * could observe the true state in between.
+ *
+ * Fixed by owning the ENTIRE press here (down, hold-repeat, and the final
+ * tap-or-release call) via consuming the down event, rather than sharing
+ * the gesture with TextButton's separate click-detection. TextButton's own
+ * onClick is now unused when repeatOnHold is on (see KeymapperRow below,
+ * which passes a no-op onClick in that case) - this modifier fires
+ * [onKeymapTriggered] exactly once per tap (no hold reached) or, for a
+ * genuine hold, once per repeat tick, with nothing else calling it a
+ * second time behind its back.
  */
 private fun Modifier.repeatingKeymapPress(
     entry: com.terminator.app.ui.settings.KeymapEntry,
     onKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit,
     scope: kotlinx.coroutines.CoroutineScope
-): Modifier = if (!entry.repeatOnHold) this else this.pointerInput(entry.id, entry.repeatOnHold) {
+): Modifier {
+    // This down-consuming, press-owning behavior is ONLY for a CTRL/ALT-
+    // only "vurgu" entry (no trailing key/char - see
+    // onMultiPaneKeymapTriggered/onSplitKeymapTriggered's own bare-modifier
+    // branch). Those toggle keymapperCtrlActive/keymapperAltActive
+    // (true <-> false) rather than sending anything, so sharing the
+    // gesture with TextButton's own onClick double-fires the toggle on
+    // one release and the chip visually never stays armed - see this
+    // function's git history/PR discussion for the original repro.
+    // Every OTHER repeatOnHold entry (a real key/char with an actual
+    // sendSequence, e.g. HOME/arrows/PGUP saved as a keymap) explicitly
+    // keeps the ORIGINAL behavior: this modifier stays a pure identity
+    // (`this`, untouched) and TextButton's own onClick fires normally
+    // for the tap, same as before any of this - sending the same
+    // sequence an extra time from a plain tap is harmless for those, so
+    // there is deliberately no consume/suppress logic for them at all.
+    val isCtrlOrAltOnly = entry.keys.isNotEmpty() &&
+        entry.keys.all { it == "CTRL" || it == "ALT" }
+    if (!entry.repeatOnHold || !isCtrlOrAltOnly) return this
+    return this.pointerInput(entry.id, entry.repeatOnHold) {
     awaitEachGesture {
-        awaitFirstDown(requireUnconsumed = false)
-        // Same fix as repeatingKeyPress above - see its doc.
+        val down = awaitFirstDown(requireUnconsumed = false)
+        // Consuming the down event is what stops TextButton's own
+        // click-detection (InteractionSource/clickable's internal
+        // pointerInput, installed further down the modifier chain on the
+        // same node) from ALSO seeing this gesture and firing its own
+        // onClick on release - that second, independent firing on the
+        // same physical press is exactly what toggled the flag back off
+        // a moment after this block's own repeat/tap logic toggled it on.
+        down.consume()
+        var repeated = false
         val repeatJob = scope.launch {
             kotlinx.coroutines.delay(LONG_PRESS_REPEAT_INITIAL_DELAY_MS)
             while (true) {
+                repeated = true
                 onKeymapTriggered(entry)
                 kotlinx.coroutines.delay(LONG_PRESS_REPEAT_INTERVAL_MS)
             }
         }
         waitForUpOrCancellation()
         repeatJob.cancel()
+        // A plain tap (released before the initial delay elapsed) never
+        // got a trigger from the repeat job above - since TextButton's
+        // own onClick is suppressed for repeatOnHold entries (the down
+        // event was consumed), fire it here instead so a single quick
+        // tap still arms/toggles exactly once, same as before this fix.
+        if (!repeated) onKeymapTriggered(entry)
+    }
     }
 }
 
@@ -234,12 +289,28 @@ private fun Modifier.repeatingKeymapPress(
  * Same repeatingKeymapPress long-press-to-repeat behavior and the same
  * horizontal-scroll chip layout as before - only the mount point changed,
  * not the row's own look or feel.
+ *
+ * [ctrlArmed]/[altArmed] mirror VirtualKeyBar's own ctrlActive/altActive
+ * highlight (background tint + text color swap on FirstKeyRowWithMenuButton/
+ * VirtualKeyRow's CTRL/ALT keys - see their isActive checks) for a
+ * CTRL/ALT-only "vurgu" entry (one whose keys list is just ["CTRL"] and/or
+ * ["ALT"] with no trailing key/char to apply it to yet - see
+ * onMultiPaneKeymapTriggered/onSplitKeymapTriggered's own "bare CTRL/ALT-
+ * only keymap entry" branch in MainActivity, which is what arms
+ * keymapperCtrlActive/keymapperAltActive in the first place). Deliberately
+ * NOT tied to repeatOnHold or the hold-repeat gesture itself - a single tap
+ * arms the flag exactly the same way a held tap does, so the highlight
+ * reflects "this modifier is currently armed, waiting for a key" regardless
+ * of how it was armed, same as VirtualKeyBar's own CTRL/ALT chips already
+ * work.
  */
 @Composable
 fun KeymapperRow(
     keymaps: List<com.terminator.app.ui.settings.KeymapEntry>,
     onKeymapTriggered: (com.terminator.app.ui.settings.KeymapEntry) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    ctrlArmed: Boolean = false,
+    altArmed: Boolean = false
 ) {
     if (keymaps.isEmpty()) return
     val repeatScope = rememberCoroutineScope()
@@ -250,14 +321,52 @@ fun KeymapperRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         keymaps.forEach { entry ->
+            // A "vurgu"/CTRL-ALT-only entry is exactly the keys list this
+            // chip's own bare-modifier arming branch checks for in
+            // MainActivity (no VirtualKey/char after CTRL/ALT to apply
+            // them to) - same shape, checked here purely for the
+            // highlight, not to change dispatch (onKeymapTriggered still
+            // does its own real parsing).
+            val isCtrlOnly = entry.keys.isNotEmpty() && entry.keys.all { it == "CTRL" }
+            val isAltOnly = entry.keys.isNotEmpty() && entry.keys.all { it == "ALT" }
+            val isActive = (isCtrlOnly && ctrlArmed) || (isAltOnly && altArmed)
+            // Must mirror repeatingKeymapPress's OWN suppression condition
+            // exactly (see that modifier's doc): that modifier only takes
+            // over the press (down-consume + its own tap-or-repeat firing)
+            // for a CTRL/ALT-only "vurgu" entry with repeatOnHold on. Every
+            // OTHER repeatOnHold entry (a real key/char with an actual
+            // sendSequence) deliberately keeps the ORIGINAL behavior -
+            // repeatingKeymapPress stays an identity modifier for those, so
+            // this onClick must stay live for them too, exactly as before
+            // any of this fix (sending the sequence an extra time from a
+            // plain tap is harmless there, unlike the CTRL/ALT toggle
+            // case).
+            val isCtrlOrAltOnly = isCtrlOnly || isAltOnly
+            val handleClick: () -> Unit = if (entry.repeatOnHold && isCtrlOrAltOnly) {
+                {}
+            } else {
+                { onKeymapTriggered(entry) }
+            }
             TextButton(
-                onClick = { onKeymapTriggered(entry) },
-                modifier = Modifier.repeatingKeymapPress(entry, onKeymapTriggered, repeatScope)
+                // Suppressed (no-op) only for a CTRL/ALT-only entry with
+                // repeatOnHold on - repeatingKeymapPress below owns the
+                // entire press for that specific case. For every other
+                // entry (repeatOnHold off, or a real key/char even with
+                // repeatOnHold on), repeatingKeymapPress is the identity
+                // modifier and doesn't touch the down event at all, so this
+                // onClick remains the only trigger source, unchanged from
+                // before.
+                onClick = handleClick,
+                modifier = Modifier
+                    .repeatingKeymapPress(entry, onKeymapTriggered, repeatScope)
+                    .background(
+                        if (isActive) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f) else Color.Transparent
+                    )
             ) {
                 Text(
                     entry.name,
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.secondary
+                    color = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.secondary
                 )
             }
         }

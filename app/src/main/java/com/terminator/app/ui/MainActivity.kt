@@ -95,6 +95,7 @@ import com.terminator.app.ui.settings.DEFAULT_CUSTOM_FG
 import com.terminator.app.ui.settings.KeymapEntry
 import com.terminator.app.ui.settings.SettingsActivity
 import com.terminator.app.ui.settings.decodeKeymaps
+import com.terminator.app.ui.settings.literalCharOf
 import com.terminator.app.ui.theme.TerminatorTheme
 import com.terminator.emulator.TerminalEmulator
 import com.terminator.emulator.MouseGestureTracker
@@ -652,6 +653,18 @@ class MainActivity : ComponentActivity() {
                 // literally.
                 var ctrlActive by remember { mutableStateOf(false) }
                 var altActive by remember { mutableStateOf(false) }
+                // KeymapperRow's own CTRL/ALT-only chip state - deliberately
+                // NOT shared with VirtualKeyBar's ctrlActive/altActive above.
+                // KeymapperRow is mounted independently of VirtualKeyBar
+                // (see KEYMAPPER_ENABLED/KeymapperRow's own doc), so sharing
+                // one pair of flags meant tapping a bare-CTRL keymap chip
+                // could arm/consume the same state VirtualKeyBar's own CTRL
+                // button drives, and vice versa - two independently-shown
+                // rows silently affecting the same toggle. Separate flags
+                // here, consumed only on the keymapper's own IME-follow-up
+                // path in each onInput below, keep the two fully decoupled.
+                var keymapperCtrlActive by remember { mutableStateOf(false) }
+                var keymapperAltActive by remember { mutableStateOf(false) }
                 // Same purpose as splitFocusRequestSignal above, but for
                 // multi-pane grid mode's own focused tile - see
                 // MultiPaneContainer/PaneContent's focusRequestSignal doc.
@@ -1198,6 +1211,20 @@ class MainActivity : ComponentActivity() {
                                             toSend = "\u001B$toSend"
                                             altActive = false
                                         }
+                                        // KeymapperRow's OWN CTRL/ALT-only-chip follow-up
+                                        // (see keymapperCtrlActive/keymapperAltActive's own
+                                        // doc above) - checked as a separate pair of ifs, not
+                                        // merged into the ctrlActive/altActive block above, so
+                                        // a chip tapped in KeymapperRow never reads or clears
+                                        // VirtualKeyBar's own flags and vice versa.
+                                        if (keymapperCtrlActive) {
+                                            toSend = toSend.map(::applyCtrl).joinToString("")
+                                            keymapperCtrlActive = false
+                                        }
+                                        if (keymapperAltActive) {
+                                            toSend = "\u001B$toSend"
+                                            keymapperAltActive = false
+                                        }
                                         viewModel.sendPaneInput(toSend, broadcastAllPanes)
                                         // sendPaneInput() only targets the focused pane (or every
                                         // pane, if broadcasting) - it deliberately ignores which
@@ -1287,19 +1314,79 @@ class MainActivity : ComponentActivity() {
                                     val sequence = StringBuilder()
                                     entry.keys.forEach { keyName ->
                                         val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
-                                        when (vk) {
-                                            VirtualKey.CTRL -> pendingCtrl = true
-                                            VirtualKey.ALT -> pendingAlt = true
-                                            null -> {}
-                                            else -> {
+                                        val literal = if (vk == null) literalCharOf(keyName) else null
+                                        when {
+                                            vk == VirtualKey.CTRL -> pendingCtrl = true
+                                            vk == VirtualKey.ALT -> pendingAlt = true
+                                            vk != null -> {
                                                 var seq = vk.sendSequence
                                                 if (pendingCtrl) { seq = seq.map(::applyCtrl).joinToString(""); pendingCtrl = false }
                                                 if (pendingAlt) { seq = "\u001B$seq"; pendingAlt = false }
                                                 sequence.append(seq)
                                             }
+                                            literal != null -> {
+                                                // Literal character saved via KeymapEditor's
+                                                // "Literal character" field/capture dialog (see
+                                                // literalCharOf's own doc) - same pendingCtrl/
+                                                // pendingAlt one-shot-modifier handling as a
+                                                // named VirtualKey above, just applying to this
+                                                // char directly instead of a fixed escape
+                                                // sequence, so e.g. ["CTRL", "CHAR:c"] sends the
+                                                // same control byte a physical Ctrl+C would.
+                                                var seq = literal.toString()
+                                                if (pendingCtrl) { seq = seq.map(::applyCtrl).joinToString(""); pendingCtrl = false }
+                                                if (pendingAlt) { seq = "\u001B$seq"; pendingAlt = false }
+                                                sequence.append(seq)
+                                            }
+                                            else -> {}
                                         }
                                     }
-                                    if (sequence.isNotEmpty()) viewModel.sendPaneInput(sequence.toString(), broadcastAllPanes)
+                                    if (sequence.isNotEmpty()) {
+                                        viewModel.sendPaneInput(sequence.toString(), broadcastAllPanes)
+                                    } else {
+                                        // A keymap entry that's ONLY CTRL and/or ALT (no
+                                        // trailing VirtualKey/char to apply them to) has
+                                        // nothing to send yet by itself. Arms KeymapperRow's
+                                        // OWN keymapperCtrlActive/keymapperAltActive here -
+                                        // deliberately NOT VirtualKeyBar's ctrlActive/altActive
+                                        // (see their own doc above on why these two rows don't
+                                        // share state) - so the next IME-typed character gets
+                                        // combined with it via this pane's onInput below,
+                                        // without ever touching VirtualKeyBar's toggle.
+                                        //
+                                        // Guard: clear VirtualKeyBar's own ctrlActive/altActive
+                                        // the instant a keymapper chip arms the equivalent
+                                        // keymapper flag (and only for the modifier actually
+                                        // being armed here). With repeatOnHold on, this chip can
+                                        // re-arm every LONG_PRESS_REPEAT_INTERVAL_MS while the
+                                        // user is still holding it - if VirtualKeyBar's toggle
+                                        // was independently left on from an earlier tap, the
+                                        // eventual keystroke could pick up BOTH flags and apply
+                                        // the modifier twice (e.g. double-Ctrl mangling the
+                                        // byte). The two rows still don't share state going the
+                                        // other direction (VirtualKeyBar's own onKeyPressed is
+                                        // untouched), this only ensures the keymapper's own
+                                        // arming always wins outright for whichever modifier it
+                                        // sets, closing that specific race window to zero.
+                                        // Real toggle, not a one-way "arm": re-tapping (or
+                                        // re-triggering via repeatOnHold's own repeat ticks -
+                                        // see repeatingKeymapPress's doc) an already-armed
+                                        // CTRL/ALT-only chip now flips it back OFF instead of
+                                        // redundantly writing `true` again. Previously this
+                                        // always set `= true` and the ONLY way to clear it was
+                                        // consuming it on the next real keystroke (onInput
+                                        // above) - there was no way to cancel an armed chip by
+                                        // tapping it again, so a mis-tap stayed stuck armed
+                                        // until some other key happened to be pressed.
+                                        if (pendingCtrl) {
+                                            keymapperCtrlActive = !keymapperCtrlActive
+                                            ctrlActive = false
+                                        }
+                                        if (pendingAlt) {
+                                            keymapperAltActive = !keymapperAltActive
+                                            altActive = false
+                                        }
+                                    }
                                 }
                                 // Independent of virtualKeysEnabled - stays mounted/usable even
                                 // with the key bar itself turned off. See KeymapperRow's doc.
@@ -1307,7 +1394,9 @@ class MainActivity : ComponentActivity() {
                                     KeymapperRow(
                                         keymaps = keymaps,
                                         onKeymapTriggered = onMultiPaneKeymapTriggered,
-                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                        modifier = Modifier.padding(horizontal = 8.dp),
+                                        ctrlArmed = keymapperCtrlActive,
+                                        altArmed = keymapperAltActive
                                     )
                                 }
                                 // Routes to the focused pane via sendPaneInput — no CTRL/ALT
@@ -2458,6 +2547,32 @@ class MainActivity : ComponentActivity() {
                                                         toSend = "\u001B$toSend"
                                                         altActive = false
                                                     }
+                                                    // KeymapperRow's OWN CTRL/ALT-only-chip follow-up
+                                                    // (see keymapperCtrlActive/keymapperAltActive's
+                                                    // own doc above) - was missing on this, the
+                                                    // PRIMARY pane's path, even though the split-pane
+                                                    // and multi-pane onInput handlers both already had
+                                                    // it (see their own copies of this exact block).
+                                                    // That mismatch is why a CTRL/ALT-only keymap chip
+                                                    // ("vurgu") appeared completely dead on the main
+                                                    // screen specifically: KeymapperRow's onClick
+                                                    // correctly armed the flag every time (confirmed by
+                                                    // its own onKeymapTriggered logic), but nothing on
+                                                    // THIS path ever read or cleared it, so the next
+                                                    // typed character/digit went through unmodified. A
+                                                    // separate pair of ifs, not merged into the
+                                                    // ctrlActive/altActive block above, so a chip
+                                                    // tapped in KeymapperRow never reads or clears
+                                                    // VirtualKeyBar's own flags and vice versa - same
+                                                    // guard as the other two panes.
+                                                    if (keymapperCtrlActive) {
+                                                        toSend = toSend.map(::applyCtrl).joinToString("")
+                                                        keymapperCtrlActive = false
+                                                    }
+                                                    if (keymapperAltActive) {
+                                                        toSend = "\u001B$toSend"
+                                                        keymapperAltActive = false
+                                                    }
                                                     // The active session's process may already be dead
                                                     // (typically right after Ctrl+D's hard kill below) -
                                                     // its last screen just sits there frozen since there's
@@ -2709,6 +2824,20 @@ class MainActivity : ComponentActivity() {
                                                 toSend = "\u001B$toSend"
                                                 altActive = false
                                             }
+                                            // KeymapperRow's OWN CTRL/ALT-only-chip follow-up
+                                            // (see keymapperCtrlActive/keymapperAltActive's own
+                                            // doc above) - a separate pair of ifs so a chip
+                                            // tapped in KeymapperRow never reads or clears
+                                            // VirtualKeyBar's own ctrlActive/altActive and
+                                            // vice versa.
+                                            if (keymapperCtrlActive) {
+                                                toSend = toSend.map(::applyCtrl).joinToString("")
+                                                keymapperCtrlActive = false
+                                            }
+                                            if (keymapperAltActive) {
+                                                toSend = "\u001B$toSend"
+                                                keymapperAltActive = false
+                                            }
                                             // Same frozen-screen problem the primary pane's own
                                             // onValueChange already guards against (see its
                                             // activeIsExited doc), just never ported here: Ctrl+D
@@ -2849,11 +2978,11 @@ class MainActivity : ComponentActivity() {
                     val sequence = StringBuilder()
                     entry.keys.forEach { keyName ->
                         val vk = runCatching { VirtualKey.valueOf(keyName) }.getOrNull()
-                        when (vk) {
-                            VirtualKey.CTRL -> pendingCtrl = true
-                            VirtualKey.ALT -> pendingAlt = true
-                            null -> {}
-                            else -> {
+                        val literal = if (vk == null) literalCharOf(keyName) else null
+                        when {
+                            vk == VirtualKey.CTRL -> pendingCtrl = true
+                            vk == VirtualKey.ALT -> pendingAlt = true
+                            vk != null -> {
                                 var seq = vk.sendSequence
                                 if (pendingCtrl) {
                                     seq = seq.map(::applyCtrl).joinToString("")
@@ -2865,6 +2994,24 @@ class MainActivity : ComponentActivity() {
                                 }
                                 sequence.append(seq)
                             }
+                            literal != null -> {
+                                // Same literal-character handling as the
+                                // multi-pane branch's onMultiPaneKeymapTriggered
+                                // (see its own doc) - applies pendingCtrl/
+                                // pendingAlt to a KeymapEditor-saved literal
+                                // char instead of a named VirtualKey.
+                                var seq = literal.toString()
+                                if (pendingCtrl) {
+                                    seq = seq.map(::applyCtrl).joinToString("")
+                                    pendingCtrl = false
+                                }
+                                if (pendingAlt) {
+                                    seq = "\u001B$seq"
+                                    pendingAlt = false
+                                }
+                                sequence.append(seq)
+                            }
+                            else -> {}
                         }
                     }
                     if (sequence.isNotEmpty()) {
@@ -2878,6 +3025,38 @@ class MainActivity : ComponentActivity() {
                         } else {
                             viewModel.sendInput(sequence.toString())
                         }
+                    } else {
+                        // Bare CTRL/ALT-only keymap entry, no trailing key to
+                        // apply it to yet. Arms KeymapperRow's OWN
+                        // keymapperCtrlActive/keymapperAltActive here -
+                        // deliberately NOT VirtualKeyBar's ctrlActive/
+                        // altActive (see their own doc above) - so the next
+                        // IME-typed character combines with it via the
+                        // split pane's own onInput below, without touching
+                        // VirtualKeyBar's toggle.
+                        //
+                        // Same hold-repeat race guard as the primary/multi-
+                        // pane arming site above (see its own doc) - clears
+                        // VirtualKeyBar's own ctrlActive/altActive for
+                        // whichever modifier is being armed here, so a
+                        // repeatOnHold chip re-arming every interval can
+                        // never stack with a stale VirtualKeyBar toggle and
+                        // double-apply the modifier on the eventual
+                        // keystroke.
+                        // Real toggle, not a one-way "arm" - see
+                        // onMultiPaneKeymapTriggered's identical fix above for
+                        // the full rationale (re-tapping an already-armed
+                        // chip, or a repeatOnHold repeat tick re-firing on an
+                        // already-armed chip, now flips it back OFF instead
+                        // of redundantly re-writing `true`).
+                        if (pendingCtrl) {
+                            keymapperCtrlActive = !keymapperCtrlActive
+                            ctrlActive = false
+                        }
+                        if (pendingAlt) {
+                            keymapperAltActive = !keymapperAltActive
+                            altActive = false
+                        }
                     }
                 }
                 // Independent of virtualKeysEnabled - same visibility
@@ -2888,7 +3067,9 @@ class MainActivity : ComponentActivity() {
                     KeymapperRow(
                         keymaps = keymaps,
                         onKeymapTriggered = onSplitKeymapTriggered,
-                        modifier = Modifier.padding(horizontal = 8.dp)
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        ctrlArmed = keymapperCtrlActive,
+                        altArmed = keymapperAltActive
                     )
                 }
                 androidx.compose.animation.AnimatedVisibility(
