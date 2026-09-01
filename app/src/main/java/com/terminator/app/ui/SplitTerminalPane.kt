@@ -65,6 +65,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.unit.dp
 import com.terminator.emulator.TerminalBuffer
 import com.terminator.emulator.TerminalEmulator
+import com.terminator.emulator.MouseGestureTracker
+import com.terminator.emulator.ScrollFling
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 
@@ -239,7 +241,8 @@ fun SplitTerminalPane(
     // default to permanently-off no-ops so any other caller of this
     // composable keeps working exactly as before without wiring anything.
     wantsMouseEvents: () -> Boolean = { false },
-    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _ -> },
+    wantsMouseMoveEvents: () -> Boolean = { false },
+    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _ -> },
     // How many lines back into this pane's own scrollback it's currently
     // showing (0 = live tail) - caller-owned (MainViewModel.splitScrollOffset)
     // same as the primary pane's own scrollOffset, just tracked separately
@@ -562,6 +565,18 @@ fun SplitTerminalPane(
                     // zoomCommitJob, both driven off a coroutineScope hoisted
                     // the same way.
                     val paneCoroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+                    // Momentum + sharp edge-autoscroll for mouse-tracking
+                    // gestures in this pane - same pair MainActivity's
+                    // primary pane uses (see ScrollFling/EdgeWheelAutoScroll's
+                    // own docs in MouseGestureTracker.kt). This pane's
+                    // mouse-report block previously called
+                    // runMouseReportGesture with neither wired up at all, so
+                    // a fast scrollback drag against an mc/vim/htop session
+                    // running in the split partner just stopped dead on
+                    // release instead of coasting, and holding near the
+                    // top/bottom edge while dragging did nothing.
+                    val scrollFling = remember(runtimeId) { ScrollFling(paneCoroutineScope) }
+                    val edgeWheelAutoScroll = remember(runtimeId) { MouseGestureTracker.EdgeWheelAutoScroll() }
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -627,6 +642,21 @@ fun SplitTerminalPane(
                                 )
                             }
                             .pointerInput(runtimeId) {
+                                // Hover-only MOVE reporting (xterm 1003/ANY_EVENT)
+                                // for a real mouse with no button held - same as
+                                // MainActivity's own hover block, previously
+                                // missing here entirely.
+                                with(MouseGestureTracker) {
+                                    runMouseHoverGesture(
+                                        wantsHover = wantsMouseMoveEvents,
+                                        charSize = { charWidthPx to charHeightPx },
+                                        bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                    ) { col, row ->
+                                        onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
+                                    }
+                                }
+                            }
+                            .pointerInput(runtimeId) {
                                 // Single gesture loop for this pane: when the
                                 // session has enabled mouse reporting (DECSET
                                 // 1000/1002/1003 - the same check the primary
@@ -665,6 +695,17 @@ fun SplitTerminalPane(
                                     isFocused = true
                                     onFocusChanged(true)
                                     val mouseWanted = wantsMouseEvents()
+                                    // New touch landing: abort any in-flight fling from a
+                                    // previous release and start tracking velocity fresh,
+                                    // same moment MainActivity's primary pane does it -
+                                    // see ScrollFling.reset's own doc for why this has to
+                                    // happen unconditionally on every down, not just once
+                                    // mouseWanted is confirmed true below (a fling from a
+                                    // PREVIOUS mouse-tracking gesture could still be
+                                    // in-flight when this new gesture starts).
+                                    scrollFling.reset()
+                                    scrollFling.track(down.uptimeMillis, down.position)
+                                    edgeWheelAutoScroll.reset()
 
                                     if (!mouseWanted || charWidthPx <= 0f || charHeightPx <= 0f) {
                                         // No mouse reporting active for this session.
@@ -882,26 +923,73 @@ fun SplitTerminalPane(
                                     }
 
                                     down.consume()
-                                    fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
-                                        (offset.x / charWidthPx).toInt() to (offset.y / charHeightPx).toInt()
-
-                                    var (col, row) = cellOf(down.position)
-                                    onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
-
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
-                                        change.consume()
-                                        if (!change.pressed) {
-                                            val (rCol, rRow) = cellOf(change.position)
-                                            onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
-                                            break
+                                    // Sharpened via the shared MouseGestureTracker - see
+                                    // MainActivity's own mouse-report block for what this
+                                    // fixes over the old inline version (edge clamping,
+                                    // historical-sample coalescing, real button id).
+                                    var lastCol = 0
+                                    var lastRow = 0
+                                    with(MouseGestureTracker) {
+                                        runMouseReportGesture(
+                                            down = down,
+                                            charSize = { charWidthPx to charHeightPx },
+                                            bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                            onMove = { uptimeMillis, position ->
+                                                scrollFling.track(uptimeMillis, position)
+                                            },
+                                            edgeAutoScroll = { uptimeMillis, position, viewportHeightPx, ecol, erow ->
+                                                if (viewportHeightPx > 0f) {
+                                                    val edgeFraction = 0.12f
+                                                    val edgePx = viewportHeightPx * edgeFraction
+                                                    val y = position.y
+                                                    when {
+                                                        y < edgePx -> {
+                                                            val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = strength,
+                                                                towardScrollback = true,
+                                                                col = ecol, row = erow,
+                                                            ) { kind, c, r -> onMouseEvent(kind, c, r, 0) }
+                                                        }
+                                                        y > viewportHeightPx - edgePx -> {
+                                                            val strength = ((y - (viewportHeightPx - edgePx)) / edgePx).coerceIn(0f, 1f)
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = strength,
+                                                                towardScrollback = false,
+                                                                col = ecol, row = erow,
+                                                            ) { kind, c, r -> onMouseEvent(kind, c, r, 0) }
+                                                        }
+                                                        else -> {
+                                                            // Outside both edge bands - disarm the dwell
+                                                            // timer so re-entering either edge starts a
+                                                            // fresh armDelayMillis wait.
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = 0f,
+                                                                towardScrollback = true,
+                                                                col = ecol, row = erow,
+                                                            ) { _, _, _ -> }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        ) { kind, col, row, button ->
+                                            lastCol = col; lastRow = row
+                                            onMouseEvent(kind, col, row, button)
                                         }
-                                        val (dCol, dRow) = cellOf(change.position)
-                                        if (dCol != col || dRow != row) {
-                                            col = dCol; row = dRow
-                                            onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
-                                        }
+                                    }
+                                    // Finger came up with residual velocity - keep
+                                    // scrolling under momentum via xterm wheel notches,
+                                    // same as MainActivity's primary pane (see
+                                    // ScrollFling.releaseAsWheelEvents' own doc).
+                                    scrollFling.releaseAsWheelEvents(
+                                        charHeightPx = { charHeightPx },
+                                        col = lastCol,
+                                        row = lastRow,
+                                    ) { kind, col, row ->
+                                        onMouseEvent(kind, col, row, 0)
                                     }
                                 }
                             }

@@ -91,6 +91,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.terminator.emulator.TerminalBuffer
 import com.terminator.emulator.TerminalEmulator
+import com.terminator.emulator.MouseGestureTracker
+import com.terminator.emulator.ScrollFling
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 import kotlin.math.roundToInt
@@ -151,7 +153,8 @@ fun MultiPaneContainer(
     onExitMultiPane: () -> Unit,
     modifier: Modifier = Modifier,
     onWantsMouseEvents: (String) -> Boolean = { false },
-    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    onWantsMouseMoveEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
     // "More" actions (clone/wake-lock/save) for each tile's own Copy/Paste
     // selection bar - see PaneContent's identical params for the full doc.
     // All default to null/false so every existing caller of this composable
@@ -199,6 +202,7 @@ fun MultiPaneContainer(
                     onClosePane = onClosePane,
                     onResizeSessionPty = onResizeSessionPty,
                     onWantsMouseEvents = onWantsMouseEvents,
+                    onWantsMouseMoveEvents = onWantsMouseMoveEvents,
                     onMouseEvent = onMouseEvent,
                     onCloneSession = onCloneSession,
                     onToggleWakeUp = onToggleWakeUp,
@@ -225,6 +229,7 @@ fun MultiPaneContainer(
                     onResizePane = onResizePane,
                     onResizeSessionPty = onResizeSessionPty,
                     onWantsMouseEvents = onWantsMouseEvents,
+                    onWantsMouseMoveEvents = onWantsMouseMoveEvents,
                     onMouseEvent = onMouseEvent,
                     onCloneSession = onCloneSession,
                     onToggleWakeUp = onToggleWakeUp,
@@ -306,7 +311,8 @@ private fun TilingLayout(
     onClosePane: (String) -> Unit,
     onResizeSessionPty: (String, Int, Int) -> Unit,
     onWantsMouseEvents: (String) -> Boolean = { false },
-    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    onWantsMouseMoveEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
     // "More" actions for each tile's own selection bar - see PaneContent's
     // identical params for why these all default to null/false (existing
     // callers keep the "no More button" behavior they always had).
@@ -389,7 +395,8 @@ private fun TilingLayout(
                                     fontDensity = density,
                                     showDragHandle = false,
                                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
-                                    onMouseEvent = { kind, col, row -> onMouseEvent(pane.runtimeId, kind, col, row) },
+                                    onWantsMouseMoveEvents = { onWantsMouseMoveEvents(pane.runtimeId) },
+                                    onMouseEvent = { kind, col, row, button -> onMouseEvent(pane.runtimeId, kind, col, row, button) },
                                     onCloneSession = onCloneSession?.let { { it(pane.runtimeId) } },
                                     onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
                                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
@@ -508,7 +515,8 @@ private fun FloatingLayout(
     onResizePane: (runtimeId: String, size: Size) -> Unit,
     onResizeSessionPty: (String, Int, Int) -> Unit,
     onWantsMouseEvents: (String) -> Boolean = { false },
-    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _, _ -> },
+    onWantsMouseMoveEvents: (String) -> Boolean = { false },
+    onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
     onCloneSession: ((String) -> Unit)? = null,
     onToggleWakeUp: ((String) -> Unit)? = null,
     wakeUpActiveFor: (String) -> Boolean = { false },
@@ -608,7 +616,8 @@ private fun FloatingLayout(
                         onResizePane(pane.runtimeId, newSize)
                     },
                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
-                    onMouseEvent = { kind, col, row -> onMouseEvent(pane.runtimeId, kind, col, row) },
+                    onWantsMouseMoveEvents = { onWantsMouseMoveEvents(pane.runtimeId) },
+                    onMouseEvent = { kind, col, row, button -> onMouseEvent(pane.runtimeId, kind, col, row, button) },
                     onCloneSession = onCloneSession?.let { { it(pane.runtimeId) } },
                     onToggleWakeUp = onToggleWakeUp?.let { { it(pane.runtimeId) } },
                     wakeUpActive = wakeUpActiveFor(pane.runtimeId),
@@ -660,7 +669,8 @@ private fun PaneContent(
     // mode). Defaults to permanently-off/no-op so callers that don't wire
     // mouse reporting keep working exactly as before.
     onWantsMouseEvents: () -> Boolean = { false },
-    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit = { _, _, _ -> },
+    onWantsMouseMoveEvents: () -> Boolean = { false },
+    onMouseEvent: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _ -> },
     // "More" actions for this pane's own Copy/Paste/More selection bar -
     // same MoreMenuActions shape the primary pane and SplitTerminalPane
     // use, just with onToggleSplitScreen always null (split-screen mode
@@ -761,6 +771,13 @@ private fun PaneContent(
     // size"), which had no debounce of its own until now - this mirrors
     // that same fix at this call site instead.
     val paneResizeScope = rememberCoroutineScope()
+    // Momentum + sharp edge-autoscroll for this tile's mouse-tracking
+    // gestures - same pair as MainActivity's primary pane and
+    // SplitTerminalPane (see ScrollFling/EdgeWheelAutoScroll's own docs in
+    // MouseGestureTracker.kt). This tile's mouse-report block previously
+    // called runMouseReportGesture with neither wired up.
+    val scrollFling = remember(runtimeId) { ScrollFling(paneResizeScope) }
+    val edgeWheelAutoScroll = remember(runtimeId) { MouseGestureTracker.EdgeWheelAutoScroll() }
     var paneResizeDebounceJob by remember(runtimeId) {
         mutableStateOf<Job?>(null)
     }
@@ -1092,35 +1109,104 @@ private fun PaneContent(
                         // own internal long-press-to-select detector to
                         // claim the gesture first, same as the primary pane.
                         .pointerInput(runtimeId) {
+                            // Hover-only MOVE reporting (xterm 1003/ANY_EVENT)
+                            // for a real mouse with no button held - same as
+                            // MainActivity's own hover block, previously
+                            // missing here entirely.
+                            with(MouseGestureTracker) {
+                                runMouseHoverGesture(
+                                    wantsHover = onWantsMouseMoveEvents,
+                                    charSize = { charMetrics },
+                                    bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                ) { col, row ->
+                                    onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
+                                }
+                            }
+                        }
+                        .pointerInput(runtimeId) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 onFocus()
                                 focusToken++
+                                // New touch landing: abort any in-flight fling from a
+                                // previous release and start tracking velocity fresh,
+                                // unconditionally (a fling from a previous mouse-tracking
+                                // gesture could still be in-flight when a new one starts) -
+                                // same as the primary pane and SplitTerminalPane.
+                                scrollFling.reset()
+                                scrollFling.track(down.uptimeMillis, down.position)
+                                edgeWheelAutoScroll.reset()
 
                                 if (onWantsMouseEvents() && charMetrics.first > 0f && charMetrics.second > 0f) {
                                     // Mouse reporting owns the whole gesture,
                                     // same as before: press/drag/release become
                                     // xterm mouse escape sequences instead of
-                                    // tap-to-focus/pinch/pan.
+                                    // tap-to-focus/pinch/pan. Sharpened via the
+                                    // shared MouseGestureTracker - see
+                                    // MainActivity's own mouse-report block for
+                                    // what this fixes over the old inline
+                                    // version (edge clamping, historical-sample
+                                    // coalescing, real button id).
                                     down.consume()
-                                    fun cellOf(offset: androidx.compose.ui.geometry.Offset) =
-                                        (offset.x / charMetrics.first).toInt() to (offset.y / charMetrics.second).toInt()
-                                    var (col, row) = cellOf(down.position)
-                                    onMouseEvent(TerminalEmulator.MouseEventKind.PRESS, col, row)
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
-                                        change.consume()
-                                        if (!change.pressed) {
-                                            val (rCol, rRow) = cellOf(change.position)
-                                            onMouseEvent(TerminalEmulator.MouseEventKind.RELEASE, rCol, rRow)
-                                            break
+                                    var lastCol = 0
+                                    var lastRow = 0
+                                    with(MouseGestureTracker) {
+                                        runMouseReportGesture(
+                                            down = down,
+                                            charSize = { charMetrics },
+                                            bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                            onMove = { uptimeMillis, position ->
+                                                scrollFling.track(uptimeMillis, position)
+                                            },
+                                            edgeAutoScroll = { uptimeMillis, position, viewportHeightPx, ecol, erow ->
+                                                if (viewportHeightPx > 0f) {
+                                                    val edgeFraction = 0.12f
+                                                    val edgePx = viewportHeightPx * edgeFraction
+                                                    val y = position.y
+                                                    when {
+                                                        y < edgePx -> {
+                                                            val strength = ((edgePx - y) / edgePx).coerceIn(0f, 1f)
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = strength,
+                                                                towardScrollback = true,
+                                                                col = ecol, row = erow,
+                                                            ) { kind, c, r -> onMouseEvent(kind, c, r, 0) }
+                                                        }
+                                                        y > viewportHeightPx - edgePx -> {
+                                                            val strength = ((y - (viewportHeightPx - edgePx)) / edgePx).coerceIn(0f, 1f)
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = strength,
+                                                                towardScrollback = false,
+                                                                col = ecol, row = erow,
+                                                            ) { kind, c, r -> onMouseEvent(kind, c, r, 0) }
+                                                        }
+                                                        else -> {
+                                                            // Outside both edge bands - disarm the dwell
+                                                            // timer so re-entering either edge starts a
+                                                            // fresh armDelayMillis wait.
+                                                            edgeWheelAutoScroll.tick(
+                                                                uptimeMillis = uptimeMillis,
+                                                                strength = 0f,
+                                                                towardScrollback = true,
+                                                                col = ecol, row = erow,
+                                                            ) { _, _, _ -> }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        ) { kind, col, row, button ->
+                                            lastCol = col; lastRow = row
+                                            onMouseEvent(kind, col, row, button)
                                         }
-                                        val (dCol, dRow) = cellOf(change.position)
-                                        if (dCol != col || dRow != row) {
-                                            col = dCol; row = dRow
-                                            onMouseEvent(TerminalEmulator.MouseEventKind.DRAG, col, row)
-                                        }
+                                    }
+                                    scrollFling.releaseAsWheelEvents(
+                                        charHeightPx = { charMetrics.second },
+                                        col = lastCol,
+                                        row = lastRow,
+                                    ) { kind, col, row ->
+                                        onMouseEvent(kind, col, row, 0)
                                     }
                                     return@awaitEachGesture
                                 }

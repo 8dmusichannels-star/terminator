@@ -573,8 +573,18 @@ class TerminalEmulator(
      * Touch/pointer event kinds a UI layer can report. Mirrors the subset
      * of xterm mouse-tracking button semantics that DECSET modes 1000/
      * 1002/1003 distinguish between.
+     *
+     * WHEEL_UP/WHEEL_DOWN are separate from PRESS/DRAG/RELEASE: xterm wheel
+     * buttons (4 and 5, encoded as button-id 64/65 - see encodeMouseEvent)
+     * are a single self-contained "click" with no matching release, exactly
+     * like a real scroll wheel notch. They're what a released-but-still-
+     * moving fling should keep sending once the finger is no longer
+     * physically down to drive PRESS/DRAG/RELEASE - see ScrollFling below,
+     * which is the Compose-side equivalent of what Termux's TerminalView
+     * does in doScroll() when mEmulator.isMouseTrackingActive() is true
+     * during an onFling() callback.
      */
-    enum class MouseEventKind { PRESS, RELEASE, DRAG, MOVE }
+    enum class MouseEventKind { PRESS, RELEASE, DRAG, MOVE, WHEEL_UP, WHEEL_DOWN }
 
     /**
      * Encodes a touch at 0-indexed (col, row) into the escape sequence the
@@ -584,12 +594,18 @@ class TerminalEmulator(
      * active mode - e.g. plain hover MOVE only goes out under 1003).
      *
      * button: 0=left, 1=middle, 2=right - only meaningful for PRESS/DRAG.
+     * Ignored for WHEEL_UP/WHEEL_DOWN, which always encode as xterm button
+     * id 64/65 regardless of what's passed.
      */
     fun encodeMouseEvent(kind: MouseEventKind, col: Int, row: Int, button: Int = 0): String? {
         if (mouseMode == MouseMode.NONE) return null
         if (kind == MouseEventKind.MOVE && mouseMode != MouseMode.ANY_EVENT) return null
         if (kind == MouseEventKind.DRAG && mouseMode != MouseMode.BUTTON_EVENT && mouseMode != MouseMode.ANY_EVENT) return null
         if (kind == MouseEventKind.RELEASE && mouseMode == MouseMode.X10) return null // X10 never reports release
+        // Wheel notches are reported under every mode that reports PRESS at
+        // all (X10 included) - real xterm does the same, a wheel click is
+        // just another button-4/5 press with no release, same as X10's
+        // ordinary button clicks having no release either.
 
         // xterm mouse coordinates are 1-indexed from the top-left.
         val c = (col + 1).coerceIn(1, buffer.columns)
@@ -600,13 +616,18 @@ class TerminalEmulator(
             MouseEventKind.DRAG -> button or 32   // motion-while-pressed flag
             MouseEventKind.MOVE -> 3 or 32         // no button + motion flag
             MouseEventKind.RELEASE -> if (mouseSgrMode) button else 3 // legacy encoding has no distinct release button id
+            MouseEventKind.WHEEL_UP -> 64
+            MouseEventKind.WHEEL_DOWN -> 65
         }
 
         return if (mouseSgrMode) {
             // SGR (1006) extended encoding: CSI < cb ; col ; row M/m - the
             // final byte itself (M press/drag/move, m release) carries the
             // press/release distinction, so cb doesn't need the legacy
-            // "release = 3" placeholder above.
+            // "release = 3" placeholder above. Wheel notches always use the
+            // 'M' (press) final byte - xterm never sends a matching 'm' for
+            // a wheel click, same as the legacy branch below never sends a
+            // release byte for one.
             val finalByte = if (kind == MouseEventKind.RELEASE) 'm' else 'M'
             "\u001B[<$cb;$c;$r$finalByte"
         } else {
