@@ -152,51 +152,27 @@ class TerminalSession(
             is SessionSpec.FileBase -> spec.resolvedPath()
         }
 
-        // A configured working directory (Settings > Sessions > entry path)
-        // takes priority; otherwise fall back to this session's own
-        // per-session history directory, same as before this field existed.
+        // This session's own per-session history directory is the fallback;
+        // "Settings > Sessions > entry path" (workingDirectory), when set,
+        // takes priority. Applies to both COMMAND_ARG and FILE_BASE.
+        //
+        // HOST-SIDE ONLY: this feeds NativePty.createSubprocess's chdir(cwd)
+        // (see pty.c), which runs before exec - i.e. before the command has
+        // done anything of its own. For a plain Android shell that's exactly
+        // right, since the configured path is a real host directory. It does
+        // NOT work for a path that's only meaningful INSIDE a proot/chroot
+        // guest the command hasn't entered yet (that chdir() silently no-ops
+        // there - see pty.c's own best-effort handling). Wrapping the whole
+        // command line in an extra shell to smuggle the cd through used to
+        // exist here for that case, but it added its own writes to the pty
+        // stream ahead of the real program's, producing a transient
+        // garbled/black-screen flash - removed for good. proot/chroot users
+        // should point their own tool's --cwd/-w (or the guest script's own
+        // cd) at the guest path instead; this field only ever controls the
+        // HOST cwd the command starts from.
         val cwd = spec.workingDirectory?.takeIf { it.isNotBlank() } ?: historyFile.parentFile?.absolutePath
-        // Only an EXPLICITLY configured entry path (not the history-dir
-        // fallback above) gets shell-wrapped below - the history dir is an
-        // internal implementation detail the user never asked to cd into
-        // from inside a proot/chroot guest, it's only meaningful as
-        // NativePty's own host-side chdir() target.
-        val explicitEntryPath = spec.workingDirectory?.takeIf { it.isNotBlank() }
 
-        // NativePty.createSubprocess's own chdir(cwd) (see pty.c) only ever
-        // runs on the HOST side, before exec - a proot/chroot target path
-        // is only meaningful INSIDE the guest rootfs the command is about
-        // to enter, so that chdir() silently no-ops for exactly the entry
-        // paths proot/chroot users actually configure, and the command
-        // then starts wherever proot/chroot's own default (usually /) or
-        // launch-script cwd happens to land instead of the configured one.
-        // "sacma sapan environment degiskenleri ile halletmiycem dogrudan
-        // override edicez" - rather than trying to smuggle the path through
-        // $PWD/$OLDPWD or a proot/chroot-specific env var (fragile, and
-        // different tools read different variables or none at all), wrap
-        // the ACTUAL command line itself in `sh -c "cd '<path>'; exec
-        // <original argv>"`. This is unconditional and tool-agnostic: a
-        // plain shell honors the cd directly; proot/chroot/anything else
-        // that re-execs into a guest still inherits whatever cwd this
-        // wrapper shell was sitting in at the moment it exec'd them, the
-        // same way any interactive shell's cwd carries into a program it
-        // launches - no cooperation from the wrapped command required, and
-        // nothing proot/chroot-specific to detect or special-case. The `;`
-        // (not `&&`) after cd means a cd failure (a guest-only path that
-        // doesn't exist on the host, which is the common case - see pty.c's
-        // own comment) is swallowed and the wrapped command still runs,
-        // matching the existing "warn and continue" behavior NativePty
-        // already has for its own host-side chdir() failure.
-        val innerArgv = if (useRoot) arrayOf("su", "-c", executablePath) else arrayOf(executablePath)
-        val argv = if (explicitEntryPath != null) {
-            val quotedPath = "'" + explicitEntryPath.replace("'", "'\\''") + "'"
-            val quotedInner = innerArgv.joinToString(" ") { arg ->
-                "'" + arg.replace("'", "'\\''") + "'"
-            }
-            arrayOf("/system/bin/sh", "-c", "cd $quotedPath 2>/dev/null; exec $quotedInner")
-        } else {
-            innerArgv
-        }
+        val argv = if (useRoot) arrayOf("su", "-c", executablePath) else arrayOf(executablePath)
         val envp = buildEnvironment(cwd)
         val pidOut = IntArray(1)
 

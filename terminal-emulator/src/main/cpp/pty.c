@@ -38,6 +38,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include <android/log.h>
 
 // Some OEM kernels install a seccomp-bpf filter that rejects the specific
 // clone flags bionic's fork() passes (it goes through the clone3 syscall,
@@ -155,28 +156,26 @@ Java_com_terminator_emulator_NativePty_createSubprocess(
         close(masterFd);
 
         if (cwd != NULL && chdir(cwd) != 0) {
-            // Surface the failure on the pty (see below for why this used
-            // to be silent) but DON'T _exit(127) here. A "Settings >
-            // Sessions > entry path" pointed at a proot/chroot target is
-            // the common case that hits this: the path is only meaningful
-            // INSIDE the guest rootfs the command is about to enter (e.g.
-            // proot's own -w, or a path under a rootfs directory that
-            // doesn't exist as a real path on the host filesystem at all)
-            // and was never expected to chdir() on the host side. Bailing
-            // out here killed the session before the command even ran,
-            // which is worse than the original silent-fallback bug this
-            // was meant to fix - it turned "entry path is a no-op for
-            // proot/chroot" into "proot/chroot sessions don't start at
-            // all". Warn and fall through to exec from whatever cwd we're
-            // already in instead, same as the pre-fail-loud behavior,
-            // so proot/chroot's own working-directory handling (its -w
-            // flag, or whatever the launch script does once inside) is
-            // still free to take over from there.
-            char message[256];
-            snprintf(message, sizeof(message),
-                      "terminator: chdir failed for %s: %s (continuing anyway)\r\n",
-                      cwd, strerror(errno));
-            write(STDOUT_FILENO, message, strlen(message));
+            // Best-effort only - silently continue from wherever we already
+            // are. A "Settings > Sessions > entry path" pointed at a
+            // proot/chroot target is the common case that hits this: the
+            // path is only meaningful INSIDE the guest rootfs the command
+            // is about to enter (e.g. proot's own -w, or a path under a
+            // rootfs directory that isn't a real path on the host at all),
+            // so failure here is expected and not worth surfacing. This
+            // used to write a "chdir failed ... (continuing anyway)"
+            // message directly to STDOUT before exec - harmless on its own,
+            // but combined with the shell-wrapper this session used to add
+            // for the same entry-path feature, it was one of several extra
+            // writers landing bytes on the pty before the real program's
+            // own output/redraw took over, which is what produced the
+            // transient garbled/black-screen flash proot/chroot users saw
+            // on session start. Logging (not writing to the pty) keeps
+            // that diagnostic available without touching the stream the
+            // guest program is about to take over.
+            __android_log_print(ANDROID_LOG_WARN, "TerminatorPty",
+                                 "chdir failed for %s: %s (continuing anyway)",
+                                 cwd, strerror(errno));
         }
 
         signal(SIGPIPE, SIG_DFL);

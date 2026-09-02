@@ -254,7 +254,10 @@ private fun AddSessionDialog(
     var fileName by remember { mutableStateOf(existing?.fileName ?: "session.sh") }
     // Entry path: the directory the spawned process starts in (its cwd /
     // $HOME). Blank means "no override" - TerminalSession falls back to
-    // the session's own history directory, same as before this existed.
+    // the session's own history directory. Shared by both session types
+    // (COMMAND_ARG and FILE_BASE) - see SessionEntry.workingDirectory's doc
+    // for the host-side-only caveat (doesn't apply inside a proot/chroot
+    // guest the command hasn't entered yet).
     var workingDirectory by remember { mutableStateOf(existing?.workingDirectory ?: "") }
     var useRoot by remember { mutableStateOf(existing?.useRoot ?: false) }
     // Optional session picture - see SessionEntry.imageUri's doc. Purely
@@ -377,6 +380,11 @@ private fun AddSessionDialog(
                     label = { Text("Entry path / spawn directory (optional)") },
                     placeholder = { Text("e.g. /sdcard, /data/local/tmp") },
                     modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    "Host path only - not applied inside proot/chroot. For those, set the working directory via the tool's own flag (e.g. proot --cwd).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
