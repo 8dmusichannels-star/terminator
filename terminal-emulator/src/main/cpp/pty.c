@@ -91,7 +91,8 @@ JNIEXPORT jint JNICALL
 Java_com_terminator_emulator_NativePty_createSubprocess(
         JNIEnv *env, jclass clazz,
         jstring j_cmd, jstring j_cwd, jobjectArray j_argv, jobjectArray j_envp,
-        jintArray j_pidOut, jint rows, jint cols, jboolean j_seccompWorkaround) {
+        jintArray j_pidOut, jint rows, jint cols, jboolean j_seccompWorkaround,
+        jint pixelWidth, jint pixelHeight) {
 
     int masterFd = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
     if (masterFd < 0) {
@@ -116,6 +117,13 @@ Java_com_terminator_emulator_NativePty_createSubprocess(
     memset(&windowSize, 0, sizeof(windowSize));
     windowSize.ws_row = (unsigned short) rows;
     windowSize.ws_col = (unsigned short) cols;
+    // ws_xpixel/ws_ypixel: some ncurses/tui programs (and anything doing
+    // its own mouse-pixel or sixel/image math) read these via
+    // ioctl(TIOCGWINSZ) instead of trusting cols*font-width. Callers that
+    // don't know the pixel size yet (or don't care) just pass 0, matching
+    // the old zero-filled behavior.
+    windowSize.ws_xpixel = (unsigned short) pixelWidth;
+    windowSize.ws_ypixel = (unsigned short) pixelHeight;
     ioctl(masterFd, TIOCSWINSZ, &windowSize);
 
     const char *cmd = (*env)->GetStringUTFChars(env, j_cmd, NULL);
@@ -206,11 +214,16 @@ Java_com_terminator_emulator_NativePty_createSubprocess(
 
 JNIEXPORT void JNICALL
 Java_com_terminator_emulator_NativePty_setWindowSize(
-        JNIEnv *env, jclass clazz, jint fd, jint rows, jint cols) {
+        JNIEnv *env, jclass clazz, jint fd, jint rows, jint cols,
+        jint pixelWidth, jint pixelHeight) {
     struct winsize windowSize;
     memset(&windowSize, 0, sizeof(windowSize));
     windowSize.ws_row = (unsigned short) rows;
     windowSize.ws_col = (unsigned short) cols;
+    // See createSubprocess's identical comment - 0 (unknown/don't-care)
+    // is a safe default and matches this function's old behavior.
+    windowSize.ws_xpixel = (unsigned short) pixelWidth;
+    windowSize.ws_ypixel = (unsigned short) pixelHeight;
     ioctl(fd, TIOCSWINSZ, &windowSize);
 }
 
