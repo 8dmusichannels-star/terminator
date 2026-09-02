@@ -28,6 +28,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -142,6 +144,12 @@ fun MultiPaneContainer(
     // mode. Defaults to true so any other existing caller keeps today's
     // behavior with no wiring needed.
     zoomEnabled: Boolean = true,
+    // Settings > Soft keyboard toggle - threaded down to each tile's own
+    // PaneContent (see that composable's identically-named param for the
+    // full doc on why only the wantsKeyboard toggle is gated, not the
+    // focus-tracking bookkeeping). Defaults to true so any other existing
+    // caller of this composable keeps today's behavior unchanged.
+    softKeyboardEnabled: Boolean = true,
     onInput: (runtimeId: String, text: String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -197,6 +205,7 @@ fun MultiPaneContainer(
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
+                    softKeyboardEnabled = softKeyboardEnabled,
                     onInput = onInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
@@ -222,6 +231,7 @@ fun MultiPaneContainer(
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
+                    softKeyboardEnabled = softKeyboardEnabled,
                     onInput = onInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
@@ -235,6 +245,19 @@ fun MultiPaneContainer(
                     onToggleWakeUp = onToggleWakeUp,
                     wakeUpActiveFor = wakeUpActiveFor,
                     onSaveSession = onSaveSession,
+                    // Was missing entirely - FloatingLayout's own
+                    // focusRequestSignal param silently defaulted to 0
+                    // forever, so VirtualKeyBar's long-text swipe-back
+                    // signal (bumped by MainActivity's onTextEntryClosed,
+                    // same signal TilingLayout above already gets) never
+                    // reached a floating pane's PaneContent at all - its
+                    // LaunchedEffect(focusRequestSignal) never saw a
+                    // nonzero value to react to. Same
+                    // "IME kendi kendine kapanıyor" swipe bug already
+                    // fixed for split screen and tiling multi-pane, just
+                    // never wired up for Floating mode when this dispatch
+                    // was written.
+                    focusRequestSignal = focusRequestSignal,
                     onImeRequestShow = onImeRequestShow,
                     onImeRequestHide = onImeRequestHide
                 )
@@ -306,6 +329,7 @@ private fun TilingLayout(
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
     zoomEnabled: Boolean = true,
+    softKeyboardEnabled: Boolean = true,
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -388,6 +412,7 @@ private fun TilingLayout(
                                     fontFamily = fontFamily,
                                     fontSizeSp = fontSizeSp,
                                     zoomEnabled = zoomEnabled,
+                                    softKeyboardEnabled = softKeyboardEnabled,
                                     onInput = { text -> onInput(pane.runtimeId, text) },
                                     onFocus = { onFocusPane(pane.runtimeId) },
                                     onClose = { onClosePane(pane.runtimeId) },
@@ -508,6 +533,7 @@ private fun FloatingLayout(
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
     zoomEnabled: Boolean = true,
+    softKeyboardEnabled: Boolean = true,
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
@@ -588,6 +614,7 @@ private fun FloatingLayout(
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
+                    softKeyboardEnabled = softKeyboardEnabled,
                     onInput = { text -> onInput(pane.runtimeId, text) },
                     onFocus = { onFocusPane(pane.runtimeId) },
                     onClose = { onClosePane(pane.runtimeId) },
@@ -685,6 +712,14 @@ private fun PaneContent(
     onToggleWakeUp: (() -> Unit)? = null,
     wakeUpActive: Boolean = false,
     onSaveSession: (() -> Unit)? = null,
+    // Settings > Soft keyboard toggle, same flag SplitTerminalPane now takes
+    // (see that composable's own doc) - guards only this tile's
+    // wantsKeyboard toggle below, not the onFocus()/focusToken bookkeeping,
+    // which must keep running unconditionally so VirtualKeyBar/keymapper
+    // routing still follows which tile was tapped even when the soft
+    // keyboard is turned off. Defaults to true so any other existing caller
+    // of this composable keeps today's behavior unchanged.
+    softKeyboardEnabled: Boolean = true,
     // Same "reclaim this pane's IME focus" signal SplitTerminalPane's own
     // focusRequestSignal is (see its doc): MainActivity bumps this after
     // VirtualKeyBar's long-text page swipes closed. Without a per-pane
@@ -853,6 +888,61 @@ private fun PaneContent(
     // no field to show it for — the "keyboard bazen açılmıyor" bug in
     // multi-pane mode.
     var focusToken by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
+    // Local, independent of isFocused/focusedRuntimeId (which just tracks
+    // WHICH tile owns input focus, not whether ITS keyboard should be up).
+    // Was missing entirely, so the tap gesture below only ever bumped
+    // focusToken and re-ran HiddenPaneInputField's show() branch - a tap on
+    // an already-focused, already-open tile had no way to close the
+    // keyboard, unlike the primary pane's own tap-to-toggle. Starts true so
+    // a freshly-focused tile still opens the keyboard immediately, same as
+    // before this fix.
+    var wantsKeyboard by remember(runtimeId) { mutableStateOf(true) }
+    // Live per-frame IME-visible read - same pattern as MainActivity's own
+    // primary-pane `keyboardOpen` (see its doc: assigned into a
+    // mutableStateOf on every composition, not read as a plain val), NOT
+    // rememberUpdatedState(val). The two look equivalent but aren't: a
+    // plain `val keyboardOpenNow = WindowInsets.ime.getBottom(...)` wrapped
+    // in rememberUpdatedState only refreshes when THIS composable itself
+    // recomposes, and Compose has no obligation to recompose this exact
+    // scope just because the inset changed several composables away from
+    // where the inset is actually read - depending on where recomposition
+    // scopes land, the gesture loop below could keep reading a frozen
+    // "IME closed" or "IME open" snapshot indefinitely, which reads as the
+    // toggle being permanently inverted rather than merely occasionally
+    // stale. A mutableStateOf that's WRITTEN on every composition (like
+    // MainActivity's keyboardOpen) doesn't have that gap: the write itself
+    // is what keeps a State's snapshot current, independent of whether any
+    // particular downstream reader's scope was the one that recomposed.
+    var keyboardOpenNow by remember(runtimeId) { mutableStateOf(false) }
+    keyboardOpenNow = WindowInsets.ime
+        .getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+    // Same live-mirror pattern as keyboardOpenNow directly above, for the
+    // same reason: a plain captured `isFocused` parameter read inside the
+    // long-running pointerInput(runtimeId){ awaitEachGesture{} } coroutine
+    // below would freeze at whatever value this composable held when that
+    // coroutine was first launched (see the staleness note right below
+    // this block) and never see later focus changes - so it's mirrored
+    // into a State here, reassigned on every recomposition, so a read
+    // inside the gesture coroutine gets this tile's true focus state as of
+    // the last completed recomposition. Captured into a local val at the
+    // very top of each gesture (see the down-handling block below) so
+    // this tile's OWN onFocus() call, made moments later in the same
+    // gesture, can't retroactively corrupt what "was I already focused
+    // BEFORE this tap" meant for that gesture's toggle decision.
+    var focusedBeforeGesture by remember(runtimeId) { mutableStateOf(false) }
+    focusedBeforeGesture = isFocused
+    // isFocused (the constructor param above) is a plain Boolean, not a
+    // Compose State - read directly inside the tap gesture's
+    // pointerInput(runtimeId){ awaitEachGesture { ... } } block below, it
+    // would capture whatever value isFocused happened to hold the moment
+    // that coroutine was originally launched and never see it change
+    // again: pointerInput's key is runtimeId alone, which never changes
+    // for a tile's whole lifetime, so Compose never restarts that
+    // coroutine (and therefore never re-captures the closure) just
+    // because focus moved to/from this tile. This no longer matters for
+    // the tap-to-toggle decision itself (see that block's own doc - it
+    // reads keyboardOpenNow directly now, not isFocused), but is left
+    // here as the general staleness note for this gesture loop.
 
     // Consumes focusRequestSignal - only for whichever pane is actually
     // focused, same guard SplitTerminalPane's splitPaneFocused check gives
@@ -868,6 +958,7 @@ private fun PaneContent(
     // initial composition (default value) never fires this on its own.
     androidx.compose.runtime.LaunchedEffect(focusRequestSignal) {
         if (focusRequestSignal != 0 && isFocused) {
+            wantsKeyboard = true
             focusToken++
         }
     }
@@ -1126,6 +1217,38 @@ private fun PaneContent(
                         .pointerInput(runtimeId) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
+                                // Captured BEFORE onFocus() below can change this
+                                // tile's focus state - see focusedBeforeGesture's own
+                                // doc above. This is "was THIS tile already the
+                                // focused one right before this exact tap landed",
+                                // used only by the plain-tap keyboard-toggle branch
+                                // further down.
+                                val wasFocusedBeforeThisTap = focusedBeforeGesture
+                                // onFocus()/focusToken fire unconditionally on every
+                                // down (routes VirtualKeyBar/keymapper to this tile the
+                                // instant a finger lands, even if the gesture turns out
+                                // to be a scroll/pinch/selection rather than a tap).
+                                //
+                                // wantsKeyboard is deliberately NOT touched here anymore
+                                // - it used to be set right on this same down, before
+                                // this gesture is known to be a plain tap at all. Since
+                                // this whole pointerInput block was merged into one
+                                // shared reader of the raw pointer stream (see this
+                                // modifier's own doc above, "single gesture loop per
+                                // pane"), EVERY down here also covers starting a
+                                // scrollback drag, a pinch, or a long-press-to-select -
+                                // toggling the IME's wanted state that early meant
+                                // starting to scroll or select in a tile with the
+                                // keyboard closed silently reopened it (and vice versa
+                                // while it was open), regardless of what the gesture
+                                // turned out to be - "IME acılıyor kapalı olsada". The
+                                // toggle now only runs once this gesture is actually
+                                // confirmed to be a plain tap - see the "Lifted before
+                                // the timeout - plain tap" branch below, mirroring
+                                // MainActivity's own primary-pane gesture loop, which
+                                // makes this same decision only after its own
+                                // moved/stolenByTerminalView classification, not on the
+                                // initial down either.
                                 onFocus()
                                 focusToken++
                                 // New touch landing: abort any in-flight fling from a
@@ -1231,7 +1354,52 @@ private fun PaneContent(
                                     val changes = event.changes
                                     val primary = changes.firstOrNull { it.id == down.id } ?: changes.firstOrNull()
                                     if (primary == null || !changes.any { it.pressed }) {
-                                        // Lifted before the timeout - plain tap.
+                                        // Lifted before the timeout - plain tap. This is
+                                        // the one place in this gesture loop that's
+                                        // actually confirmed NOT to be a scroll/pinch/
+                                        // long-press, so this is where the IME toggle
+                                        // belongs (see the down-handling block above's
+                                        // doc for why it was moved out of awaitFirstDown).
+                                        //
+                                        // Only actually TOGGLES when this tile was
+                                        // already the focused one before this tap
+                                        // (wasFocusedBeforeThisTap) - a real re-tap on
+                                        // the tile you're already typing into. A tap
+                                        // that's switching focus IN from elsewhere
+                                        // leaves wantsKeyboard untouched, so whatever
+                                        // this tile's own remembered
+                                        // open/closed preference was (from the last
+                                        // time IT was focused) simply takes effect
+                                        // as-is once `active = isFocused && wantsKeyboard`
+                                        // recomposes true for it.
+                                        //
+                                        // Previously this read the GLOBAL
+                                        // `keyboardOpenNow` (WindowInsets.ime, one
+                                        // signal per WINDOW, not per tile) for every
+                                        // tap, switch-in included. That meant tapping
+                                        // INTO a tile always inverted whatever the
+                                        // PREVIOUSLY-focused tile's keyboard state
+                                        // happened to be, regardless of what this
+                                        // tile's own state was: e.g. tile A open,
+                                        // switch to tile B which you'd deliberately
+                                        // left closed earlier - keyboardOpenNow read
+                                        // true (from A), so `!keyboardOpenNow` forced
+                                        // wantsKeyboard = false for B even though B's
+                                        // own remembered preference had nothing to do
+                                        // with A. Or the reverse - switching to a tile
+                                        // you'd left closed while the CURRENT tile
+                                        // is/was also closed forced it back OPEN. This
+                                        // is the actual "IME açılıyor kapalı olsada"
+                                        // bug: it was never about focus-loss not
+                                        // hiding the field (that's the separate
+                                        // activationKey/primaryPaneFocused fix already
+                                        // made) - it's that the toggle decision itself
+                                        // read a window-global signal to make a
+                                        // per-tile decision.
+                                        if (softKeyboardEnabled && wasFocusedBeforeThisTap) {
+                                            wantsKeyboard = !keyboardOpenNow
+                                            focusToken++
+                                        }
                                         return@awaitEachGesture
                                     }
                                     val pressedNow = changes.filter { it.pressed }
@@ -1484,7 +1652,21 @@ private fun PaneContent(
                     // directly over this pane's own tile, not some shared
                     // coordinate space that could land it over a different
                     // pane entirely.
-                    SelectionActionBar(actionModeController)
+                    SelectionActionBar(
+                        actionModeController,
+                        // See MainActivity's identical call site: focusRow is
+                        // always the actively-dragged handle, so it - not
+                        // minOf(anchor, focus) - is what should drive the flip.
+                        handleRow = paneSelectionState.focusRow,
+                        // Same reasoning as MainActivity's call site: hide the
+                        // bar while a handle is actually being dragged.
+                        hideWhileDragging = paneSelectionState.draggingHandle,
+                        // Real pixel bounds, same fix as MainActivity's call
+                        // site - see HandleClearingPositionProvider's doc.
+                        handleTopPx = paneSelectionState.focusRow * charMetrics.second,
+                        handleBottomPx = (paneSelectionState.focusRow + 1) * charMetrics.second,
+                        rowHeightPx = charMetrics.second,
+                    )
                     // Same MoreActionsPopup the primary pane and
                     // SplitTerminalPane use - onToggleSplitScreen is always
                     // null here (see this function's doc), so that row
@@ -1513,9 +1695,54 @@ private fun PaneContent(
                     // the caller-supplied onInput wrapper resetting scroll
                     // via a side effect would be more surprising here than
                     // just resetting locally right before forwarding.
+                    //
+                    // wantsKeyboardOn factors in softKeyboardEnabled, which
+                    // `active` was missing entirely: MainActivity's own
+                    // primary pane never even calls requestFocus()/show() when
+                    // this setting is off (see its onTap branch, gated
+                    // `... && softKeyboardEnabled`), but this tile's `active`
+                    // was just `isFocused && wantsKeyboard` - wantsKeyboard
+                    // defaults true and the tap handler that could ever set it
+                    // false is ITSELF gated behind softKeyboardEnabled (so it
+                    // never runs while the setting is off), meaning
+                    // wantsKeyboard stayed permanently true and `active` was
+                    // driven by isFocused alone. Any tile that gained focus
+                    // therefore still called requestFocus() + show(ime())
+                    // below regardless of the setting - the real IME popped
+                    // up over split/multi-pane tiles even with "disable soft
+                    // keyboard" on, while the primary pane correctly never did.
+                    val wantsKeyboardOn = isFocused && wantsKeyboard && softKeyboardEnabled
                     HiddenPaneInputField(
-                        active = isFocused,
-                        activationKey = focusToken,
+                        // wantsKeyboard added so a tap toggle-close (see the
+                        // tap gesture above) can hide the IME without giving
+                        // up this tile's input focus - isFocused alone can't
+                        // represent "focused but keyboard dismissed".
+                        active = wantsKeyboardOn,
+                        // Was `focusToken` alone. isFocused here is DERIVED
+                        // (pane.runtimeId == focusedRuntimeId, recomposed
+                        // automatically by Compose whenever ANOTHER tile is
+                        // tapped), unlike focusToken which is local state
+                        // this tile only ever bumps on a tap into ITSELF.
+                        // So when a different tile was tapped, this tile's
+                        // isFocused correctly flipped to false on
+                        // recomposition, but activationKey never changed -
+                        // LaunchedEffect(activationKey) never re-ran, hide()
+                        // was never called, and this tile's IME stayed open
+                        // over the newly-focused tile. Pairing in the
+                        // derived active value means a focus-loss with no
+                        // local focusToken bump still changes the key, so
+                        // the effect re-fires and reads the now-current
+                        // latestActive.value (false) - same
+                        // "outgoing pane never hides" bug as
+                        // SplitTerminalPane's own isFocused/primaryPaneFocused
+                        // fix, different mechanism because this tile's
+                        // isFocused is derived rather than locally owned.
+                        // Keyed on wantsKeyboardOn itself (not a narrower
+                        // isFocused/wantsKeyboard pair) so flipping
+                        // softKeyboardEnabled off mid-session, while a tile's
+                        // real IME is showing, also re-fires this and hides
+                        // it - not just focus/wantsKeyboard changes.
+                        activationKey = focusToken to wantsKeyboardOn,
                         onText = { text ->
                             scrollOffset = 0
                             onInput(text)
@@ -1683,27 +1910,57 @@ internal fun HiddenPaneInputField(
     val latestActive = rememberUpdatedState(active)
 
     LaunchedEffect(activationKey) {
-        if (active) {
-            // Was routed through view.post (queues to the next Choreographer
-            // frame) - see the old comment below for why that existed for
-            // the very FIRST composition. But this LaunchedEffect only runs
-            // on a real activationKey CHANGE, which means Compose has
-            // already committed a recomposition by the time this coroutine
-            // resumes - the layout that owns this FocusRequester is already
-            // in the tree, so the "hasn't been committed yet" concern
-            // view.post was guarding against doesn't apply here. Routing
-            // through post was adding a full extra frame (sometimes more,
-            // if the Looper queue was busy) on top of whatever gap already
-            // exists between the outgoing field's clearFocus/hide and this
-            // field's requestFocus/show - part of what was reading as the
-            // keyboard staying fully closed for the better part of a second
-            // on swipe-back in split screen. Calling both directly,
-            // synchronously, closes that extra frame of delay.
+        // Reads latestActive.value, NOT the raw `active` parameter: this
+        // coroutine restarts the instant activationKey (focusToken) changes,
+        // which the tap gesture bumps in the SAME write batch as the
+        // onFocus() call that flips the PARENT's focusedRuntimeId (and
+        // therefore this composable's own `isFocused` -> `active` param)
+        // - but onFocus() only updates parent state, it doesn't recompose
+        // this composable synchronously. A newly-focused tile's very first
+        // tap therefore had this coroutine relaunch on the new focusToken
+        // while still closing over the OLD `active` (false, from before
+        // isFocused flipped), so requestFocus()/show() were silently
+        // skipped - focus visibly moved (the tile highlighted, isFocused
+        // eventually flipped) but the IME never appeared. This is the same
+        // "focusing oluyor ama IME gorunmuyor" gap the post{} below already
+        // fixes for the Compose-recomposition-vs-platform-callback race;
+        // this fixes the analogous gap one step earlier, between the parent
+        // focus write and this coroutine's read of it. Only affects
+        // non-primary panes - the primary pane in MainActivity doesn't use
+        // HiddenPaneInputField at all.
+        if (latestActive.value) {
+            // requestFocus() itself stays synchronous - Compose has already
+            // committed the recomposition that puts this FocusRequester's
+            // target in the tree by the time a real activationKey CHANGE
+            // resumes this coroutine, so there's nothing to gain waiting on
+            // that front.
+            //
+            // But show() still has to go through view.post (next
+            // Choreographer frame), same as MainActivity's own hidden field
+            // (see its insetsController doc: "a synchronous show() right
+            // after requestFocus() races the focus-driven show request the
+            // platform already fires on its own"). That's a DIFFERENT gap
+            // than the Compose-recomposition one above: requestFocus() only
+            // marks Compose's own focus state immediately - the underlying
+            // platform View actually receiving focus and standing up a real
+            // InputConnection for the IME to attach to happens over a
+            // separate callback chain that hasn't necessarily run yet in
+            // the same tick. Calling show() before that lands is what let
+            // this call site silently no-op: focus visibly moved (fields
+            // recomposed, isFocused flipped) but the IME never actually
+            // appeared - "focusing oluyor ama IME gorunmuyor" - while every
+            // other show() call site in this app already routes through
+            // post{} and doesn't see it. A previous pass here read that
+            // Compose-recomposition reasoning as covering this too and
+            // dropped post{} for both calls; it only ever covered
+            // requestFocus(), so only that one stays synchronous.
             focusRequester.requestFocus()
-            if (onRequestShow != null) {
-                onRequestShow()
-            } else {
-                insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+            view.post {
+                if (onRequestShow != null) {
+                    onRequestShow()
+                } else {
+                    insetsController?.show(androidx.core.view.WindowInsetsCompat.Type.ime())
+                }
             }
         } else {
             // Mirrors the primary pane's own tap-to-close path in
@@ -1774,11 +2031,34 @@ internal fun HiddenPaneInputField(
                     consumedBaseline = placeholder
                 }
             }
-            value = new.copy(
-                text = if (consumedBaseline == placeholder) placeholder else newText,
-                selection = if (consumedBaseline == placeholder)
-                    TextRange(placeholder.length) else new.selection
-            )
+            // Explicitly construct a fresh TextFieldValue rather than
+            // new.copy(...) whenever resetting to the bare placeholder
+            // (consumedBaseline == placeholder here). new.copy() carries
+            // forward new.composition - the IME's own active composing
+            // region - even though the visible/committed text is being
+            // yanked back down to the placeholder underneath it. That left
+            // Compose's side of the field reset while the IME's own
+            // InputConnection still believed it had an open composing
+            // region over text that no longer exists on this side (most
+            // reachable via the 256-char growth cap above, which can land
+            // mid-composition on a fast typing burst or right as an emoji
+            // panel commit lands) - the IME's NEXT edit (often exactly an
+            // emoji-panel commit, which many keyboards send as "finish
+            // composing region" + "commit text" in two separate calls) was
+            // then computed against its own stale composing state and
+            // landed as something other than the emoji itself once
+            // reconciled against this field's already-reset text, which is
+            // what surfaced as an emoji tap silently turning into a space.
+            // TextFieldValue(text, selection) with no composition argument
+            // defaults composition to null, telling Compose (and, via
+            // restartInput, the IME) there is no composing region at all -
+            // matching reality once the field's been forced back to the
+            // placeholder.
+            value = if (consumedBaseline == placeholder) {
+                TextFieldValue(placeholder, selection = TextRange(placeholder.length))
+            } else {
+                new.copy(text = newText, selection = new.selection)
+            }
         },
         modifier = Modifier
             .size(1.dp)
