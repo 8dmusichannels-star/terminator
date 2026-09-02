@@ -21,6 +21,8 @@
 package com.terminator.emulator
 
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import java.io.File
 import java.io.FileInputStream
@@ -113,6 +115,23 @@ class TerminalSession(
     // "exited" state on the session that just went away.
     @Volatile private var exited = false
     private var exitListener: (() -> Unit)? = null
+    // markExited() itself can run on the pty reader thread (natural EOF,
+    // via the finally block in start()'s reader Thread) OR synchronously
+    // on whatever thread called kill()/destroy() - the UI thread, in
+    // practice. exitListener ultimately mutates MainViewModel's
+    // liveSessions/liveEntries maps (plain, non-thread-safe mutableMapOf)
+    // and _uiState. If session A's reader thread fires this at the same
+    // moment the UI thread is inside launchLiveSession() for a brand new
+    // session B - Ctrl+D dismissing A and immediately opening a new
+    // session, or tapping Clone on a row while some OTHER session's
+    // process happens to be dying in the background - both threads are
+    // mutating those same maps concurrently, corrupting them and crashing
+    // (this is the "new session after Ctrl+D" and "Clone crashes if
+    // another session was killed" bugs). Posting to the main looper
+    // serializes every exitListener invocation with all of
+    // MainViewModel's own map/state mutations, which only ever happen on
+    // the UI thread.
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     val buffer = TerminalBuffer(columns = 80, rows = 24)
     lateinit var emulator: TerminalEmulator
@@ -382,7 +401,18 @@ class TerminalSession(
             emulator.append(message)
             appendHistory(message)
         }
-        exitListener?.invoke()
+        // See mainHandler's doc above - this MUST NOT invoke exitListener
+        // directly from whatever thread markExited() itself is running on.
+        // If already on the main thread (kill()/destroy() called from UI
+        // code), Handler.post still defers to the next looper iteration
+        // rather than running inline - that's fine and in fact necessary:
+        // it keeps this always-async, so callers on the UI thread can't
+        // accidentally come to depend on the listener having already run
+        // by the time markExited() returns.
+        val listener = exitListener
+        if (listener != null) {
+            mainHandler.post { listener.invoke() }
+        }
     }
 
     private companion object {
