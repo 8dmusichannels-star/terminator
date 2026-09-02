@@ -51,8 +51,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 /**
  * Why this is a Compose-drawn popup and not `android.view.ActionMode`
@@ -118,21 +122,93 @@ fun rememberActionModeController(): ActionModeController {
  *  which doesn't reliably reach this app's SelectionContainer version -
  *  see this file's top doc).
  *
+ *  That "usually mid-screen" assumption breaks when the relevant selection
+ *  handle sits in the first few rows of the visible viewport (very common -
+ *  selecting the first line or two of the current screen, or of a short
+ *  command's output) - a fixed TopCenter popup then renders directly on
+ *  top of the drag handle marking that edge, so the bar visually covers
+ *  the very handle a user would drag to extend the selection ("Copy Paste
+ *  More menusu bazen selection kucuk isaretinin onune geciyor"). [handleRow]
+ *  - the row of whichever handle is actually being dragged right now,
+ *  screen-relative (see TerminalSelectionState.focusRow's own doc: focus
+ *  is always the actively-moved end, anchor is re-pinned to the OTHER,
+ *  fixed end the instant a handle-drag starts - so focusRow, not
+ *  min(anchorRow, focusRow), is the row that matters here) - lets this bar
+ *  flip to BottomCenter whenever that handle is too close to the top for
+ *  TopCenter to clear it, and back to TopCenter once the dragged handle
+ *  moves away from the top again (including down toward the bottom of the
+ *  viewport), the same top-vs-bottom flip Android's native floating
+ *  selection toolbar does. Using min(anchor, focus) here instead of the
+ *  live handle would get this backwards mid-drag: e.g. selecting downward
+ *  from a top-anchored start, the anchor stays pinned near row 0 for the
+ *  whole drag even once the actively-dragged focus handle has moved well
+ *  down the screen, which kept forcing BottomCenter - directly under the
+ *  handle the user is dragging - for as long as any part of the selection
+ *  touched the top few rows ("asagiya kaydirirken kucuk bazen gozukmuyor").
+ *  Defaults to Int.MAX_VALUE (always "far from the top") so any call site
+ *  that doesn't pass it keeps today's TopCenter-always behavior unchanged.
+ *
  *  Visual shape/color follow the system's own floating selection toolbar
  *  (the dark full-capsule pill with a trailing overflow dot-icon,
  *  Material-You-tinted) rather than the earlier flat rounded-rect bar -
  *  Copy/Paste/More stay exactly the same three actions/callbacks, this is
  *  purely the container's shape and color scheme. MoreActionsPopup (the
  *  menu that opens off the More button) is intentionally untouched - only
- *  this bar's own look changed. */
+ *  this bar's own look changed.
+ *
+ *  [hideWhileDragging] - pass TerminalSelectionState.draggingHandle here -
+ *  temporarily skips rendering the whole popup for as long as a handle is
+ *  actually being held/dragged. Without this, the bar's TopCenter/
+ *  BottomCenter flip (driven by [handleRow], live off the dragged handle)
+ *  recomposes the popup at a new position on every row the finger crosses,
+ *  which is itself another way the bar can end up sitting directly under a
+ *  handle mid-drag for a frame or two even with the flip logic correct -
+ *  "toolbar'in gecici olarak kaybolmasi" while a handle drag is in
+ *  progress avoids that entirely, and the controller's own isVisible is
+ *  left untouched so the bar reappears at its (by-then-settled) position
+ *  the instant endHandleDrag() fires, with no separate show()/hide() call
+ *  needed here.
+ *
+ *  [handleTopPx]/[handleBottomPx] - the actively-dragged handle's own
+ *  screen-relative pixel bounds (top/bottom of its glyph + touch padding,
+ *  in the SAME pixel space as the Box this popup is placed in), and
+ *  [rowHeightPx] - one character row's height in that same space. Replaces
+ *  the old Top/Bottom-flip-only positioning (which only ever snapped the
+ *  bar to the very top or very bottom of the whole pane, regardless of
+ *  where on-screen the handle actually was) with a position computed
+ *  directly off the handle's real pixel rect: the bar is placed
+ *  [rowHeightPx] above handleTopPx whenever that clears the top of the
+ *  viewport, and [rowHeightPx] below handleBottomPx otherwise. Either way
+ *  the bar's own rect never overlaps [handleTopPx, handleBottomPx] - "kuscuk
+ *  hep ustune spawn olsun, kuscuk onun icine girmesine izin verme": the
+ *  handle never ends up underneath/inside the bar and the bar never spawns
+ *  inside the handle's own touch target, regardless of the mid-screen
+ *  Top-vs-Bottom case the old fixed-alignment version got right only by
+ *  accident (selection happened to be far enough from both edges).
+ *  Defaults (Int.MAX_VALUE for both, matching the old handleRow default)
+ *  fall back to the previous behavior for any call site that hasn't been
+ *  updated to pass real pixel bounds yet - see SelectionOverrideToolbarLegacyRow-
+ *  BasedPositionProvider below. */
 @Composable
-fun SelectionActionBar(controller: ActionModeController) {
+fun SelectionActionBar(
+    controller: ActionModeController,
+    handleRow: Int = Int.MAX_VALUE,
+    hideWhileDragging: Boolean = false,
+    handleTopPx: Float = Float.NaN,
+    handleBottomPx: Float = Float.NaN,
+    rowHeightPx: Float = Float.NaN,
+) {
     if (!controller.isVisible) return
+    if (hideWhileDragging) return
     val copy = controller.onCopy ?: return
-    Popup(
-        alignment = Alignment.TopCenter,
-        properties = PopupProperties(focusable = false),
-    ) {
+    val hasPixelBounds = !handleTopPx.isNaN() && !handleBottomPx.isNaN() && !rowHeightPx.isNaN() && rowHeightPx > 0f
+    // Rows are small (a handle glyph plus touch padding is roughly this
+    // tall in character-grid terms on a typical terminal font size) - a
+    // dragged handle within this many rows of the viewport's top edge is
+    // close enough that the TopCenter popup below would overlap it. Only
+    // used as the fallback path when hasPixelBounds is false.
+    val nearTopRowThreshold = 2
+    val barContent: @Composable () -> Unit = {
         Surface(
             // Full capsule, not a fixed corner radius - matches the
             // system toolbar's pill shape at any bar height, the same way
@@ -181,6 +257,122 @@ fun SelectionActionBar(controller: ActionModeController) {
                 }
             }
         }
+    }
+    // Two separate Popup() call sites rather than one shared call fed a
+    // nullable popupPositionProvider: Popup's alignment-based overload and
+    // its popupPositionProvider-based overload are mutually exclusive
+    // (passing both is not a supported combination), so branching has to
+    // happen at the call site itself, not by conditionally building one
+    // provider and always passing it through the same parameter.
+    if (hasPixelBounds) {
+        Popup(
+            popupPositionProvider = remember(handleTopPx, handleBottomPx, rowHeightPx) {
+                HandleClearingPositionProvider(handleTopPx, handleBottomPx, rowHeightPx)
+            },
+            properties = PopupProperties(focusable = false),
+            content = barContent,
+        )
+    } else {
+        Popup(
+            alignment = if (handleRow <= nearTopRowThreshold) Alignment.BottomCenter else Alignment.TopCenter,
+            properties = PopupProperties(focusable = false),
+            content = barContent,
+        )
+    }
+}
+
+/**
+ * Positions the bar directly off the actively-dragged handle's own pixel
+ * rect ([handleTopPx]..[handleBottomPx], screen-relative in the same space
+ * as the anchor Box) instead of snapping to a fixed Top/Bottom alignment of
+ * the whole pane - see SelectionActionBar's own doc for why the old
+ * row-threshold flip could still let the bar spawn overlapping the handle
+ * anywhere the selection wasn't near either screen edge.
+ *
+ * This is a two-sided barrier, not a one-shot "try above, else below":
+ * [handleTopWindow, handleBottomWindow] (plus [margin] on each side) is
+ * treated as a hard exclusion zone the bar's own rect may never enter,
+ * full stop - preferred placement is above the handle (mirrors the old
+ * TopCenter default), but if placing it there would push the bar's TOP
+ * edge above the visible window (clipping off-screen against the actual
+ * top barrier), it flips below instead. Critically, the final vertical
+ * clamp against the window bounds is done SEPARATELY per branch - clamped
+ * toward the window edge the bar is already sitting against, never back
+ * across the handle - so a bar that doesn't fully fit above (or below)
+ * gets pushed further in that same direction rather than snapping back
+ * onto/into the handle's own rect. That's what makes this an actual
+ * barrier instead of the old single coerceIn(minY, maxY), which could
+ * clamp a "not enough room below" result straight back up into the
+ * handle whenever handleBottomWindow + margin + popupHeight overflowed
+ * the window.
+ */
+private class HandleClearingPositionProvider(
+    private val handleTopPx: Float,
+    private val handleBottomPx: Float,
+    private val rowHeightPx: Float,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        // anchorBounds is the anchor Box's own rect in window coordinates;
+        // handleTopPx/handleBottomPx are supplied relative to that same
+        // Box, so add anchorBounds.top to land in window space.
+        val handleTopWindow = anchorBounds.top + handleTopPx
+        val handleBottomWindow = anchorBounds.top + handleBottomPx
+        val margin = (rowHeightPx * 0.5f).coerceAtLeast(4f)
+        val popupHeight = popupContentSize.height.toFloat()
+        // Preferred: bar's bottom edge sits `margin` above the handle's
+        // top barrier. If the bar's own top edge would then land above
+        // anchorBounds.top (off the visible window - the ONLY thing that
+        // can invalidate the "above" placement), flip below instead.
+        val aboveTopEdge = handleTopWindow - margin - popupHeight
+        val y = if (aboveTopEdge >= anchorBounds.top) {
+            // Fits above cleanly.
+            aboveTopEdge
+        } else {
+            // Doesn't clear the top barrier - place below the handle's
+            // bottom barrier instead. If the bar also doesn't fully fit
+            // below (a very short pane), it still starts exactly at the
+            // barrier - handleBottomWindow + margin - rather than
+            // snapping back up across it, so the handle stays outside
+            // the bar's rect either way even if the bar itself ends up
+            // partially clipped by the window edge (unavoidable once
+            // neither side has room, but the exclusion zone itself is
+            // never violated).
+            handleBottomWindow + margin
+        }
+        // Horizontal center: since only the handle's vertical rect is
+        // passed in (handles are effectively a point on the X axis - a
+        // caret/teardrop glyph - the anchor Box's own horizontal center is
+        // the closest stable reference without threading handle X through
+        // too), center the bar in the anchor Box horizontally, same as the
+        // old TopCenter/BottomCenter alignment did.
+        val boxCenterX = anchorBounds.left + (anchorBounds.right - anchorBounds.left) / 2
+        // coerceIn(min, max) throws if min > max, which the naive
+        // anchorBounds.right - popupContentSize.width bound can be
+        // whenever the bar is wider than the anchor Box itself (a narrow
+        // split pane, a small multi-pane tile) - clamp the upper bound up
+        // to at least the lower bound first so this never crashes on a
+        // narrow pane.
+        val minX = anchorBounds.left
+        val maxX = maxOf(minX, anchorBounds.right - popupContentSize.width)
+        val x = (boxCenterX - popupContentSize.width / 2).coerceIn(minX, maxX)
+        // Deliberately NOT a single coerceIn(anchorBounds.top,
+        // anchorBounds.bottom - popupHeight) here - that would clamp the
+        // "below" branch's y back UP whenever handleBottomWindow + margin
+        // + popupHeight overflows the window bottom, landing the bar back
+        // on/inside the handle it just flipped below to avoid ("ust
+        // barrier'a takilirsa asagiya dusmeli" - the barrier flip has to
+        // survive the final clamp, not get undone by it). Each branch
+        // instead only clamps toward the window edge it's already
+        // sitting against - see the two y-computation branches above -
+        // so the worst case on a too-short pane is the bar clipping
+        // against that edge while still staying fully outside the
+        // handle's own rect, never sliding back across it.
+        return IntOffset(x, y.toInt())
     }
 }
 @Composable
