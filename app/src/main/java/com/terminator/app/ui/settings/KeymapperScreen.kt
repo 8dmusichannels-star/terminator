@@ -38,7 +38,9 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.terminator.app.settings.SettingsKeys
 import com.terminator.app.ui.AppAction
 import com.terminator.app.ui.AppShortcutEntry
@@ -60,14 +62,44 @@ import java.util.UUID
 data class KeymapEntry(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
-    val keys: List<String>, // VirtualKey.name values, e.g. "ESC", "CTRL", "UP"
+    // Ordered sequence of either a VirtualKey.name value ("ESC", "CTRL",
+    // "UP", ...) or a literal character encoded as "CHAR:<c>" (e.g.
+    // "CHAR:c", "CHAR:5") - see LITERAL_KEY_PREFIX. Order matters here
+    // (unlike the old Set<String>-backed storage this replaced): CTRL/ALT
+    // apply as a modifier to whatever key/char immediately follows them in
+    // this list, same one-shot-modifier semantics VirtualKeyBar's own
+    // CTRL/ALT buttons already have, so ["CTRL", "CHAR:c"] means Ctrl+C
+    // specifically, not "CTRL and C in some order".
+    val keys: List<String>,
     val repeatOnHold: Boolean = false
 )
 
-private val ALL_KEY_OPTIONS = listOf(
+/** Prefix used to encode a literal character (letter/digit/punctuation -
+ *  anything outside the fixed named-key set) inside
+ *  KeymapEntry.keys, e.g. "CHAR:c" for the literal 'c'. Kept as a simple
+ *  string prefix rather than a second field on KeymapEntry so keys stays
+ *  a single ordered list and CTRL/ALT-then-char sequencing (see keys' own
+ *  doc) doesn't need a parallel structure to stay in sync with. */
+const val LITERAL_KEY_PREFIX = "CHAR:"
+
+fun literalKey(c: Char): String = "$LITERAL_KEY_PREFIX$c"
+
+/** Null if [key] isn't a literal-character encoding (see keys' own doc on
+ *  KeymapEntry) - callers (MainActivity's keymap-trigger parsing) check
+ *  VirtualKey.valueOf first and fall back to this for anything that isn't
+ *  a named key. Public so that parsing, which lives in MainActivity.kt
+ *  rather than here, can decode the same encoding this file produces. */
+fun literalCharOf(key: String): Char? =
+    if (key.startsWith(LITERAL_KEY_PREFIX) && key.length == LITERAL_KEY_PREFIX.length + 1) {
+        key[LITERAL_KEY_PREFIX.length]
+    } else null
+
+private val NAMED_KEY_OPTIONS = listOf(
     "ESC", "TAB", "CTRL", "ALT", "SLASH", "DASH",
     "HOME", "END", "PGUP", "PGDN", "UP", "DOWN", "LEFT", "RIGHT", "INSERT"
 )
+private val LETTER_KEY_OPTIONS = ('a'..'z').map { literalKey(it) }
+private val DIGIT_KEY_OPTIONS = ('0'..'9').map { literalKey(it) }
 
 fun decodeKeymaps(json: String): List<KeymapEntry> {
     if (json.isBlank()) return emptyList()
@@ -199,9 +231,18 @@ private fun TerminalKeysTab() {
                     ListItem(
                         headlineContent = { Text(entry.name) },
                         supportingContent = {
+                            // Same "CTRL + C" style formatting as
+                            // KeymapEditor's own preview line above -
+                            // previously raw entry.keys.joinToString(" + ")
+                            // printed the literal storage encoding verbatim
+                            // (e.g. "CTRL + CHAR:c"), which is what the
+                            // saved-shortcuts list on this screen was still
+                            // showing even after the editor's own preview
+                            // got fixed. Display-only, same as there.
                             Text(
-                                entry.keys.joinToString(" + ") +
-                                    if (entry.repeatOnHold) "  •  hold to repeat" else ""
+                                entry.keys.joinToString(" + ") { key ->
+                                    literalCharOf(key)?.toString()?.uppercase() ?: key
+                                } + if (entry.repeatOnHold) "  •  hold to repeat" else ""
                             )
                         },
                         trailingContent = {
@@ -237,7 +278,14 @@ private fun KeymapEditor(
     onSave: (KeymapEntry) -> Unit
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
-    var selectedKeys by remember { mutableStateOf(initial?.keys?.toSet() ?: emptySet()) }
+    // Ordered now (was a Set) so CTRL/ALT-then-char sequencing survives
+    // editing - see KeymapEntry.keys' own doc on why order matters for
+    // literal-character combos like Ctrl+C. toMutableStateList so
+    // appends/removes below trigger recomposition without a full
+    // reassignment each time.
+    val selectedKeys = remember {
+        (initial?.keys ?: emptyList()).toMutableStateList()
+    }
     var repeatOnHold by remember { mutableStateOf(initial?.repeatOnHold ?: false) }
 
     Scaffold(
@@ -279,7 +327,22 @@ private fun KeymapEditor(
             }
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
+        // verticalScroll added: this column holds the Name field plus the
+        // Named Keys, Letters (26 chips) and Digits (10 chips) FlowRows -
+        // on anything but a tall screen that content overflows past the
+        // Scaffold's bottomBar with nothing to scroll it into view (a
+        // plain fillMaxSize() Column doesn't scroll on its own), which is
+        // what made the Digits row - and the bottom of Letters - visually
+        // unreachable: no amount of swiping moved it, because there was no
+        // scroll container to swipe. This was independent of the label
+        // font-size legibility issue above.
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
@@ -291,26 +354,127 @@ private fun KeymapEditor(
             Spacer(modifier = Modifier.height(20.dp))
             Text("Key shortcut", style = MaterialTheme.typography.labelLarge)
             Text(
-                "Pick the keys this shortcut sends to the terminal.",
+                "Pick the keys this shortcut sends to the terminal. Order matters: CTRL/ALT apply to whichever key or character comes right after them, e.g. CTRL then \"c\" sends Ctrl+C.",
                 style = MaterialTheme.typography.bodySmall
             )
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Named control keys (ESC, CTRL, arrows, etc.) - unchanged
+            // set/order from before, still the primary keys shown first.
             androidx.compose.foundation.layout.FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                ALL_KEY_OPTIONS.forEach { key ->
+                NAMED_KEY_OPTIONS.forEach { key ->
                     FilterChip(
                         selected = key in selectedKeys,
                         onClick = {
-                            selectedKeys = if (key in selectedKeys) {
-                                selectedKeys - key
-                            } else {
-                                selectedKeys + key
-                            }
+                            // Appended at the end on select (not removed/
+                            // reinserted in fixed order) so order reflects
+                            // tap order - that's what makes CTRL-then-char
+                            // sequencing work (see KeymapEntry.keys' own
+                            // doc). Removes every occurrence on deselect.
+                            if (key in selectedKeys) selectedKeys.removeAll { it == key }
+                            else selectedKeys.add(key)
                         },
                         label = { Text(key) }
                     )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                "Letters",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            androidx.compose.foundation.layout.FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                LETTER_KEY_OPTIONS.forEach { key ->
+                    FilterChip(
+                        selected = key in selectedKeys,
+                        onClick = {
+                            if (key in selectedKeys) selectedKeys.removeAll { it == key }
+                            else selectedKeys.add(key)
+                        },
+                        // literalCharOf never returns null here - every
+                        // entry in LETTER_KEY_OPTIONS was built by
+                        // literalKey() above - just showing the bare
+                        // letter ("a") instead of the raw "CHAR:a" storage
+                        // encoding (see literalCharOf's own doc). Shown
+                        // uppercase + bold + at a larger size than
+                        // FilterChip's default label text (which reads as
+                        // tiny/low-contrast in a dense 26-chip grid,
+                        // reported as unreadable/hard to tap correctly) -
+                        // this is a display-only transform, the stored
+                        // encoding and the actual byte sent both stay the
+                        // original lowercase char untouched.
+                        label = {
+                            Text(
+                                literalCharOf(key).toString().uppercase(),
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                "Digits",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            androidx.compose.foundation.layout.FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DIGIT_KEY_OPTIONS.forEach { key ->
+                    FilterChip(
+                        selected = key in selectedKeys,
+                        onClick = {
+                            if (key in selectedKeys) selectedKeys.removeAll { it == key }
+                            else selectedKeys.add(key)
+                        },
+                        // Same large/bold treatment as the letter chips
+                        // above, for the same legibility reason (digits
+                        // have no uppercase/lowercase distinction so no
+                        // .uppercase() call is needed here).
+                        label = {
+                            Text(
+                                literalCharOf(key).toString(),
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+            // The sequence as it'll actually be saved/sent, in order -
+            // shown as a plain "CTRL + C" style combo string (named keys
+            // as-is, literal chars uppercased with no quotes) instead of
+            // the old quoted-lowercase "CTRL + "c"" - that read like a
+            // literal typed character rather than a keyboard shortcut.
+            // Display-only: the stored KeymapEntry.keys list and the byte
+            // actually sent both keep the original literal char untouched
+            // (still lowercase "c" via literalKey/literalCharOf above) -
+            // only this preview line's text changes. Chip grids above
+            // (Letters/Digits FilterChips) are untouched by this change.
+            if (selectedKeys.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    selectedKeys.joinToString(" + ") { key ->
+                        literalCharOf(key)?.toString()?.uppercase() ?: key
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                TextButton(onClick = { selectedKeys.removeLastOrNull() }) {
+                    Text("Remove last")
                 }
             }
 

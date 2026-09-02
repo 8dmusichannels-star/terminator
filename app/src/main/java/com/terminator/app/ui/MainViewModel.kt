@@ -1356,6 +1356,15 @@ class MainViewModel(
     fun activeSessionWantsMouseEvents(): Boolean =
         liveSessions[_uiState.value.activeSessionId]?.emulator?.mouseMode != TerminalEmulator.MouseMode.NONE
 
+    /** True only when the active session has requested ANY_EVENT (DECSET
+     *  1003) - the one mouse mode that reports plain hover MOVE with no
+     *  button held (used by htop/mc to highlight under the cursor). Kept
+     *  separate from [activeSessionWantsMouseEvents] because 1000/1002
+     *  want press/drag/release but explicitly do NOT want a MOVE flood
+     *  from a real mouse just sitting still and being nudged around. */
+    fun activeSessionWantsMouseMoveEvents(): Boolean =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.mouseMode == TerminalEmulator.MouseMode.ANY_EVENT
+
     /** Whether the running program has switched the terminal into
      *  "application cursor keys" mode (DECCKM, CSI ?1h) - e.g. nano/vim via
      *  ncurses' keypad(TRUE). While active, arrow/home/end keys need to be
@@ -1379,6 +1388,12 @@ class MainViewModel(
      *  even ask whether its session wanted mouse events. */
     fun sessionWantsMouseEvents(runtimeId: String): Boolean =
         liveSessions[runtimeId]?.emulator?.mouseMode != TerminalEmulator.MouseMode.NONE
+
+    /** Same as [activeSessionWantsMouseMoveEvents], but for an arbitrary
+     *  runtimeId - see [sessionWantsMouseEvents]'s doc for why the split
+     *  pane needs its own per-runtimeId variant. */
+    fun sessionWantsMouseMoveEvents(runtimeId: String): Boolean =
+        liveSessions[runtimeId]?.emulator?.mouseMode == TerminalEmulator.MouseMode.ANY_EVENT
 
     /** Same as [sendMouseEvent], but targets an arbitrary runtimeId - see
      *  [sessionWantsMouseEvents]'s doc for why the split pane needs this

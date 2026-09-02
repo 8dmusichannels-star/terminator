@@ -1,39 +1,43 @@
 # Changelog
 
-## 🚀 [`451b245`](https://github.com/8dmusichannels-star/terminator/commit/451b245) — Selection Refactoring & Scrollback Fix
+## 🚀 Latest Updates
 
-- 🧠 Reworked terminal text selection with a custom selection state.
-- 📜 Fixed selection issues while scrolling through scrollback.
-- 🖱️ Improved selection handle dragging and positioning.
-- 🎯 Fixed incorrect selection row mapping.
-- 🔄 Improved selection synchronization during scrolling and edge auto-scroll.
-- ⏸️ Fixed selection loss during pause/resume drag.
-- ⌨️ Prevented handle dragging from accidentally toggling the keyboard.
-- 🪟 Improved selection across primary, split, and multi-pane terminals.
-- 🎨 Updated selection highlight and handle styling.
-- 📋 Updated copy handling for the new selection model.
+### [`5cb3c35`](https://github.com/8dmusichannels-star/terminator/commit/5cb3c35) — Environment, Keymapper & Split-Screen Improvements
 
-**Stats:** `5 files changed` · `+1,209 / -405`
+- 🛠️ **Environment override** support improved.
+  - Added and updated handling for `PATH`, `HOME`, `TERM`, `TMPDIR`, and `TERMINFO`.
+- ⌨️ **Keymapper** improvements.
+  - Added hold/repeat support for `ALL_KEY_OPTIONS`.
+  - Improved literal string processing.
+- 🖥️ **Split-screen** handling improved.
+  - Updated `CTRL+D` behavior.
+  - Added special handling for `SIGKILL`.
+  - Added `sendtoscreenkill` with **SIGKILL-aware path handling**.
+  - Fixed bugs related to process termination and split-screen handling.
+- 🐛 Improved terminal process and session stability.
 
-🔗 **Commit:** [`451b245`](https://github.com/8dmusichannels-star/terminator/commit/451b245)
+### [`15fa409`](https://github.com/8dmusichannels-star/terminator/commit/15fa409) — XTerm Mouse & Touch Improvements
 
----
-
-## 🔔 [`6f6d924`](https://github.com/8dmusichannels-star/terminator/commit/6f6d924) — Status Bar Notification Icon Update
-
-- 🎨 Redesigned the notification/status-bar icon.
-- 🌈 Added theme-aware icon coloring.
-- 📱 Improved Android notification appearance.
-- 🖥️ Updated the terminal notification vector drawable.
-
-**Stats:** `1 file changed` · `+116 / -4`
-
-🔗 **Commit:** [`6f6d924`](https://github.com/8dmusichannels-star/terminator/commit/6f6d924)
+- 🖱️ Improved **XTerm mouse reporting**.
+- 👆 Improved touch and mouse gesture handling.
+- 🖱️ Fixed and improved **physical mouse** input behavior.
+- 🔄 Improved mouse event processing and reporting consistency.
+- 🐛 Fixed several mouse interaction and gesture-related bugs.
 
 ---
 
-## 📦 Repository
+## 📋 Summary
 
-🔗 **[8dmusichannels-star/terminator](https://github.com/8dmusichannels-star/terminator)**
+This update focuses on improving:
 
+- 🛠️ Terminal environment and process handling
+- ⌨️ Keymapper, hold/repeat, and literal string processing
+- 🖥️ Split-screen and `SIGKILL` handling
+- 🖱️ XTerm mouse, touch gestures, and physical mouse support
+- 🐛 Stability, reliability, and bug fixes
 
+---
+
+## 🔗 Repository
+
+[**8dmusichannels-star/terminator**](https://github.com/8dmusichannels-star/terminator)
