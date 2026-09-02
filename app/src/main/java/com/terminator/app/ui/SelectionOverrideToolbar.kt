@@ -273,8 +273,25 @@ fun SelectionActionBar(
             content = barContent,
         )
     } else {
+        // Same window-clamp reasoning as MoreActionsPopup's own switch
+        // away from the alignment overload (see WindowClampedPositionProvider's
+        // doc) - this branch only
+        // runs when a caller doesn't pass pixel bounds (none of
+        // MainActivity/SplitTerminalPane/MultiPaneContainer's call sites
+        // currently hit it, they all pass handleTopPx/handleBottomPx/
+        // rowHeightPx), but a future caller that doesn't wire those up
+        // shouldn't regress back to the same off-screen-overflow bug this
+        // whole fix is for. handleRow's Top/Bottom choice is preserved by
+        // picking which anchor edge (top vs bottom) the provider centers
+        // against before the window-clamp is applied.
         Popup(
-            alignment = if (handleRow <= nearTopRowThreshold) Alignment.BottomCenter else Alignment.TopCenter,
+            popupPositionProvider = remember(handleRow) {
+                if (handleRow <= nearTopRowThreshold) {
+                    WindowClampedPositionProvider(Alignment.BottomCenter)
+                } else {
+                    WindowClampedPositionProvider(Alignment.TopCenter)
+                }
+            },
             properties = PopupProperties(focusable = false),
             content = barContent,
         )
@@ -359,7 +376,27 @@ private class HandleClearingPositionProvider(
         // narrow pane.
         val minX = anchorBounds.left
         val maxX = maxOf(minX, anchorBounds.right - popupContentSize.width)
-        val x = (boxCenterX - popupContentSize.width / 2).coerceIn(minX, maxX)
+        var x = (boxCenterX - popupContentSize.width / 2).coerceIn(minX, maxX)
+        // Second clamp pass, against windowSize rather than anchorBounds -
+        // "Terminal ekranin disina cikmiycak". The anchorBounds-only clamp
+        // above is enough on the primary pane (its own Box already spans
+        // the full window width), but on a narrow split/multi-pane tile
+        // anchorBounds itself can be narrower than the popup content
+        // (a Copy+Paste+More pill doesn't shrink to fit a small tile), so
+        // minX/maxX above can both sit past the tile's own edge while
+        // still being nowhere near the window's actual edge - the bar
+        // then renders centered on the tile but overflowing past the
+        // window boundary on one or both sides, since Compose's Popup does
+        // not itself clip content to the window. Re-clamping x against
+        // [0, windowSize.width - popupContentSize.width] after the
+        // anchor-relative pass guarantees the bar's own rect never exits
+        // the actual screen, regardless of how narrow the anchoring pane
+        // is - same "clamp toward the edge it's already against, don't
+        // undo the barrier flip" spirit as the y computation above, just
+        // for the window boundary instead of the handle exclusion zone.
+        val minWindowX = 0
+        val maxWindowX = maxOf(minWindowX, windowSize.width - popupContentSize.width)
+        x = x.coerceIn(minWindowX, maxWindowX)
         // Deliberately NOT a single coerceIn(anchorBounds.top,
         // anchorBounds.bottom - popupHeight) here - that would clamp the
         // "below" branch's y back UP whenever handleBottomWindow + margin
@@ -372,7 +409,82 @@ private class HandleClearingPositionProvider(
         // so the worst case on a too-short pane is the bar clipping
         // against that edge while still staying fully outside the
         // handle's own rect, never sliding back across it.
-        return IntOffset(x, y.toInt())
+        //
+        // Final window-bound clamp on y, same reasoning as the x pass
+        // above: the handle-relative branches only ever reason about the
+        // handle's own barrier and anchorBounds.top, never about the
+        // window's bottom edge or (on a pane that isn't flush against the
+        // window top, e.g. a floating multi-pane tile) the window's top
+        // edge either. Clamping the chosen y into
+        // [0, anchorBounds.bottom - popupHeight] after the fact keeps the
+        // bar from clipping off the top of the window, or spilling past
+        // the bottom of its own anchor Box, without touching which branch
+        // (above/below the handle) was picked.
+        // Was windowSize.height here, same as the x-pass above - but unlike x,
+        // the y bottom bound can't just be "the real screen edge": VirtualKeyBar
+        // (and, above it, KeymapperRow) render as a sibling BELOW this popup's
+        // anchor Box, inside the same outer Column, so anchorBounds.bottom
+        // already sits exactly on top of them - VirtualKeyBar/KeymapperRow are
+        // simply outside anchorBounds entirely. windowSize.height, however, is
+        // the full window/screen height and includes that space underneath
+        // anchorBounds, so clamping against it let the "below the handle"
+        // branch (handleBottomWindow + margin) drop the bar down past
+        // anchorBounds.bottom and straight into VirtualKeyBar's own rows
+        // ("Copy Paste More menusu bazen virtual key bar'in ustune biniyor").
+        // anchorBounds.bottom is the correct barrier here, not the window edge.
+        val minWindowY = 0f
+        val maxWindowY = maxOf(minWindowY, anchorBounds.bottom - popupHeight)
+        val clampedY = y.coerceIn(minWindowY, maxWindowY)
+        return IntOffset(x, clampedY.toInt())
+    }
+}
+/**
+ * Same "top-center of the anchor, but never past the actual window edge"
+ * placement MoreActionsPopup always used (previously via the plain
+ * alignment = Alignment.TopCenter Popup overload, which centers against
+ * the anchor Box only and has no window-clamp hook at all) - see that
+ * call site's own doc for why a fixed-width popup centered on a narrow
+ * split/multi-pane tile can overflow past the real screen edge. Unlike
+ * HandleClearingPositionProvider above, this has no handle-exclusion zone
+ * to honor - so vertical placement is just the anchor's own top or bottom
+ * edge (matching whichever Alignment the caller would otherwise have
+ * passed straight to Popup's alignment overload), clamped into the window
+ * the same way HandleClearingPositionProvider's own final y-clamp works,
+ * and horizontal is always the anchor's own center, clamped the same way
+ * its final x-clamp works. Also reused by SelectionActionBar's own
+ * no-pixel-bounds fallback branch (see that call site) for the same
+ * TopCenter/BottomCenter choice it used to hand straight to the alignment
+ * overload.
+ */
+private class WindowClampedPositionProvider(
+    private val alignment: Alignment,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+        popupContentSize: IntSize,
+    ): IntOffset {
+        val boxCenterX = anchorBounds.left + (anchorBounds.right - anchorBounds.left) / 2
+        var x = boxCenterX - popupContentSize.width / 2
+        val minWindowX = 0
+        val maxWindowX = maxOf(minWindowX, windowSize.width - popupContentSize.width)
+        x = x.coerceIn(minWindowX, maxWindowX)
+        var y = if (alignment == Alignment.BottomCenter) {
+            anchorBounds.bottom - popupContentSize.height
+        } else {
+            anchorBounds.top
+        }
+        // Same anchorBounds.bottom barrier as HandleClearingPositionProvider's
+        // own y-clamp above (see its doc) - MoreActionsPopup's TopCenter case
+        // never hits this since it clamps against anchorBounds.top instead, but
+        // the BottomCenter case (near-top selections, see SelectionActionBar's
+        // fallback branch) has the exact same VirtualKeyBar-is-outside-anchorBounds
+        // issue windowSize.height doesn't know about.
+        val minWindowY = 0
+        val maxWindowY = maxOf(minWindowY, anchorBounds.bottom - popupContentSize.height)
+        y = y.coerceIn(minWindowY, maxWindowY)
+        return IntOffset(x, y)
     }
 }
 @Composable
@@ -468,7 +580,22 @@ fun MoreActionsPopup(
 ) {
     if (!visible) return
     Popup(
-        alignment = Alignment.TopCenter,
+        // Was alignment = Alignment.TopCenter - Compose's alignment-based
+        // Popup overload only ever centers against the anchor Box (same
+        // "narrow split/multi-pane tile" issue SelectionActionBar's own
+        // HandleClearingPositionProvider doc covers), never against the
+        // actual window, and Compose's Popup does not itself clip content
+        // to the window - so this 220.dp-wide menu could render centered
+        // on a tile narrower than itself and overflow past the real screen
+        // edge on a narrow pane ("Terminal ekranin disina cikmiycak" - same
+        // complaint, same root cause, this call site just hadn't been
+        // switched over yet). A popupPositionProvider is required to get a
+        // window-clamp in at all - the alignment overload has no hook for
+        // one - so this switches to WindowClampedPositionProvider(TopCenter),
+        // which keeps the same "top-center of the anchor" placement this
+        // call site always used and only ADDS the final clamp into
+        // [0, windowSize] on both axes.
+        popupPositionProvider = remember { WindowClampedPositionProvider(Alignment.TopCenter) },
         properties = PopupProperties(focusable = true),
         onDismissRequest = onDismiss
     ) {
