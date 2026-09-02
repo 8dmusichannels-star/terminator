@@ -155,7 +155,28 @@ Java_com_terminator_emulator_NativePty_createSubprocess(
         close(masterFd);
 
         if (cwd != NULL && chdir(cwd) != 0) {
-            // Fall back silently to the process's default working directory.
+            // Surface the failure on the pty (see below for why this used
+            // to be silent) but DON'T _exit(127) here. A "Settings >
+            // Sessions > entry path" pointed at a proot/chroot target is
+            // the common case that hits this: the path is only meaningful
+            // INSIDE the guest rootfs the command is about to enter (e.g.
+            // proot's own -w, or a path under a rootfs directory that
+            // doesn't exist as a real path on the host filesystem at all)
+            // and was never expected to chdir() on the host side. Bailing
+            // out here killed the session before the command even ran,
+            // which is worse than the original silent-fallback bug this
+            // was meant to fix - it turned "entry path is a no-op for
+            // proot/chroot" into "proot/chroot sessions don't start at
+            // all". Warn and fall through to exec from whatever cwd we're
+            // already in instead, same as the pre-fail-loud behavior,
+            // so proot/chroot's own working-directory handling (its -w
+            // flag, or whatever the launch script does once inside) is
+            // still free to take over from there.
+            char message[256];
+            snprintf(message, sizeof(message),
+                      "terminator: chdir failed for %s: %s (continuing anyway)\r\n",
+                      cwd, strerror(errno));
+            write(STDOUT_FILENO, message, strlen(message));
         }
 
         signal(SIGPIPE, SIG_DFL);
