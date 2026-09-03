@@ -32,7 +32,6 @@
 - 🛡️ Clone-session crash fix
 - ⌨️ IME & virtual-keybar fixes
 
-**7 commits · 26 tracked changes**
 
 We happily announce that **Terminator** is now out of beta and is now a stable release!
 
