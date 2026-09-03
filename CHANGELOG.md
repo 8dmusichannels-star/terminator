@@ -1,13 +1,6 @@
 # Changelog
 
-## 🚀 1.2.6
-
-### 🖥️ Native PTY & Terminal
-- [`378b00b`](https://github.com/8dmusichannels-star/terminator/commit/378b00b) — Added native PTY pixel-size support with `pixelWidth`, `pixelHeight`, `ws_pixel` and `ws_ypixel`.
-- Added `lastAppliedColumns` / `lastAppliedRows` guards to avoid redundant terminal resizing.
-- Skips PTY `ioctl` / `SIGWINCH` when rows and columns are unchanged.
-- `resize()` now accepts optional `pixelWidth` / `pixelHeight`.
-- PTY subprocess startup now initializes pixel dimensions correctly.
+## 🚀 1.1.7
 
 ### 📋 Selection & UI
 - [`753bf77`](https://github.com/8dmusichannels-star/terminator/commit/753bf77) — Improved selection toolbar window clamping.
