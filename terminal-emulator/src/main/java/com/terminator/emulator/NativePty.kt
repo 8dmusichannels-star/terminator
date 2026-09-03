@@ -56,11 +56,27 @@ object NativePty {
         // needs. When true, pty.c spawns the child via a raw, minimal
         // syscall(SYS_clone, SIGCHLD, ...) instead of fork(), which avoids
         // the flags those policies filter.
-        seccompWorkaround: Boolean
+        seccompWorkaround: Boolean,
+        // Pixel dimensions of the terminal view at spawn time, forwarded to
+        // ws_xpixel/ws_ypixel (see pty.c). Pass 0/0 if unknown - matches the
+        // old always-zero behavior. external fun can't have default
+        // parameter values, so callers that don't care must pass 0/0
+        // explicitly (TerminalSession's own resize()/start() wrappers do
+        // this for you).
+        pixelWidth: Int,
+        pixelHeight: Int
     ): Int
 
     @JvmStatic
-    external fun setWindowSize(fd: Int, rows: Int, cols: Int)
+    external fun setWindowSize(
+        fd: Int,
+        rows: Int,
+        cols: Int,
+        // See createSubprocess's identical params - forwarded to
+        // ws_xpixel/ws_ypixel. Pass 0/0 if the caller doesn't know/care.
+        pixelWidth: Int,
+        pixelHeight: Int
+    )
 
     @JvmStatic
     external fun waitFor(pid: Int): Int

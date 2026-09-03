@@ -40,9 +40,16 @@ data class SessionEntry(
     // FILE_BASE
     val filePath: String? = null,
     val fileName: String? = null,
-    // Directory the spawned process starts in (its cwd / $HOME). Null
-    // falls back to whatever TerminalSession.start() already used before
-    // this existed - the session's own per-session history directory.
+    // Directory the spawned process starts in (its cwd / $HOME). Applies to
+    // both COMMAND_ARG and FILE_BASE sessions. Null falls back to this
+    // session's own per-session history directory. Host-side only: the
+    // chdir() this feeds (NativePty, see pty.c) runs before exec, so it has
+    // no effect on a path that's only meaningful INSIDE a proot/chroot
+    // guest the command hasn't entered yet - a plain Android shell (the
+    // common case this field is for) always has a real host path here, so
+    // that limitation doesn't come up. For proot/chroot, use the tool's own
+    // --cwd/-w instead (see this field's doc at its NativePty.createSubprocess
+    // call site in TerminalSession.start()).
     val workingDirectory: String? = null,
     val useRoot: Boolean = false,
     val isFavorite: Boolean = false,

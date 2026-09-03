@@ -21,6 +21,8 @@
 package com.terminator.emulator
 
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import java.io.File
 import java.io.FileInputStream
@@ -113,10 +115,37 @@ class TerminalSession(
     // "exited" state on the session that just went away.
     @Volatile private var exited = false
     private var exitListener: (() -> Unit)? = null
+    // markExited() itself can run on the pty reader thread (natural EOF,
+    // via the finally block in start()'s reader Thread) OR synchronously
+    // on whatever thread called kill()/destroy() - the UI thread, in
+    // practice. exitListener ultimately mutates MainViewModel's
+    // liveSessions/liveEntries maps (plain, non-thread-safe mutableMapOf)
+    // and _uiState. If session A's reader thread fires this at the same
+    // moment the UI thread is inside launchLiveSession() for a brand new
+    // session B - Ctrl+D dismissing A and immediately opening a new
+    // session, or tapping Clone on a row while some OTHER session's
+    // process happens to be dying in the background - both threads are
+    // mutating those same maps concurrently, corrupting them and crashing
+    // (this is the "new session after Ctrl+D" and "Clone crashes if
+    // another session was killed" bugs). Posting to the main looper
+    // serializes every exitListener invocation with all of
+    // MainViewModel's own map/state mutations, which only ever happen on
+    // the UI thread.
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     val buffer = TerminalBuffer(columns = 80, rows = 24)
     lateinit var emulator: TerminalEmulator
         private set
+
+    // Last cols/rows actually pushed to the pty via ioctl(TIOCSWINSZ).
+    // resize() below skips the native call (and the SIGWINCH it triggers)
+    // when the new size matches this exactly - e.g. a recomposition that
+    // re-reports the same measured size, or two resize sources agreeing on
+    // the same target. buffer.resize()/onBufferResized() still always run
+    // so the in-app grid stays correct either way; this guard only saves
+    // the redundant kernel round-trip + full-screen-program redraw.
+    private var lastAppliedColumns = -1
+    private var lastAppliedRows = -1
 
     /** Registers a callback fired exactly once, when the session's process
      *  is first detected as no longer running (natural exit or kill). */
@@ -133,11 +162,27 @@ class TerminalSession(
             is SessionSpec.FileBase -> spec.resolvedPath()
         }
 
-        val argv = if (useRoot) arrayOf("su", "-c", executablePath) else arrayOf(executablePath)
-        // A configured working directory (Settings > Sessions > entry path)
-        // takes priority; otherwise fall back to this session's own
-        // per-session history directory, same as before this field existed.
+        // This session's own per-session history directory is the fallback;
+        // "Settings > Sessions > entry path" (workingDirectory), when set,
+        // takes priority. Applies to both COMMAND_ARG and FILE_BASE.
+        //
+        // HOST-SIDE ONLY: this feeds NativePty.createSubprocess's chdir(cwd)
+        // (see pty.c), which runs before exec - i.e. before the command has
+        // done anything of its own. For a plain Android shell that's exactly
+        // right, since the configured path is a real host directory. It does
+        // NOT work for a path that's only meaningful INSIDE a proot/chroot
+        // guest the command hasn't entered yet (that chdir() silently no-ops
+        // there - see pty.c's own best-effort handling). Wrapping the whole
+        // command line in an extra shell to smuggle the cd through used to
+        // exist here for that case, but it added its own writes to the pty
+        // stream ahead of the real program's, producing a transient
+        // garbled/black-screen flash - removed for good. proot/chroot users
+        // should point their own tool's --cwd/-w (or the guest script's own
+        // cd) at the guest path instead; this field only ever controls the
+        // HOST cwd the command starts from.
         val cwd = spec.workingDirectory?.takeIf { it.isNotBlank() } ?: historyFile.parentFile?.absolutePath
+
+        val argv = if (useRoot) arrayOf("su", "-c", executablePath) else arrayOf(executablePath)
         val envp = buildEnvironment(cwd)
         val pidOut = IntArray(1)
 
@@ -150,7 +195,13 @@ class TerminalSession(
                 pidOut = pidOut,
                 rows = rows,
                 cols = columns,
-                seccompWorkaround = seccompWorkaround
+                seccompWorkaround = seccompWorkaround,
+                // Pixel size isn't known yet at spawn time (the view hasn't
+                // been measured before the session starts) - the first real
+                // resize() call right after layout fills ws_xpixel/ws_ypixel
+                // in properly.
+                pixelWidth = 0,
+                pixelHeight = 0
             )
         } catch (e: IOException) {
             throw IOException("Unable to start session: $executablePath", e)
@@ -268,13 +319,29 @@ class TerminalSession(
         write(seq)
     }
 
-    fun resize(columns: Int, rows: Int) {
+    /**
+     * [pixelWidth]/[pixelHeight] are the terminal view's on-screen size in
+     * pixels (ws_xpixel/ws_ypixel) - optional, default 0/0 for callers that
+     * only have cols/rows. Programs that trust the kernel's pixel size over
+     * cols*font-width (mouse-pixel reporting, sixel/image output, some
+     * ncurses builds) need these to be non-zero to lay out correctly;
+     * everything else ignores them.
+     */
+    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         buffer.resize(columns, rows)
         if (::emulator.isInitialized) {
             emulator.onBufferResized()
         }
-        if (masterFd >= 0) {
-            NativePty.setWindowSize(masterFd, rows, columns)
+        // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
+        // whatever's running) when cols/rows haven't actually changed - see
+        // lastAppliedColumns/Rows's own doc. Pixel size alone changing with
+        // the same cols/rows (e.g. font metrics settling a frame later)
+        // isn't worth a second kernel round-trip either; the next real
+        // cols/rows change will carry the corrected pixel size along.
+        if (masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
+            NativePty.setWindowSize(masterFd, rows, columns, pixelWidth, pixelHeight)
+            lastAppliedColumns = columns
+            lastAppliedRows = rows
         }
     }
 
@@ -382,7 +449,18 @@ class TerminalSession(
             emulator.append(message)
             appendHistory(message)
         }
-        exitListener?.invoke()
+        // See mainHandler's doc above - this MUST NOT invoke exitListener
+        // directly from whatever thread markExited() itself is running on.
+        // If already on the main thread (kill()/destroy() called from UI
+        // code), Handler.post still defers to the next looper iteration
+        // rather than running inline - that's fine and in fact necessary:
+        // it keeps this always-async, so callers on the UI thread can't
+        // accidentally come to depend on the listener having already run
+        // by the time markExited() returns.
+        val listener = exitListener
+        if (listener != null) {
+            mainHandler.post { listener.invoke() }
+        }
     }
 
     private companion object {

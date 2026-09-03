@@ -1194,6 +1194,7 @@ class MainActivity : ComponentActivity() {
                                     fontFamily = terminalTypeface,
                                     fontSizeSp = textSize,
                                     zoomEnabled = zoomEnabled,
+                                    softKeyboardEnabled = softKeyboardEnabled,
                                     onInput = { runtimeId, text ->
                                         // Same missing-transform bug as the split pane's onInput
                                         // (see its own doc): this tile's HiddenPaneInputField
@@ -2458,7 +2459,38 @@ class MainActivity : ComponentActivity() {
                                     // SelectionOverrideToolbar.kt's top doc for why this is a
                                     // Compose popup driven off actionModeController's state
                                     // rather than a native ActionMode/TextToolbar bubble.
-                                    SelectionActionBar(actionModeController)
+                                    SelectionActionBar(
+                                        actionModeController,
+                                        // focusRow is always the handle actively being
+                                        // dragged right now (see SelectionActionBar's own
+                                        // doc) - using it, not minOf(anchor, focus), is
+                                        // what lets the bar flip back to TopCenter once
+                                        // the dragged handle moves away from the top,
+                                        // even if the OTHER (fixed/anchor) end is still
+                                        // sitting near row 0.
+                                        handleRow = selectionState.focusRow,
+                                        // Hide the bar entirely for as long as a handle
+                                        // is actually being held/dragged, so it doesn't
+                                        // flicker between TopCenter/BottomCenter (and
+                                        // potentially sit under the handle for a frame)
+                                        // while the user is mid-drag - it reappears at
+                                        // its settled position the instant the drag ends.
+                                        hideWhileDragging = selectionState.draggingHandle,
+                                        // Real pixel bounds of the actively-dragged
+                                        // handle's row, in the same coordinate space as
+                                        // the Box this popup is anchored in (TerminalView
+                                        // fills that Box top-aligned, so row * charHeight
+                                        // is the handle row's own top edge). Passing these
+                                        // switches SelectionActionBar from the old fixed
+                                        // Top/Bottom-of-pane alignment to positioning
+                                        // computed directly off the handle's real
+                                        // location, so the bar can never spawn overlapping
+                                        // it regardless of where mid-screen the selection
+                                        // sits - see HandleClearingPositionProvider's doc.
+                                        handleTopPx = selectionState.focusRow * latestCharMetrics.value.second,
+                                        handleBottomPx = (selectionState.focusRow + 1) * latestCharMetrics.value.second,
+                                        rowHeightPx = latestCharMetrics.value.second,
+                                    )
 
                                     // Invisible field that actually captures IME input and
                                     // forwards it to the active session, one keystroke at a time.
@@ -2652,11 +2684,23 @@ class MainActivity : ComponentActivity() {
                                             // state actually depends on staying alive) no longer
                                             // resets at all here - see the growth-cap effect below for
                                             // the only other place a reset can happen.
-                                            hiddenInput = new.copy(
-                                                text = if (consumedBaseline == inputPlaceholder) inputPlaceholder else newText,
-                                                selection = if (consumedBaseline == inputPlaceholder)
-                                                    TextRange(inputPlaceholder.length) else new.selection
-                                            )
+                                            //
+                                            // Explicitly constructs a fresh TextFieldValue (composition
+                                            // defaults to null) rather than new.copy(...) whenever
+                                            // resetting to the bare placeholder, instead of carrying
+                                            // new.composition forward - see MultiPaneContainer's
+                                            // HiddenPaneInputField, which had the identical bug: copy()
+                                            // let the IME's own active composing region survive a reset
+                                            // it should have been told about, so the IME's next edit
+                                            // (often an emoji-panel commit, which many keyboards send
+                                            // as two separate InputConnection calls) computed against
+                                            // stale composing state and landed as something other than
+                                            // the emoji - "emoji basmak olmuyor, bosluk basiyor".
+                                            hiddenInput = if (consumedBaseline == inputPlaceholder) {
+                                                TextFieldValue(inputPlaceholder, selection = TextRange(inputPlaceholder.length))
+                                            } else {
+                                                new.copy(text = newText, selection = new.selection)
+                                            }
                                         },
                                         modifier = Modifier
                                             .size(1.dp)
@@ -2798,6 +2842,7 @@ class MainActivity : ComponentActivity() {
                                         // the first place.
                                         fontSizeSp = state.sessionTextSizes[splitRuntimeId] ?: textSize,
                                         zoomEnabled = zoomEnabled,
+                                        softKeyboardEnabled = softKeyboardEnabled,
                                         onZoomTextSize = { newSize ->
                                             viewModel.setSessionTextSize(splitRuntimeId, newSize)
                                         },
@@ -2889,6 +2934,12 @@ class MainActivity : ComponentActivity() {
                                         onClose = { viewModel.setSplitSession(null) },
                                         onFocusChanged = { focused -> splitPaneFocused = focused },
                                         focusRequestSignal = splitFocusRequestSignal,
+                                        // See SplitTerminalPane's own doc on this param: the
+                                        // missing "you lost focus" half of the mirror. This is
+                                        // the same hiddenFieldFocused already set at the primary
+                                        // pane's own onFocusChanged above (line ~2710) - reusing
+                                        // it here rather than adding a new signal.
+                                        primaryPaneFocused = hiddenFieldFocused,
                                         wantsMouseEvents = { viewModel.sessionWantsMouseEvents(splitRuntimeId) },
                                         wantsMouseMoveEvents = { viewModel.sessionWantsMouseMoveEvents(splitRuntimeId) },
                                         onMouseEvent = { kind, col, row, button ->

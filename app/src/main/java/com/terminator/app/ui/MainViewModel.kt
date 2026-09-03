@@ -561,18 +561,30 @@ class MainViewModel(
         // update by at least one dispatch, and that deferral is exactly
         // what caused "Ctrl+D kills the session, then Enter does nothing":
         // killActiveSessionHard()/killSessionHard() call sendCtrlDOrKill()
-        // -> kill() -> markExited() -> this callback, all synchronously on
-        // the UI thread when the shell itself is in the foreground - so by
-        // the time markExited() returns, the exit is already real, but
-        // with launch{} _uiState.value hadn't been published yet. If the
+        // -> kill() -> markExited() -> this callback, all on the UI thread
+        // when the shell itself is in the foreground - so by the time
+        // markExited() returns, the exit is already real, but with
+        // launch{} _uiState.value hadn't been published yet. If the
         // user's next keystroke (Enter) landed before that queued
         // coroutine got to run, the activeIsExited/splitExited guards in
         // MainActivity read a stale exited=false and Enter's \r got
         // written into a pty whose fd kill() had already closed - silently
         // swallowed, looked like the app just stopped responding.
-        // MutableStateFlow.value's setter is a plain atomic CAS - safe to
-        // call from any thread, including the pty reader thread's
-        // natural-EOF path - so no dispatch is needed here.
+        // NOTE: this callback is ALWAYS invoked on the main thread -
+        // TerminalSession.markExited() posts it via a main-Looper Handler
+        // rather than calling it inline, specifically so this closure
+        // (and the plain, non-thread-safe liveSessions/liveEntries maps
+        // below) never runs concurrently with the UI thread's own
+        // mutation of that same state in launchLiveSession()/killSession()
+        // etc. It used to be invoked directly from whatever thread
+        // markExited() itself ran on (including the pty reader thread on
+        // natural EOF), which is what let one session's background exit
+        // race with the UI thread spawning/cloning another session and
+        // corrupt these maps - see TerminalSession.markExited()'s doc.
+        // Handler.post from the UI thread still defers to the next looper
+        // iteration rather than running inline, so the "no coroutine
+        // dispatch" ordering guarantee above still holds: this runs before
+        // any later UI-thread work, including the next keystroke.
         session.setOnExited {
             _uiState.value = _uiState.value.copy(
                 runningSessions = _uiState.value.runningSessions.map {

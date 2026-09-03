@@ -1,42 +1,47 @@
 # Changelog
 
-## 🚀 Latest Updates
+## 🚀 1.2.6
 
-### [`5cb3c35`](https://github.com/8dmusichannels-star/terminator/commit/5cb3c35) — Environment, Keymapper & Split-Screen Improvements
+### 🖥️ Native PTY & Terminal
+- [`378b00b`](https://github.com/8dmusichannels-star/terminator/commit/378b00b) — Added native PTY pixel-size support with `pixelWidth`, `pixelHeight`, `ws_pixel` and `ws_ypixel`.
+- Added `lastAppliedColumns` / `lastAppliedRows` guards to avoid redundant terminal resizing.
+- Skips PTY `ioctl` / `SIGWINCH` when rows and columns are unchanged.
+- `resize()` now accepts optional `pixelWidth` / `pixelHeight`.
+- PTY subprocess startup now initializes pixel dimensions correctly.
 
-- 🛠️ **Environment override** support improved.
-  - Added and updated handling for `PATH`, `HOME`, `TERM`, `TMPDIR`, and `TERMINFO`.
-- ⌨️ **Keymapper** improvements.
-  - Added hold/repeat support for `ALL_KEY_OPTIONS`.
-  - Improved literal string processing.
-- 🖥️ **Split-screen** handling improved.
-  - Updated `CTRL+D` behavior.
-  - Added special handling for `SIGKILL`.
-  - Added `sendtoscreenkill` with **SIGKILL-aware path handling**.
-  - Fixed bugs related to process termination and split-screen handling.
-- 🐛 Improved terminal process and session stability.
+### 📋 Selection & UI
+- [`753bf77`](https://github.com/8dmusichannels-star/terminator/commit/753bf77) — Improved selection toolbar window clamping.
+- Fixed terminal content escaping the selection toolbar bounds.
+- [`c23a813`](https://github.com/8dmusichannels-star/terminator/commit/c23a813) — Improved selection actionbar viewport positioning and automatic bottom-center anchoring.
+- Improved temporary selection-popup hiding.
 
-### [`15fa409`](https://github.com/8dmusichannels-star/terminator/commit/15fa409) — XTerm Mouse & Touch Improvements
+### 📂 Entry Path
+- [`7142a9b`](https://github.com/8dmusichannels-star/terminator/commit/7142a9b) — Improved entry-path host-side `chdir` override handling.
+- [`0f42735`](https://github.com/8dmusichannels-star/terminator/commit/0f42735) — Added failed-`chdir` reporting while allowing execution to continue.
 
-- 🖱️ Improved **XTerm mouse reporting**.
-- 👆 Improved touch and mouse gesture handling.
-- 🖱️ Fixed and improved **physical mouse** input behavior.
-- 🔄 Improved mouse event processing and reporting consistency.
-- 🐛 Fixed several mouse interaction and gesture-related bugs.
+### 🛡️ Stability
+- [`356d843`](https://github.com/8dmusichannels-star/terminator/commit/356d843) — Fixed cloned-app terminal-session crash.
 
----
+### ⌨️ IME & Keyboard
+- [`8b191d2`](https://github.com/8dmusichannels-star/terminator/commit/8b191d2) — Added tap-to-toggle IME support for multipanel containers.
+- Fixed unwanted IME opening from taps/presses.
+- Fixed IME opening when the panel is unfocused.
+- Improved `wantsKeyboard` and multipanel keyboard preferences. 
+- The transition touches `wantsKeyboard` never touches.
+- Fixed virtual-keybar swipe closing IME in long-text fields.
+- Improved floating-screen and virtual-keybar interactions.
 
-## 📋 Summary
+### 📊 Summary
+- ✨ Native PTY improvements
+- 📐 Pixel-aware terminal resizing
+- 📋 Selection UI fixes
+- 📂 `chdir` / entry-path improvements
+- 🛡️ Clone-session crash fix
+- ⌨️ IME & virtual-keybar fixes
 
-This update focuses on improving:
+**7 commits · 26 tracked changes**
 
-- 🛠️ Terminal environment and process handling
-- ⌨️ Keymapper, hold/repeat, and literal string processing
-- 🖥️ Split-screen and `SIGKILL` handling
-- 🖱️ XTerm mouse, touch gestures, and physical mouse support
-- 🐛 Stability, reliability, and bug fixes
-
----
+We happily announce that **Terminator** is now out of beta and is now a stable release!
 
 ## 🔗 Repository
 

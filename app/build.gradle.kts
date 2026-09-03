@@ -17,8 +17,8 @@ android {
         applicationId = "com.terminator.app"
         minSdk = 33
         targetSdk = 37
-        versionCode = 18
-        versionName = "0.9.7"
+        versionCode = 19
+        versionName = "1.1.7"
     }
     buildFeatures {
         compose = true

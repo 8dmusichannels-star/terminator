@@ -27,6 +27,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -233,6 +235,22 @@ fun SplitTerminalPane(
     // (any change from the caller's last value) re-triggers the same
     // focusToken bump / IME re-show a real re-tap into this pane would.
     focusRequestSignal: Int = 0,
+    // Ground truth for "did the PRIMARY pane's own hidden field just take
+    // real focus" (MainActivity's hiddenFieldFocused, mirrored down here) -
+    // the counterpart onFocusChanged above never had: this pane's own
+    // isFocused only ever got set to true (see the doc above it), never
+    // back to false, because nothing told it the primary pane had taken
+    // over. MainActivity's onFocusChanged{splitPaneFocused=...} callback
+    // only updates MainActivity's own mirror of this state - it doesn't
+    // reach back into this composable's local isFocused var. The result:
+    // tapping the primary pane while this pane was focused correctly moved
+    // VirtualKeyBar routing away (splitPaneFocused flipped false in
+    // MainActivity) but this pane's own isFocused stayed stuck true, so
+    // `active = isFocused && wantsKeyboard` never went false and
+    // HiddenPaneInputField's hide() below never ran - the split pane's IME
+    // stayed open over the primary pane ("hala aynı sorun var" in split
+    // screen). Defaults to false so any other caller keeps today's behavior.
+    primaryPaneFocused: Boolean = false,
     // Mouse reporting for THIS pane's own session (mc/vim/htop's own
     // xterm-mouse-mode programs) - see MainViewModel.sessionWantsMouseEvents/
     // sendMouseEventTo's docs for why these need to be per-runtimeId rather
@@ -324,7 +342,17 @@ fun SplitTerminalPane(
     // default) disables committing anything - the gesture still runs and
     // resizes the pty live, but nothing persists past the pinch, same as
     // supplying zoomEnabled = false.
-    onZoomTextSize: ((Float) -> Unit)? = null
+    onZoomTextSize: ((Float) -> Unit)? = null,
+    // Settings > Soft keyboard toggle - same flag MainActivity's own primary
+    // pane guards its tap-to-toggle-IME branch with (see that file's
+    // `if (!moved && !stolenByTerminalView && softKeyboardEnabled)` call
+    // site). This pane previously had no awareness of the setting at all,
+    // so a tap always flipped wantsKeyboard/opened the IME regardless of
+    // whether the user had turned the soft keyboard off - inconsistent with
+    // the primary pane, which skips the whole toggle when the setting is
+    // off. Defaults to true so any other existing caller of this composable
+    // keeps today's behavior unchanged.
+    softKeyboardEnabled: Boolean = true
 ) {
     // Direct-tap-to-type, no separate "Type here..." input box - tapping
     // the terminal area itself focuses it and brings up the keyboard, same
@@ -345,6 +373,29 @@ fun SplitTerminalPane(
     // tapping back into the split pane left the virtual key bar (which
     // gates on the real IME/WindowInsets state) never reappearing.
     var focusToken by remember(runtimeId) { mutableIntStateOf(0) }
+    // Local, independent of isFocused (which only tracks whether THIS pane
+    // owns input focus, not whether its keyboard should be up). Was missing
+    // entirely: this pane's onTap only ever set isFocused = true and bumped
+    // focusToken, with no way to ever ask HiddenPaneInputField to hide -
+    // unlike MultiPaneContainer's tiles (see that file's own wantsKeyboard
+    // doc for the identical bug there), this pane had NO tap-to-toggle-close
+    // path at all, only ever tap-to-open. Starts true so the split partner
+    // is still immediately typable the moment it opens, same as before this
+    // fix (matches isFocused's own default above).
+    var wantsKeyboard by remember(runtimeId) { mutableStateOf(true) }
+    // Live per-frame IME-visible read - same pattern as MainActivity's own
+    // primary-pane `keyboardOpen` (see its doc: assigned into a
+    // mutableStateOf on every composition, not read as a plain val), NOT
+    // rememberUpdatedState(val). The two look equivalent but aren't: a
+    // plain val wrapped in rememberUpdatedState only refreshes when THIS
+    // composable itself recomposes, and Compose has no obligation to
+    // recompose this exact scope just because the inset changed - the
+    // gesture loop below could keep reading a frozen snapshot indefinitely,
+    // which reads as the toggle being permanently inverted rather than
+    // merely occasionally stale. A mutableStateOf that's WRITTEN on every
+    // composition (like MainActivity's keyboardOpen) doesn't have that gap.
+    var keyboardOpenNow by remember(runtimeId) { mutableStateOf(false) }
+    keyboardOpenNow = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     // Consumes focusRequestSignal (see its own doc) - any change from
     // MainActivity means "reclaim this pane's IME focus", identical to what
     // a real re-tap into this pane does via the gesture blocks below.
@@ -365,14 +416,38 @@ fun SplitTerminalPane(
     LaunchedEffect(focusRequestSignal) {
         if (focusRequestSignal != 0) {
             isFocused = true
+            wantsKeyboard = true
             focusToken++
         }
     }
+    // Forces HiddenPaneInputField's LaunchedEffect(activationKey) to
+    // re-evaluate `active` (see its own doc above) when this setting flips
+    // - activationKey here is plain `focusToken`, which nothing else bumps
+    // on a settings change, so without this, turning "disable soft
+    // keyboard" on while this pane's real IME was already showing left it
+    // showing until the next unrelated focus/tap event happened to bump
+    // focusToken. skipIfInitial-style guard isn't needed the way
+    // focusRequestSignal's != 0 check is - a same-value initial composition
+    // read is a no-op focusToken bump, not a spurious show/hide.
+    LaunchedEffect(softKeyboardEnabled) { focusToken++ }
     // Mirrors isFocused up to MainActivity on every change, including the
     // initial true (this pane is typable immediately on open, same as
     // isFocused's own doc above) - not just the later awaitEachGesture
     // tap that flips it. See onFocusChanged's own doc for why this exists.
     LaunchedEffect(isFocused) { onFocusChanged(isFocused) }
+    // The missing other half of that mirror - see primaryPaneFocused's own
+    // doc above. Only reacts to the primary pane's field actually GAINING
+    // focus (not losing it - the primary pane's own onFocusChanged only
+    // ever needs to hand routing away on gain, and a bare "lost focus"
+    // there doesn't mean this pane gained it). Guarded on isFocused already
+    // being true so this doesn't fight a fresh re-tap into this same pane
+    // that happens to land in the same frame primaryPaneFocused settles.
+    LaunchedEffect(primaryPaneFocused) {
+        if (primaryPaneFocused && isFocused) {
+            isFocused = false
+            focusToken++
+        }
+    }
 
     Box(modifier = modifier.background(Color.Black)) {
         androidx.compose.foundation.layout.Column(modifier = Modifier.fillMaxWidth().fillMaxHeight()) {
@@ -635,6 +710,51 @@ fun SplitTerminalPane(
                             .pointerInput(runtimeId) {
                                 detectTapGestures(
                                     onTap = {
+                                        // Focus tracking (isFocused/focusToken/
+                                        // onFocusChanged) always runs on tap, regardless
+                                        // of softKeyboardEnabled - this is what routes
+                                        // VirtualKeyBar/keymapper input to the right
+                                        // pane, and switching which pane is focused is
+                                        // independent of whether the soft keyboard is
+                                        // allowed to open. Only the IME toggle itself
+                                        // (wantsKeyboard) is gated below - same split as
+                                        // MainActivity's own primary-pane tap branch,
+                                        // which still runs its non-keyboard bookkeeping
+                                        // even when softKeyboardEnabled is off and only
+                                        // skips the show/hide call.
+                                        // Only actually TOGGLES when this pane was
+                                        // already the focused one before this tap -
+                                        // isFocused here is still the PRE-tap value
+                                        // (the `isFocused = true` write is two lines
+                                        // below, and unlike MultiPaneContainer's
+                                        // per-tile isFocused - a plain captured
+                                        // parameter, genuinely stale inside a
+                                        // long-running pointerInput coroutine - this
+                                        // pane's isFocused is a local mutableStateOf,
+                                        // so reading it here always gets its true
+                                        // current value, no mirroring needed).
+                                        //
+                                        // A tap switching focus IN from the primary
+                                        // pane leaves wantsKeyboard untouched, so
+                                        // this pane's own remembered open/closed
+                                        // preference (from the last time IT was
+                                        // focused) simply takes effect once `active =
+                                        // isFocused && wantsKeyboard` recomposes true.
+                                        //
+                                        // Previously this read the GLOBAL
+                                        // keyboardOpenNow (WindowInsets.ime - one
+                                        // signal per WINDOW, shared with the primary
+                                        // pane) for every tap, switch-in included:
+                                        // switching in while the PRIMARY pane's
+                                        // keyboard happened to be open forced this
+                                        // pane's wantsKeyboard closed regardless of
+                                        // what this pane's own preference was, and
+                                        // vice versa - the actual "IME açılıyor kapalı
+                                        // olsada" bug, not the separate focus-loss/
+                                        // primaryPaneFocused issue already fixed.
+                                        if (softKeyboardEnabled && isFocused) {
+                                            wantsKeyboard = !keyboardOpenNow
+                                        }
                                         isFocused = true
                                         focusToken++
                                         onFocusChanged(true)
@@ -1013,7 +1133,26 @@ fun SplitTerminalPane(
                             debugLabel = "split"
                         )
                         HiddenPaneInputField(
-                            active = isFocused,
+                            // wantsKeyboard added so a tap toggle-close (see the
+                            // detectTapGestures block above) can actually hide this
+                            // pane's keyboard - active used to be isFocused alone,
+                            // which can only ever go true->true on a re-tap into an
+                            // already-focused pane and so never had a way to ask for
+                            // hide. Same fix as MultiPaneContainer's own tiles.
+                            //
+                            // softKeyboardEnabled factored in here too - same missing
+                            // piece as MultiPaneContainer's own wantsKeyboardOn (see
+                            // its doc): MainActivity's own primary pane never even
+                            // calls requestFocus()/show() when this setting is off,
+                            // but this pane's `active` was just `isFocused &&
+                            // wantsKeyboard` - wantsKeyboard defaults true and the
+                            // only place that could ever set it false (the tap
+                            // handler above) is itself gated behind
+                            // softKeyboardEnabled, so it never ran while the setting
+                            // was off and wantsKeyboard stayed permanently true. This
+                            // pane's real IME kept popping up on focus regardless of
+                            // "disable soft keyboard" being on.
+                            active = isFocused && wantsKeyboard && softKeyboardEnabled,
                             activationKey = focusToken,
                             onText = { text ->
                                 onInput(text)
@@ -1031,7 +1170,21 @@ fun SplitTerminalPane(
                         // SelectionActionBar(actionModeController) call
                         // in MainActivity, just anchored inside this
                         // pane's own Box instead.
-                        SelectionActionBar(actionModeController)
+                        SelectionActionBar(
+                            actionModeController,
+                            // See MainActivity's identical call site: focusRow is
+                            // always the actively-dragged handle, so it - not
+                            // minOf(anchor, focus) - is what should drive the flip.
+                            handleRow = paneSelectionState.focusRow,
+                            // Same reasoning as MainActivity's call site: hide the
+                            // bar while a handle is actually being dragged.
+                            hideWhileDragging = paneSelectionState.draggingHandle,
+                            // Real pixel bounds, same fix as MainActivity's call
+                            // site - see HandleClearingPositionProvider's doc.
+                            handleTopPx = paneSelectionState.focusRow * charHeightPx,
+                            handleBottomPx = (paneSelectionState.focusRow + 1) * charHeightPx,
+                            rowHeightPx = charHeightPx,
+                        )
                         moreMenuActions?.let { actions ->
                             MoreActionsPopup(
                                 visible = moreVisible,
