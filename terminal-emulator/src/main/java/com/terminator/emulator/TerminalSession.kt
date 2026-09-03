@@ -137,6 +137,16 @@ class TerminalSession(
     lateinit var emulator: TerminalEmulator
         private set
 
+    // Last cols/rows actually pushed to the pty via ioctl(TIOCSWINSZ).
+    // resize() below skips the native call (and the SIGWINCH it triggers)
+    // when the new size matches this exactly - e.g. a recomposition that
+    // re-reports the same measured size, or two resize sources agreeing on
+    // the same target. buffer.resize()/onBufferResized() still always run
+    // so the in-app grid stays correct either way; this guard only saves
+    // the redundant kernel round-trip + full-screen-program redraw.
+    private var lastAppliedColumns = -1
+    private var lastAppliedRows = -1
+
     /** Registers a callback fired exactly once, when the session's process
      *  is first detected as no longer running (natural exit or kill). */
     fun setOnExited(callback: () -> Unit) {
@@ -185,7 +195,13 @@ class TerminalSession(
                 pidOut = pidOut,
                 rows = rows,
                 cols = columns,
-                seccompWorkaround = seccompWorkaround
+                seccompWorkaround = seccompWorkaround,
+                // Pixel size isn't known yet at spawn time (the view hasn't
+                // been measured before the session starts) - the first real
+                // resize() call right after layout fills ws_xpixel/ws_ypixel
+                // in properly.
+                pixelWidth = 0,
+                pixelHeight = 0
             )
         } catch (e: IOException) {
             throw IOException("Unable to start session: $executablePath", e)
@@ -303,13 +319,29 @@ class TerminalSession(
         write(seq)
     }
 
-    fun resize(columns: Int, rows: Int) {
+    /**
+     * [pixelWidth]/[pixelHeight] are the terminal view's on-screen size in
+     * pixels (ws_xpixel/ws_ypixel) - optional, default 0/0 for callers that
+     * only have cols/rows. Programs that trust the kernel's pixel size over
+     * cols*font-width (mouse-pixel reporting, sixel/image output, some
+     * ncurses builds) need these to be non-zero to lay out correctly;
+     * everything else ignores them.
+     */
+    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         buffer.resize(columns, rows)
         if (::emulator.isInitialized) {
             emulator.onBufferResized()
         }
-        if (masterFd >= 0) {
-            NativePty.setWindowSize(masterFd, rows, columns)
+        // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
+        // whatever's running) when cols/rows haven't actually changed - see
+        // lastAppliedColumns/Rows's own doc. Pixel size alone changing with
+        // the same cols/rows (e.g. font metrics settling a frame later)
+        // isn't worth a second kernel round-trip either; the next real
+        // cols/rows change will carry the corrected pixel size along.
+        if (masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
+            NativePty.setWindowSize(masterFd, rows, columns, pixelWidth, pixelHeight)
+            lastAppliedColumns = columns
+            lastAppliedRows = rows
         }
     }
 
