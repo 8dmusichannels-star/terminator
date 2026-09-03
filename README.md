@@ -36,10 +36,6 @@ As keyboards, soft keyboard (tap to open/close terminal) and virtual key (as key
 You can control whether the soft keyboard will be on or off with the toggle. With the virtual keybar toggle, you can control whether the virtual keybar will appear or not. With the keyboard shortcust keymapper toggle, you can control whether the keyboard shortcust keymapper buttons will appear or not.
 Keyboard shortcuts and keymapper support are also provided. You can assign or support virtual keyboards directly from the physical keyboard. Additionally, seccomp support is available to resolve operation-disallowed errors. and there are more features
 
-## Development status
-
-It is currently under development, more advanced features or improved features will be developed soon, but since it is in beta phase and not fully stable, there may be minor bugs.
-
 ## Build
 
 ### Debug setup
