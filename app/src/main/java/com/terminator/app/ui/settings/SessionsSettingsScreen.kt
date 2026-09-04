@@ -106,7 +106,10 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
                             "Off: `clear` behaves like a normal terminal - old " +
                                 "output just scrolls out of view, still reachable by " +
                                 "scrolling up. On: `clear` also wipes scrollback " +
-                                "history, so nothing is left above the screen.",
+                                "history, so nothing is left above the screen. Also " +
+                                "covers full-screen apps (htop, mc, vim...) that send " +
+                                "a scrollback-clear on their own startup/exit - off " +
+                                "keeps your prior history intact even then.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }

@@ -807,7 +807,25 @@ class TerminalEmulator(
                 // with mode 2 (full clearAll), which meant a `clear -x`/
                 // tmux clear-history erased visible on-screen content it
                 // has no business touching.
-                buffer.clearScrollback()
+                //
+                // Only honored while on the PRIMARY screen (not
+                // buffer.inAlternateScreen) - there's no way to tell "the
+                // user ran `clear`" apart from "an app fired 3J on its own"
+                // from the byte stream alone, since both are the exact same
+                // escape sequence over the same pty. But in practice a
+                // user-typed `clear`/`clear -x` always runs in the shell,
+                // i.e. on the primary screen. Full-screen programs (htop,
+                // mc, some vim/tmux terminfo setups) that fire an
+                // unsolicited 3J on their own do so from INSIDE alternate
+                // screen (right around their own 1049h/l transition) -
+                // which is exactly what was silently wiping all prior
+                // shell scrollback just from opening one of those apps
+                // ("eski terminal geçmişi siliniyor"). Restricting to the
+                // primary screen filters that case out while still letting
+                // a real `clear -x` typed at the shell prompt purge
+                // scrollback (subject to clearAlwaysPurgesScrollback below,
+                // same opt-in as CSI 2J).
+                if (!buffer.inAlternateScreen && clearAlwaysPurgesScrollback) buffer.clearScrollback()
             }
         }
     }

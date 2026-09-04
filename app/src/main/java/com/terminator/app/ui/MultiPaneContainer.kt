@@ -155,7 +155,7 @@ fun MultiPaneContainer(
     onClosePane: (String) -> Unit,
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
     onResizePane: (runtimeId: String, size: Size) -> Unit,
-    onResizeSessionPty: (runtimeId: String, columns: Int, rows: Int) -> Unit,
+    onResizeSessionPty: (runtimeId: String, columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit,
     onSetMode: (PaneMode) -> Unit,
     onAddPaneRequested: () -> Unit,
     onExitMultiPane: () -> Unit,
@@ -333,7 +333,7 @@ private fun TilingLayout(
     onInput: (String, String) -> Unit,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
-    onResizeSessionPty: (String, Int, Int) -> Unit,
+    onResizeSessionPty: (String, Int, Int, Int, Int) -> Unit,
     onWantsMouseEvents: (String) -> Boolean = { false },
     onWantsMouseMoveEvents: (String) -> Boolean = { false },
     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
@@ -416,7 +416,7 @@ private fun TilingLayout(
                                     onInput = { text -> onInput(pane.runtimeId, text) },
                                     onFocus = { onFocusPane(pane.runtimeId) },
                                     onClose = { onClosePane(pane.runtimeId) },
-                                    onMeasuredSize = { cols, rws -> onResizeSessionPty(pane.runtimeId, cols, rws) },
+                                    onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
                                     fontDensity = density,
                                     showDragHandle = false,
                                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
@@ -539,7 +539,7 @@ private fun FloatingLayout(
     onClosePane: (String) -> Unit,
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
     onResizePane: (runtimeId: String, size: Size) -> Unit,
-    onResizeSessionPty: (String, Int, Int) -> Unit,
+    onResizeSessionPty: (String, Int, Int, Int, Int) -> Unit,
     onWantsMouseEvents: (String) -> Boolean = { false },
     onWantsMouseMoveEvents: (String) -> Boolean = { false },
     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
@@ -618,7 +618,7 @@ private fun FloatingLayout(
                     onInput = { text -> onInput(pane.runtimeId, text) },
                     onFocus = { onFocusPane(pane.runtimeId) },
                     onClose = { onClosePane(pane.runtimeId) },
-                    onMeasuredSize = { cols, rws -> onResizeSessionPty(pane.runtimeId, cols, rws) },
+                    onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
                     fontDensity = density,
                     showDragHandle = true,
                     onDragStart = {
@@ -685,7 +685,7 @@ private fun PaneContent(
     onInput: (String) -> Unit,
     onFocus: () -> Unit,
     onClose: () -> Unit,
-    onMeasuredSize: (columns: Int, rows: Int) -> Unit,
+    onMeasuredSize: (columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit,
     fontDensity: Float,
     showDragHandle: Boolean,
     modifier: Modifier = Modifier,
@@ -843,6 +843,10 @@ private fun PaneContent(
     // Local scroll offset into this pane's own scrollback - independent of
     // every other pane's, and of the classic single-pane view's scrollOffset.
     var scrollOffset by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
+    // Last known pointer position for a real mouse - see MainActivity's own
+    // lastMousePosition doc for why a wheel notch (a delta, not a
+    // position) needs this.
+    var lastMousePosition by remember(runtimeId) { mutableStateOf(Offset.Zero) }
 
     // Mirrors MainViewModel.lastScrollWasEdgeAutoScroll / the primary pane's
     // LaunchedEffect(state.scrollOffset) guard, and SplitTerminalPane's
@@ -1091,7 +1095,7 @@ private fun PaneContent(
                                 if (charWidth > 0f && charHeight > 0f && finalSize != null) {
                                     val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                     val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                    latestOnMeasuredSize.value(cols, rws)
+                                    latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
                                 }
                             }
                         }
@@ -1210,7 +1214,34 @@ private fun PaneContent(
                                     charSize = { charMetrics },
                                     bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                 ) { col, row ->
+                                    val (cw, ch) = charMetrics
+                                    lastMousePosition = Offset(col * cw, row * ch)
                                     onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
+                                }
+                            }
+                        }
+                        .pointerInput(runtimeId) {
+                            // Physical mouse/trackpad scroll wheel - same gap
+                            // and same fix as MainActivity's own primary-pane
+                            // wheel block; see runMouseWheelGesture's doc for
+                            // the full rationale.
+                            with(MouseGestureTracker) {
+                                runMouseWheelGesture(
+                                    wantsWheelReporting = onWantsMouseEvents,
+                                    emitWheelToApp = { kind, col, row -> onMouseEvent(kind, col, row, 0) },
+                                    charSize = { charMetrics },
+                                    bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                    lastPointerPosition = { lastMousePosition },
+                                ) { deltaLines ->
+                                    val buf = buffer ?: return@runMouseWheelGesture
+                                    val maxOffset = buf.maxScrollOffset
+                                    val prevOffset = scrollOffset
+                                    scrollOffset = (scrollOffset + deltaLines.roundToInt()).coerceIn(0, maxOffset)
+                                    val applied = scrollOffset - prevOffset
+                                    if (applied != 0) {
+                                        paneSelectionState.shiftRows(applied)
+                                        paneSelectionState.recomputeFrom(buf, scrollOffset)
+                                    }
                                 }
                             }
                         }
@@ -1806,7 +1837,7 @@ private fun PaneContent(
                                     if (charWidth > 0f && charHeight > 0f && finalSize != null) {
                                         val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                         val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                        latestOnMeasuredSize.value(cols, rws)
+                                        latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
                                     }
                                 },
                                 onDragCancel = {
@@ -1826,7 +1857,7 @@ private fun PaneContent(
                                     if (charWidth > 0f && charHeight > 0f && finalSize != null) {
                                         val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                         val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                        latestOnMeasuredSize.value(cols, rws)
+                                        latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
                                     }
                                 }
                             )
