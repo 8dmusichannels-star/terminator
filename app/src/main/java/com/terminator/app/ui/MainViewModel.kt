@@ -822,6 +822,26 @@ class MainViewModel(
         }
     }
 
+    /**
+     * Same routing as [sendInput] (active session + broadcast mirror +
+     * jump back to live screen), but for a clipboard paste specifically -
+     * goes through TerminalSession.writePaste so a program that requested
+     * bracketed paste (DECSET 2004) gets the ESC[200~/201~ wrapper (see
+     * writePaste's own doc). A plain sendInput() call here would never be
+     * able to make that distinction, since by the time text reaches
+     * TerminalSession it looks identical to typed keystrokes.
+     */
+    fun sendPaste(text: String) {
+        val state = _uiState.value
+        liveSessions[state.activeSessionId]?.writePaste(text)
+        if (state.broadcastInput) {
+            state.splitRuntimeId?.let { liveSessions[it]?.writePaste(text) }
+        }
+        if (_uiState.value.scrollOffset != 0) {
+            _uiState.value = _uiState.value.copy(scrollOffset = 0)
+        }
+    }
+
     /** Sends input to one specific pane's session, bypassing broadcast -
      *  used by the split-screen secondary pane's own keyboard/paste so
      *  typing directly into pane 2 never doubles into pane 1 regardless of
@@ -830,6 +850,14 @@ class MainViewModel(
      *  own typing back into itself). */
     fun sendInputTo(runtimeId: String, text: String) {
         liveSessions[runtimeId]?.write(text)
+    }
+
+    /** Paste counterpart to [sendInputTo] - same bracketed-paste wrapping
+     *  as [sendPaste], but targeted at one specific pane's session (split-
+     *  screen secondary pane's own paste), bypassing broadcast for the
+     *  same reason sendInputTo does. */
+    fun sendPasteTo(runtimeId: String, text: String) {
+        liveSessions[runtimeId]?.writePaste(text)
     }
 
     /**
@@ -1246,6 +1274,24 @@ class MainViewModel(
         }
     }
 
+    /** Paste counterpart to [sendPaneInput] - same focused-pane/broadcast
+     *  targeting, but goes through [sendPasteTo] for bracketed-paste
+     *  wrapping (see its own doc) instead of plain sendInputTo. Doesn't
+     *  need sendPaneInput's Ctrl+D/exited-pane handling: a paste is never
+     *  a literal EOT byte and pasting into an already-exited pane's dead
+     *  pty is a harmless no-op the same way it already is for the primary
+     *  pane's own paste path. */
+    fun sendPanePaste(text: String, broadcastAllPanes: Boolean) {
+        val state = _uiState.value
+        if (state.panes.isEmpty()) return
+        val targets = if (broadcastAllPanes) {
+            state.panes.map { it.runtimeId }
+        } else {
+            listOfNotNull(state.focusedPaneRuntimeId)
+        }
+        targets.forEach { target -> sendPasteTo(target, text) }
+    }
+
     /** Clamped well away from 0/1 so neither pane can be dragged down to an
      *  unusable sliver - matches the drag handle's own min-size guard in
      *  SplitScreenContainer, kept here too since this is also reachable
@@ -1428,7 +1474,64 @@ class MainViewModel(
         if (newColumns == columns && newRows == rows) return
         columns = newColumns
         rows = newRows
-        liveSessions.values.forEach { it.resize(newColumns, newRows, pixelWidth, pixelHeight) }
+        // Skip the split partner's own session here - it now measures its
+        // own (possibly different-width) Box and resizes itself through
+        // updateTerminalSizeFor (see that function's own doc + its
+        // SplitTerminalPane.kt call site's onResize doc for the full
+        // "why"). Before that per-runtime path existed, this forEach was
+        // the ONLY thing that ever resized the split partner's pty, always
+        // to THIS (primary pane's) width - correct only when splitRatio
+        // happened to be exactly 0.5 and both panes were coincidentally
+        // the same width. Leaving the split partner in this forEach now
+        // would race its own onResize commit: every primary-pane resize
+        // (rotation, IME open/close, divider drag) would immediately
+        // overwrite the split partner's just-computed correct size back to
+        // the primary's (wrong, for anything but a dead-center split)
+        // size, undoing updateTerminalSizeFor's own commit a moment later.
+        val splitRuntimeId = _uiState.value.splitRuntimeId
+        liveSessions.forEach { (runtimeId, session) ->
+            if (runtimeId != splitRuntimeId) {
+                session.resize(newColumns, newRows, pixelWidth, pixelHeight)
+            }
+        }
+        activeBuffer()?.let { buf ->
+            android.util.Log.d("ResizeDebug", "AFTER resize ${newColumns}x${newRows} cursorRow=${buf.cursorRow} rows=${buf.rows}")
+            for (r in 0 until buf.rows) {
+                val text = buf.rowText(r)
+                if (text.isNotBlank()) android.util.Log.d("ResizeDebug", "row[$r]=\"$text\"")
+            }
+        }
+        // Compensate scrollOffset/splitScrollOffset for whichever of the
+        // two resized sessions the user might currently be scrolled up
+        // into - see TerminalBuffer.consumePendingResizeScrollLines's own
+        // doc for why a resize (unlike ordinary PTY output) needs this at
+        // all: a shrink relocates on-screen content the user may already
+        // be looking at straight into scrollback out from under a
+        // scrollOffset that never otherwise changes, desyncing the view
+        // from the content it was pointing at (visible as a stray live
+        // line, a wall of blank rows, and old history reappearing
+        // elsewhere on screen - reported after simply tapping the
+        // terminal to open/close the keyboard while scrolled up). Reading
+        // this AFTER resize() above (which is where the counter gets
+        // incremented) and BEFORE bumpVersion() so TerminalView's own
+        // recomposition already sees the corrected scrollOffset on the
+        // same tick, rather than one tick showing the stale value.
+        activeBuffer()?.let { buf ->
+            val shift = buf.consumePendingResizeScrollLines()
+            if (shift != 0 && _uiState.value.scrollOffset != 0) {
+                val next = (_uiState.value.scrollOffset + shift).coerceIn(0, buf.maxScrollOffset)
+                _uiState.value = _uiState.value.copy(scrollOffset = next)
+            }
+        }
+        _uiState.value.splitRuntimeId?.let { splitId ->
+            bufferFor(splitId)?.let { splitBuffer ->
+                val shift = splitBuffer.consumePendingResizeScrollLines()
+                if (shift != 0 && _uiState.value.splitScrollOffset != 0) {
+                    val next = (_uiState.value.splitScrollOffset + shift).coerceIn(0, splitBuffer.maxScrollOffset)
+                    _uiState.value = _uiState.value.copy(splitScrollOffset = next)
+                }
+            }
+        }
         bumpVersion()
     }
 

@@ -86,6 +86,15 @@ class TerminalEmulator(
     var applicationCursorKeys: Boolean = false
         private set
 
+    // DECSET/DECRST 2004 (bracketed paste). When true, the running program
+    // has asked to be told which input came from a paste vs. real typing -
+    // the UI layer (TerminalSession.writePaste) wraps pasted text in
+    // ESC[200~...ESC[201~ only while this is true, exactly mirroring what a
+    // real xterm/VTE does. Off by default and reset on RIS (see reset()),
+    // same as every other DECSET-driven mode here.
+    var bracketedPasteMode: Boolean = false
+        private set
+
     // Current SGR (graphic rendition) state, applied to newly written cells
     private var curFg = TerminalBuffer.DEFAULT_FOREGROUND
     private var curBg = TerminalBuffer.DEFAULT_BACKGROUND
@@ -93,6 +102,9 @@ class TerminalEmulator(
     private var curUnderline = false
     private var curInverse = false
     private var curItalic = false
+    private var curDim = false
+    private var curBlink = false
+    private var curStrikethrough = false
 
     // Scrolling region (DECSTBM, CSI r) - top/bottom are 0-indexed and
     // inclusive. Defaults to the full screen. TUI apps commonly pin a
@@ -407,6 +419,18 @@ class TerminalEmulator(
         // Final byte reached - dispatch
         val raw = paramBuffer.toString()
         val private = raw.startsWith("?")
+        // Distinct from `private` (the '?' DEC-private-mode prefix) - '>'
+        // marks a secondary-DA/XTVERSION/kitty-keyboard query specifically
+        // (e.g. "CSI > c" for DA2, "CSI > 0 q" for XTVERSION). Needed below
+        // so 'c' can tell a DA2 query ("CSI > c", answered with the
+        // Pp;Pv;Pc-style secondary-DA reply xterm/tmux/ssh expect) apart
+        // from a DA1 query ("CSI c", answered with the VT100 "\u001B[?1;2c"
+        // primary-DA reply) - before this they were indistinguishable once
+        // the prefix was stripped below, so a DA2 query would have gotten
+        // DA1's answer, a reply shape the querying side doesn't recognize
+        // as a valid DA2 response and wasn't going to accept as unblocking
+        // its wait either.
+        val secondaryDA = raw.startsWith(">")
         // '>' (secondary-DA/XTVERSION/kitty-keyboard queries, e.g. the
         // "CSI > 0 q" fish/starship send on startup) and '=' (tertiary-DA)
         // sequences aren't otherwise handled below - stripping the prefix
@@ -520,6 +544,37 @@ class TerminalEmulator(
                 6 -> listener.onRespond("\u001B[${cursorRow + 1};${cursorCol + 1}R")
                 5 -> listener.onRespond("\u001B[0n")
             }
+            // Primary Device Attributes (DA1), `CSI c` or `CSI 0 c` - "what
+            // kind of terminal are you?" Distinct from the ESC-c (RIS, full
+            // reset) branch above this whenClause's caller dispatches on -
+            // this is the CSI form, params-based like DSR just above it.
+            // Never answered before, which is the exact same class of bug
+            // DSR/CPR's own doc describes for starship: any remote-side
+            // shell, multiplexer, or prompt framework (bash/zsh completion
+            // probing terminal capabilities, tmux/screen sanity-checking
+            // the terminal on attach, starship/powerlevel10k's own startup
+            // probes, ssh's terminal-type negotiation on some servers) that
+            // sends this and blocks waiting for a reply sees nothing come
+            // back and has to sit out its own internal timeout before
+            // falling back - which is what read as PTY/SSH startup and
+            // per-keystroke lag, not a rendering delay: nothing was slow to
+            // DRAW, the remote side was stuck waiting on a reply this
+            // emulator was silently never going to send. DA1 ("CSI c")
+            // replies with the standard VT100-with-AVO identification
+            // (matches what xterm/most terminfo "xterm-256color" entries
+            // expect a DA1-querying peer to receive); DA2 ("CSI > c",
+            // secondaryDA above) is a DIFFERENT query asking for
+            // terminal-version info, not terminal-class info, and expects
+            // the "Pp;Pv;Pc" shaped reply below instead - answering it
+            // with DA1's reply is a malformed response the querying side
+            // won't recognize as a valid DA2 answer, so it still sits out
+            // its timeout. "64" here is an arbitrary but plausible xterm
+            // patch-level; "0" is the (unused) ROM cartridge param.
+            'c' -> if (secondaryDA) {
+                listener.onRespond("\u001B[>0;64;0c")
+            } else if (params.getOrElse(0) { 0 } == 0) {
+                listener.onRespond("\u001B[?1;2c")
+            }
             'h', 'l' -> { /* non-private mode set/reset we don't track - ignore */ }
             else -> { /* unsupported final byte - ignore */ }
         }
@@ -561,9 +616,15 @@ class TerminalEmulator(
                 1003 -> mouseMode = if (enable) MouseMode.ANY_EVENT else MouseMode.NONE
                 1006 -> mouseSgrMode = enable
                 1 -> applicationCursorKeys = enable
-                // 2004: bracketed paste - not implemented, but explicitly
-                // ignored now rather than falling through to the generic
-                // (and wrong) non-private h/l no-op.
+                // Bracketed paste (see bracketedPasteMode's own doc) - was
+                // previously matched by the generic `else` branch below
+                // (silently ignored), which is why pasted multi-line text
+                // was never distinguishable from typed input on the shell
+                // side: without the ESC[200~/201~ wrapper a paste containing
+                // newlines reads to the shell exactly like the user pressing
+                // Enter after every line, so each line ran as its own
+                // command instead of landing as one editable blob.
+                2004 -> bracketedPasteMode = enable
                 else -> { /* unsupported private mode - ignore */ }
             }
         }
@@ -717,7 +778,8 @@ class TerminalEmulator(
             TerminalBuffer.Cell(
                 text = text, fg = curFg, bg = curBg,
                 bold = curBold, underline = curUnderline,
-                inverse = curInverse, italic = curItalic
+                inverse = curInverse, italic = curItalic,
+                dim = curDim, blink = curBlink, strikethrough = curStrikethrough
             )
         )
         cursorCol++
@@ -845,25 +907,57 @@ class TerminalEmulator(
             when (val p = params[i]) {
                 0 -> resetSgr()
                 1 -> curBold = true
+                2 -> curDim = true
                 3 -> curItalic = true
                 4 -> curUnderline = true
+                5, 6 -> curBlink = true
                 7 -> curInverse = true
-                22 -> curBold = false
+                9 -> curStrikethrough = true
+                // 22 is "normal intensity" - real terminals clear BOTH bold
+                // and dim here (they're the two ends of one "intensity"
+                // attribute, only one active at a time), not just bold -
+                // previously this left curDim untouched, so `tput dim;
+                // tput sgr0`-style sequences (or any app sending 1 then 2
+                // then 22) could leave text stuck dim after a reset that
+                // should have cleared it.
+                22 -> { curBold = false; curDim = false }
                 23 -> curItalic = false
                 24 -> curUnderline = false
+                25 -> curBlink = false
                 27 -> curInverse = false
+                29 -> curStrikethrough = false
                 in 30..37 -> curFg = p - 30
                 in 40..47 -> curBg = p - 40
                 in 90..97 -> curFg = p - 90 + 8
                 in 100..107 -> curBg = p - 100 + 8
                 38, 48 -> {
-                    // Extended color: 38;5;N (256-color) or 38;2;R;G;B (truecolor index-mapped)
+                    // Extended color: 38;5;N (256-color) or 38;2;R;G;B (truecolor)
                     if (i + 1 < params.size && params[i + 1] == 5 && i + 2 < params.size) {
                         val colorIdx = params[i + 2]
                         if (p == 38) curFg = colorIdx else curBg = colorIdx
                         i += 2
                     } else if (i + 1 < params.size && params[i + 1] == 2 && i + 4 < params.size) {
-                        // truecolor - stored as-is; UI layer maps to RGB directly via a side table
+                        // Packed into the same Int as a plain 0-255 ANSI
+                        // index using TerminalPalette.TRUECOLOR_MARKER (see
+                        // its own doc) - previously the R/G/B params were
+                        // read past (i += 4) but never actually stored
+                        // anywhere, so curFg/curBg were silently left
+                        // unchanged and every truecolor SGR was a no-op:
+                        // programs relying on 24-bit color (bat, delta,
+                        // neovim themes, modern ls/fzf themes) rendered in
+                        // whatever color happened to be active before the
+                        // truecolor escape, not the color actually
+                        // requested. Params clamped to 0..255 same as any
+                        // other untrusted CSI param (see the repeat-count
+                        // clamp above) - a malformed/out-of-range R/G/B
+                        // shouldn't be able to set stray high bits that
+                        // collide with TRUECOLOR_MARKER itself or wrap
+                        // negative.
+                        val r = params[i + 2].coerceIn(0, 255)
+                        val g = params[i + 3].coerceIn(0, 255)
+                        val b = params[i + 4].coerceIn(0, 255)
+                        val packed = TerminalPalette.TRUECOLOR_MARKER or (r shl 16) or (g shl 8) or b
+                        if (p == 38) curFg = packed else curBg = packed
                         i += 4
                     }
                 }
@@ -881,6 +975,9 @@ class TerminalEmulator(
         curUnderline = false
         curInverse = false
         curItalic = false
+        curDim = false
+        curBlink = false
+        curStrikethrough = false
     }
 
     private fun reset() {
@@ -892,6 +989,7 @@ class TerminalEmulator(
         scrollBottom = buffer.rows - 1
         cursorVisible = true
         applicationCursorKeys = false
+        bracketedPasteMode = false
         oscPendingSt = false
         state = State.NORMAL
     }
@@ -906,7 +1004,33 @@ class TerminalEmulator(
         scrollBottom = (buffer.rows - 1).coerceAtLeast(0)
         if (wasFullScreen) scrollTop = 0
         scrollTop = scrollTop.coerceIn(0, scrollBottom)
-        cursorRow = cursorRow.coerceIn(0, buffer.rows - 1)
-        cursorCol = cursorCol.coerceIn(0, buffer.columns - 1)
+        // buffer.resize() (called just before this, by TerminalSession.
+        // resize()) already moved buffer.cursorRow to the correct row for
+        // the new grid - shifting it by rowOffset/totalTopPadding as
+        // content scrolled into/out of scrollback (see its own doc: the
+        // "beyaz cursor ekranin ortasinda asili kaliyor" bug). Reading this
+        // class's OWN cursorRow field here instead - which the resize call
+        // never touched, so it's still the PRE-resize row number - and
+        // merely coercing it back into buffer.rows was wrong on every
+        // grow/shrink that actually shifted content: the coerce alone
+        // doesn't reproduce that shift, so the field's stale value went
+        // straight back into buffer.cursorRow via this class's own setter
+        // below, silently undoing the correct shifted value resize() had
+        // just computed - which is exactly why that fix kept appearing to
+        // not take: this ran a moment later on every single resize and
+        // clobbered it back to the wrong row every time. Reading FROM
+        // buffer.cursorRow instead (the value resize() just got right) and
+        // only coercing THAT keeps this class's own field in sync with the
+        // buffer's already-correct post-resize cursor instead of
+        // overwriting it.
+        cursorRow = buffer.cursorRow.coerceIn(0, buffer.rows - 1)
+        // Same clobbering hazard as cursorRow above, just for the column
+        // axis: buffer.resize() already coerced buffer.cursorCol against
+        // the new column count. Reading FROM this class's own (stale,
+        // pre-resize) cursorCol field here - as this used to - and
+        // writing it back through the setter would silently overwrite
+        // that already-correct value with the old one on every column
+        // resize, the exact same bug the cursorRow fix above addresses.
+        cursorCol = buffer.cursorCol.coerceIn(0, buffer.columns - 1)
     }
 }

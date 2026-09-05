@@ -959,6 +959,11 @@ class MainActivity : ComponentActivity() {
                             // ends, via the commit block in the pointerInput below.
                             var liveZoomSize by remember(activeSessionId) { mutableStateOf<Float?>(null) }
                             var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
+                            // Nanos of the last time a pinch actually committed a real
+                            // buffer/pty resize (not just liveZoomSize's visual preview) -
+                            // see the throttleElapsed check where zoomCommitJob is
+                            // (re)launched below for why this exists.
+                            var lastZoomCommitNanos by remember { mutableStateOf(0L) }
 
                             val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
                             // Hoisted here (rather than created inside TerminalView) so the
@@ -1073,6 +1078,100 @@ class MainActivity : ComponentActivity() {
                             val edgeWheelAutoScroll = remember(activeSessionId) { MouseGestureTracker.EdgeWheelAutoScroll() }
                             var resizeDebounceJob by remember { mutableStateOf<Job?>(null) }
                             var latestTerminalSize by remember { mutableStateOf<IntSize?>(null) }
+                            // True from the instant onSizeChanged sees a new pixel size
+                            // until applyResize() actually commits that size to
+                            // buffer.resize(). Compose's Canvas repaints at the new
+                            // container size immediately (every frame of the IME's
+                            // show/hide animation), but buffer.rows/columns and
+                            // buffer.cursorRow/cursorCol don't change until the
+                            // debounced (or, on rotation, immediate) applyResize() call
+                            // lands - exactly the same "canvas already at the new size,
+                            // buffer/cursor still describing the old grid" gap that
+                            // liveZoomSize/suppressCursor already covers for pinch-zoom
+                            // (see TerminalView's own suppressCursor doc: the "imleç
+                            // beyaz kalıyor, yeri değişiyor" bug). Without a matching
+                            // guard here, the same stale-cursor-times-new-canvas-size
+                            // math produces a block cursor that visibly leaps to some
+                            // other row/col for the length of the IME animation each
+                            // time the keyboard opens or closes, snapping back only
+                            // once the debounce finally fires - the "beyaz cursor
+                            // dunya turuna cikiyor" bug. Cleared the moment
+                            // applyResize() runs (both the debounced and the immediate
+                            // rotation path), not just after the 120ms delay, so a
+                            // same-size resize (nothing to actually commit) doesn't
+                            // leave the cursor suppressed indefinitely.
+                            var pendingResize by remember { mutableStateOf(false) }
+                            // Safety net for pendingResize itself: every writer of this
+                            // flag (applyResize's own success/early-return paths, the
+                            // orientation LaunchedEffect below) is supposed to flip it
+                            // back to false once the resize actually lands - but that
+                            // depends on resizeDebounceJob's coroutine actually running
+                            // to completion. If it's ever cancelled without a
+                            // replacement being armed (composable recomposed mid-flight,
+                            // a future edit changes the debounce shape, coroutineScope
+                            // itself gets cancelled by something outside this block's
+                            // control), pendingResize is left wedged true with nothing
+                            // left to ever clear it - which reads as "the cursor never
+                            // comes back until I tap the terminal again" (tapping re-
+                            // arms a fresh onSizeChanged/applyResize cycle that happens
+                            // to succeed). Rather than rely on the debounce job always
+                            // completing, watch pendingResize itself and force it back
+                            // to false if it's still true well past any legitimate
+                            // resize's settle time - TerminalView's own suppressCursor
+                            // watchdog (500ms) covers the rendering symptom already, but
+                            // fixing pendingResize here too means the state is actually
+                            // correct again (not just "cursor drawn despite stale
+                            // pendingResize"), and covers the same failure mode for any
+                            // other future pendingResize reader.
+                            // Keyed on latestTerminalSize (not pendingResize) so that
+                            // every genuine mid-animation size change - which
+                            // onSizeChanged below already restarts its own 120ms
+                            // resizeDebounceJob for - ALSO restarts this watchdog's
+                            // clock. Keying on pendingResize alone was wrong: once
+                            // pendingResize flips to true it stays true for the whole
+                            // multi-frame IME animation (each frame just re-confirms
+                            // it), so a LaunchedEffect(pendingResize) only launches
+                            // ONCE at the start of the animation and counts down from
+                            // there - completely independent of resizeDebounceJob, which
+                            // keeps pushing itself back on every frame. On an animation
+                            // that runs long enough (or a device slow enough) that this
+                            // fixed 400ms elapses before resizeDebounceJob finally gets
+                            // a quiet 120ms window to fire applyResize(), the watchdog
+                            // forced pendingResize = false while resizeDebounceJob was
+                            // still alive and mid-flight - un-suppressing the cursor for
+                            // a moment - only for the very next onSizeChanged frame to
+                            // flip pendingResize back to true (still animating) and hide
+                            // it again. That race is exactly the "hep açılıp kapanıyor"
+                            // glitch: two independent timers fighting over the same flag.
+                            // Restarting the watchdog's countdown on every real size
+                            // delta makes it fire only once resize activity has
+                            // genuinely gone quiet for 400ms straight - by which point
+                            // resizeDebounceJob's own 120ms window has always already
+                            // had its chance to run applyResize() and legitimately clear
+                            // pendingResize itself, so the watchdog now only ever acts
+                            // as a true last-resort (job cancelled/lost) rather than a
+                            // second clock racing the first.
+                            LaunchedEffect(latestTerminalSize, pendingResize) {
+                                if (pendingResize) {
+                                    kotlinx.coroutines.delay(400)
+                                    pendingResize = false
+                                }
+                            }
+                            // Mirrors MultiPaneContainer's isManuallyResizing for the
+                            // classic split-screen divider (SplitDragHandle below) -
+                            // dragging it resizes both the primary and split Boxes on
+                            // every drag frame, the exact same "Canvas repaints at the
+                            // new pixel size before buffer.resize() catches up" gap
+                            // pendingResize already covers for orientation/IME resize
+                            // and MultiPaneContainer's isManuallyResizing covers for a
+                            // floating pane's corner handle. Threaded into both
+                            // TerminalView calls' suppressCursor below (primary pane
+                            // here, split pane via SplitTerminalPane's
+                            // suppressCursorExtra) so the cursor sits out divider drags
+                            // the same way it already sits out those other two resize
+                            // paths, instead of visibly wandering to a stale row/col
+                            // for the length of the drag.
+                            var isDraggingSplit by remember { mutableStateOf(false) }
                             // Last known pointer position (px, terminal-local) for a real
                             // mouse - kept fresh by the hover-MOVE gesture block below and
                             // reused as the fixed col/row a wheel notch reports at, same as
@@ -1137,10 +1236,18 @@ class MainActivity : ComponentActivity() {
                             fun applyResize() {
                                 val (charWidth, charHeight) = charMetrics
                                 val finalSize = latestTerminalSize
-                                if (charWidth <= 0f || charHeight <= 0f || finalSize == null) return
+                                if (charWidth <= 0f || charHeight <= 0f || finalSize == null) {
+                                    pendingResize = false
+                                    return
+                                }
                                 val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                 val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
                                 viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
+                                // Whatever buffer.rows/columns are now, they match this
+                                // finalSize - safe for drawTerminal to trust
+                                // buffer.cursorRow/cursorCol against the current canvas
+                                // size again.
+                                pendingResize = false
                             }
 
                             // Forces an immediate (non-debounced) resize whenever orientation
@@ -1163,6 +1270,7 @@ class MainActivity : ComponentActivity() {
                             // from onSizeChanged's own firing order.
                             LaunchedEffect(currentOrientation) {
                                 if (hasSizedOnce) {
+                                    pendingResize = true
                                     applyResize()
                                 }
                             }
@@ -1240,6 +1348,23 @@ class MainActivity : ComponentActivity() {
                                         // field could produce any text. runtimeId is accepted for
                                         // signature symmetry with onFocusPane/onClosePane below
                                         // but intentionally unused here.
+                                    },
+                                    onPasteInput = { _, text ->
+                                        // text has already had \n->\r applied
+                                        // by PaneContent's own onPaste before
+                                        // reaching here - no need to repeat it.
+                                        // Bypasses onInput's CTRL/ALT chip
+                                        // processing entirely - a pasted blob
+                                        // never wants a pending chip applied
+                                        // (see SplitTerminalPane's identical
+                                        // onPasteInput doc) - and goes through
+                                        // sendPanePaste for bracketed-paste
+                                        // wrapping. runtimeId unused for the
+                                        // same reason onInput ignores it above
+                                        // (sendPanePaste targets the focused
+                                        // pane or broadcasts, not this specific
+                                        // tile's own runtimeId).
+                                        viewModel.sendPanePaste(text, broadcastAllPanes)
                                     },
                                     onFocusPane = { runtimeId -> viewModel.bringPaneToFront(runtimeId) },
                                     onClosePane = { runtimeId -> viewModel.removePane(runtimeId) },
@@ -1492,19 +1617,44 @@ class MainActivity : ComponentActivity() {
                                             // current after the animation settles gets applied
                                             // fixes that without losing responsiveness for
                                             // "real" size changes (split-screen, etc).
+                                            // Only the FIRST onSizeChanged after a real
+                                            // change should arm pendingResize - re-firing on
+                                            // every subsequent animation frame at sizes that
+                                            // still haven't committed is fine (the flag's
+                                            // already true), but comparing against
+                                            // latestTerminalSize's PREVIOUS value here (before
+                                            // overwriting it below) is what actually detects
+                                            // "this is a genuine size change" rather than
+                                            // Compose re-invoking the callback with the same
+                                            // size it already reported.
+                                            val sizeActuallyChanged = hasSizedOnce && size != latestTerminalSize
+                                            if (sizeActuallyChanged) {
+                                                pendingResize = true
+                                            }
                                             latestTerminalSize = size
                                             hasSizedOnce = true
-                                            resizeDebounceJob?.cancel()
-                                            // Orientation-triggered resizes are handled separately
-                                            // by the LaunchedEffect(currentOrientation) above, which
-                                            // fires immediately without this debounce - see its
-                                            // comment for why that's a more reliable way to detect
-                                            // "this size change is a rotation" than comparing
-                                            // orientation values inline here. This path now only
-                                            // has to handle the IME-animation case.
-                                            resizeDebounceJob = coroutineScope.launch {
-                                                delay(120)
-                                                applyResize()
+                                            // Only reset the debounce timer when the size genuinely
+                                            // changed. Compose can re-invoke onSizeChanged with the
+                                            // SAME size repeatedly while the IME animation is still
+                                            // settling (observed: 30+ callbacks at the identical final
+                                            // size before the very last one lands) - previously every
+                                            // one of those cancelled and restarted the 120ms timer, so
+                                            // applyResize() kept getting pushed back by ~1 full second
+                                            // total. During that whole window the Compose Box was
+                                            // already at its final (new) pixel size but buffer.rows/
+                                            // columns hadn't been updated yet - drawTerminal drew the
+                                            // stale row count against the already-resized canvas,
+                                            // which is what showed up as a wall of blank rows with
+                                            // real content pinned to one edge ("bosluk spawn oluyor").
+                                            // Only arming/restarting the timer on an actual size
+                                            // delta means a run of same-size callbacks no longer
+                                            // delays the eventual commit at all.
+                                            if (sizeActuallyChanged || resizeDebounceJob == null) {
+                                                resizeDebounceJob?.cancel()
+                                                resizeDebounceJob = coroutineScope.launch {
+                                                    delay(120)
+                                                    applyResize()
+                                                }
                                             }
                                         }
                                         // Edge-scroll while selecting: when the user drags a
@@ -1842,7 +1992,26 @@ class MainActivity : ComponentActivity() {
                                                         scrollFling.track(primary.uptimeMillis, primary.position)
                                                         val dy = primary.position.y - lastPos.y
                                                         if (!viewModel.activeSessionInAlternateScreen()) {
-                                                            val (_, charHeight) = charMetrics
+                                                            // latestCharMetrics.value, not the plain
+                                                            // charMetrics local - this whole gesture
+                                                            // block lives inside pointerInput(activeSessionId),
+                                                            // a single long-running coroutine that is NOT
+                                                            // relaunched every time fontSizeSp/charMetrics
+                                                            // changes (only when activeSessionId itself
+                                                            // changes). Reading the plain `charMetrics` val
+                                                            // here captures whatever it was AT THE MOMENT
+                                                            // THIS COROUTINE WAS LAUNCHED and never updates
+                                                            // again for the rest of the session - so any
+                                                            // scroll-drag after a zoom (pinch OR a font-size
+                                                            // change from Settings) computed dy against the
+                                                            // WRONG, stale row height. latestCharMetrics is
+                                                            // exactly the rememberUpdatedState wrapper this
+                                                            // file already uses everywhere else in this same
+                                                            // gesture loop (mouse charSize, selection handle
+                                                            // positioning, etc.) for this identical reason -
+                                                            // this one call site (and its 3 siblings below)
+                                                            // were simply missed when that fix landed.
+                                                            val (_, charHeight) = latestCharMetrics.value
                                                             if (charHeight > 0f) {
                                                                 // isEdgeAutoScroll = true whenever a
                                                                 // selection is already active: a plain
@@ -1966,7 +2135,11 @@ class MainActivity : ComponentActivity() {
                                                             // → scroll scrollback, same unit as the
                                                             // single-finger scroll path above.
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
-                                                                val (_, charHeight) = charMetrics
+                                                                // See the identical latestCharMetrics.value
+                                                                // fix a bit above (one-finger drag) - same
+                                                                // stale-closure reasoning applies here for
+                                                                // the two-finger selection-scroll sub-branch.
+                                                                val (_, charHeight) = latestCharMetrics.value
                                                                 if (charHeight > 0f) {
                                                                     val avgDy = ((p1.position.y - p1.previousPosition.y) +
                                                                         (p2.position.y - p2.previousPosition.y)) / 2f
@@ -2037,13 +2210,82 @@ class MainActivity : ComponentActivity() {
                                                                     // row using the OLD charHeight, so we know
                                                                     // which row the fingers are actually over
                                                                     // before anything changes size.
-                                                                    val (_, oldCharHeight) = charMetrics
+                                                                    //
+                                                                    // latestCharMetrics.value, NOT the plain
+                                                                    // charMetrics local - this is the actual
+                                                                    // root cause of "zoom yaparken/tıklarken
+                                                                    // imleç yukarı kayıyor": this whole pinch
+                                                                    // handler runs inside the SAME long-lived
+                                                                    // pointerInput(activeSessionId) coroutine
+                                                                    // as the drag-to-scroll branch above (see
+                                                                    // its own doc) - it is launched ONCE for
+                                                                    // the session and never restarts just
+                                                                    // because fontSizeSp/charMetrics changed,
+                                                                    // so the plain `charMetrics` val it closed
+                                                                    // over was frozen at whatever size was
+                                                                    // active the FIRST time this coroutine
+                                                                    // started (e.g. before the user ever
+                                                                    // zoomed, or tapped to reopen the
+                                                                    // keyboard and re-triggered composition).
+                                                                    // Every subsequent pinch anchored itself
+                                                                    // against that same stale oldCharHeight
+                                                                    // instead of the size the previous pinch
+                                                                    // actually committed to - since a pinch
+                                                                    // IN also shrinks oldCharHeight relative
+                                                                    // to the true previous size, midY /
+                                                                    // oldCharHeight computed anchorRow too
+                                                                    // large, so the anchorDelta correction
+                                                                    // below under-compensated and the whole
+                                                                    // grid (cursor included) crept upward a
+                                                                    // little more on every zoom gesture,
+                                                                    // compounding across repeated
+                                                                    // zooms/session lifetime rather than
+                                                                    // settling back to the finger's actual
+                                                                    // midpoint. suppressCursor only hides the
+                                                                    // cursor WHILE a pinch is in flight; it
+                                                                    // never touches this anchor math, which
+                                                                    // is what kept misplacing it once the
+                                                                    // cursor reappeared post-commit.
+                                                                    val (_, oldCharHeight) = latestCharMetrics.value
                                                                     val midY = (p1.position.y + p2.position.y) / 2f
                                                                     val anchorRow = if (oldCharHeight > 0f) (midY / oldCharHeight).toInt() else 0
                                                                     liveZoomSize = newSize
                                                                     zoomCommitJob?.cancel()
+                                                                    // Previously this ALWAYS waited out a
+                                                                    // fresh 150ms debounce, cancelled and
+                                                                    // restarted on every single pinch frame -
+                                                                    // during a slow, continuous pinch (fingers
+                                                                    // still moving, a new delta arriving every
+                                                                    // frame) that timer never once reached
+                                                                    // zero until the gesture actually paused
+                                                                    // or ended, so the real buffer/pty resize
+                                                                    // (below) never fired for the ENTIRE
+                                                                    // gesture - only liveZoomSize's font size
+                                                                    // changed while buffer.rows/columns stayed
+                                                                    // exactly what they were before the pinch
+                                                                    // started. Since TerminalView draws that
+                                                                    // fixed grid at the ever-shrinking live
+                                                                    // font size, zooming OUT left a growing
+                                                                    // unfilled (near-black background) strip
+                                                                    // on the right/bottom the whole time you
+                                                                    // were still pinching - "zoom ile terminal
+                                                                    // ekranı şekillenmiyor, siyah boşluklar
+                                                                    // oluşuyor". Throttling to a real commit
+                                                                    // at most every 150ms DURING an ongoing
+                                                                    // gesture (skipping the wait below once
+                                                                    // that long has actually elapsed since the
+                                                                    // last real commit) keeps the buffer
+                                                                    // roughly in sync with the live font size
+                                                                    // throughout the pinch instead of only
+                                                                    // once at the very end - the trailing
+                                                                    // debounced commit (delay(150) below,
+                                                                    // still cancelled/restarted every frame)
+                                                                    // is what guarantees the exact final size
+                                                                    // once the gesture actually settles.
+                                                                    val throttleElapsed = System.nanoTime() - lastZoomCommitNanos >= 150_000_000L
                                                                     zoomCommitJob = coroutineScope.launch {
-                                                                        delay(150)
+                                                                        if (!throttleElapsed) delay(150)
+                                                                        lastZoomCommitNanos = System.nanoTime()
                                                                         viewModel.setSessionTextSize(activeSessionId, newSize)
                                                                         liveZoomSize = null
                                                                         // sessionTextSize (the state
@@ -2121,7 +2363,10 @@ class MainActivity : ComponentActivity() {
                                                             scrollFling.track(primary.uptimeMillis, primary.position)
                                                             val dy = primary.position.y - lastPos.y
                                                             if (!viewModel.activeSessionInAlternateScreen()) {
-                                                                val (_, charHeight) = charMetrics
+                                                                // See the drag-to-scroll branch above's
+                                                                // latestCharMetrics.value doc - identical
+                                                                // stale-closure bug, same fix.
+                                                                val (_, charHeight) = latestCharMetrics.value
                                                                 if (charHeight > 0f) {
                                                                     // Same reasoning as the equivalent
                                                                     // call above, right before this loop
@@ -2280,6 +2525,34 @@ class MainActivity : ComponentActivity() {
                                             palette = terminalPalette,
                                             fontFamily = terminalTypeface,
                                             fontSizeSp = effectiveTextSize,
+                                            // liveZoomSize != null means this exact frame is
+                                            // rendering at a live pinch-zoom preview size that
+                                            // hasn't been committed to buffer.resize() yet - see
+                                            // TerminalView's own suppressCursor doc for why the
+                                            // block cursor has to sit this out until the commit
+                                            // lands (the "imleç beyaz kalıyor" bug).
+                                            // isDraggingSplit: see its own doc above - dragging
+                                            // the split divider resizes this primary pane's Box
+                                            // on every frame too (its weight shrinks/grows as
+                                            // splitRatio changes), same stale-cursor gap as
+                                            // liveZoomSize already guards against.
+                                            // Deliberately NOT including pendingResize here:
+                                            // that covered the IME show/hide (keyboard open/
+                                            // close) resize gap, but on primary this made the
+                                            // cursor blink hidden/visible for the length of
+                                            // every keyboard animation (worse than the stale-
+                                            // coordinate flash it was preventing) and doesn't
+                                            // match split/floating, which never suppress for
+                                            // keyboard resize at all (SplitTerminalPane:
+                                            // suppressCursor = liveZoomSize != null ||
+                                            // suppressCursorExtra; MultiPaneContainer:
+                                            // suppressCursor = zoomSizeSp != null ||
+                                            // isManuallyResizing - neither reads pendingResize
+                                            // or an IME-driven flag). Keeping primary consistent
+                                            // with both: cursor now stays visible through
+                                            // keyboard open/close here too, same as split and
+                                            // floating already did.
+                                            suppressCursor = liveZoomSize != null || isDraggingSplit,
                                             bufferVersion = state.bufferVersion,
                                             // Only let the terminal's own background go
                                             // translucent when there's actually a wallpaper
@@ -2441,17 +2714,20 @@ class MainActivity : ComponentActivity() {
                                                         // terminals send CR (\r, 0x0D) for a line
                                                         // break, not the LF (\n, 0x0A) a copied
                                                         // multi-line selection naturally contains.
-                                                        // Forwarding raw \n bytes meant every line
-                                                        // of a pasted multi-line selection got
-                                                        // interpreted by the shell as if Enter had
-                                                        // been pressed after it - i.e. each line
-                                                        // immediately executed as its own command
-                                                        // instead of the whole paste landing as
-                                                        // inert text the user could still edit
-                                                        // before running anything. A single-line
-                                                        // paste with no trailing newline is
-                                                        // unaffected either way.
-                                                        viewModel.sendInput(pasted.replace('\n', '\r'))
+                                                        // Still needed even with bracketed paste
+                                                        // (sendPaste below) - bracketed paste tells
+                                                        // the shell's line editor "don't treat what
+                                                        // follows as separate Enter presses", but
+                                                        // the bytes themselves still need to be the
+                                                        // CR a terminal always sends for a line
+                                                        // break, bracketed or not.
+                                                        // sendPaste (not sendInput): lets
+                                                        // TerminalSession.writePaste wrap this in
+                                                        // ESC[200~/201~ when the running program
+                                                        // asked for bracketed paste (DECSET 2004) -
+                                                        // see its own doc. For a program that never
+                                                        // asked, this is identical to sendInput.
+                                                        viewModel.sendPaste(pasted.replace('\n', '\r'))
                                                     }
                                                 }
                                                 selectionState.clear()
@@ -2838,12 +3114,14 @@ class MainActivity : ComponentActivity() {
                                 // already works correctly for the primary pane today.
                                 if (splitRuntimeId != null) {
                                     SplitDragHandle(
+                                        onDragStart = { isDraggingSplit = true },
                                         onDrag = { deltaPx, containerHeightPx ->
                                             if (containerHeightPx > 0f) {
                                                 val deltaRatio = deltaPx / containerHeightPx
                                                 viewModel.setSplitRatio(state.splitRatio + deltaRatio)
                                             }
-                                        }
+                                        },
+                                        onDragEnd = { isDraggingSplit = false }
                                     )
                                     SplitTerminalPane(
                                         modifier = Modifier
@@ -2962,6 +3240,17 @@ class MainActivity : ComponentActivity() {
                                                 viewModel.sendInputTo(splitRuntimeId, toSend)
                                             }
                                         },
+                                        onPasteInput = { text ->
+                                            // Bypasses onInput's CTRL/ALT chip/
+                                            // EOT/kill-session logic entirely -
+                                            // none of that applies to a pasted
+                                            // blob (see onPasteInput's own doc
+                                            // on SplitTerminalPane) - and goes
+                                            // through sendPasteTo so a program
+                                            // that requested bracketed paste
+                                            // gets the ESC[200~/201~ wrapper.
+                                            splitRuntimeId?.let { viewModel.sendPasteTo(it, text) }
+                                        },
                                         onClose = { viewModel.setSplitSession(null) },
                                         onFocusChanged = { focused -> splitPaneFocused = focused },
                                         focusRequestSignal = splitFocusRequestSignal,
@@ -3030,7 +3319,31 @@ class MainActivity : ComponentActivity() {
                                                 pendingSaveRuntimeId = splitRuntimeId
                                                 terminalExportLauncher.launch("terminator-session.txt")
                                             }
-                                        )
+                                        ),
+                                        // See isDraggingSplit's own doc above - same divider
+                                        // drag resizes this split pane's Box too, so it needs
+                                        // the same suppress-cursor treatment as the primary
+                                        // pane gets via pendingResize/liveZoomSize.
+                                        suppressCursorExtra = isDraggingSplit,
+                                        // This pane's own measured size, resized against
+                                        // its OWN cols/rows via the per-runtime path
+                                        // (updateTerminalSizeFor) - see onResize's own doc
+                                        // in SplitTerminalPane.kt. Previously this pane had
+                                        // no onSizeChanged of its own at all, so it only
+                                        // ever inherited whatever cols/rows the PRIMARY
+                                        // pane's own onSizeChanged computed for ITS width
+                                        // (via updateTerminalSize's "every live session
+                                        // gets the same size" behavior) - correct only when
+                                        // splitRatio happens to be exactly 0.5 and both
+                                        // panes are coincidentally the same width. Dragging
+                                        // the divider off-center (or any other width
+                                        // mismatch between the two panes) left this pane's
+                                        // buffer sized for the PRIMARY pane's width instead
+                                        // of its own, which is what showed up as garbled/
+                                        // clipped content confined to this pane specifically.
+                                        onResize = { cols, rows, pixelWidth, pixelHeight ->
+                                            viewModel.updateTerminalSizeFor(splitRuntimeId, cols, rows, pixelWidth, pixelHeight)
+                                        }
                                     )
                                 }
 
