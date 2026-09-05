@@ -121,6 +121,15 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
     // awaitPointerEvent() call below runs on the SAME restricted scope the
     // two call sites are already suspended within, which is allowed.
     var lastEvent = initialEvent
+    // Nanos of the last REAL commit (onCommitZoom actually invoked), not
+    // just the last liveZoomSize preview update - see throttleElapsed
+    // below for why this exists. Local to one continuous 2-finger gesture,
+    // same as lastEvent; a gesture that drops to one finger and pinches
+    // again later starts a fresh call to this function with this reset to
+    // 0, which just means that resumed gesture's first frame waits out the
+    // normal debounce once more - a negligible edge case next to the
+    // problem this fixes.
+    var lastCommitNanos = 0L
     while (true) {
         val changes = lastEvent.changes.filter { it.pressed }
         if (changes.size < 2) break // back down to one finger (or zero) - pinch is over
@@ -135,9 +144,29 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
                     val newSize = (latestFontSize.value * zoom).coerceIn(8f, 40f)
                     onLiveZoom(newSize)
                     cancelPendingZoomCommit()
+                    // Same fix as MainActivity's own primary-pane pinch
+                    // branch (see its inline doc): cancelling and
+                    // restarting this 150ms debounce on EVERY pinch frame
+                    // meant a slow, continuous pinch never let it reach
+                    // zero until the gesture paused/ended, so onCommitZoom
+                    // - which is what ultimately reflows this pane's
+                    // column/row count - never fired for the whole
+                    // gesture. Font size kept shrinking live while the
+                    // grid stayed exactly as big as it was before the
+                    // pinch started, leaving a growing unfilled (near-
+                    // black) strip in this pane the entire time it was
+                    // still being pinched. Throttling to a real commit at
+                    // most every 150ms during an ongoing gesture (skip the
+                    // wait once that long has actually elapsed since the
+                    // last real commit) keeps it roughly in sync
+                    // throughout; the trailing debounced commit (delay(150)
+                    // below, still reset every frame) still guarantees the
+                    // exact final size once the gesture settles.
+                    val throttleElapsed = System.nanoTime() - lastCommitNanos >= 150_000_000L
                     setZoomCommitJob(
                         coroutineScope.launch {
-                            delay(150)
+                            if (!throttleElapsed) delay(150)
+                            lastCommitNanos = System.nanoTime()
                             onCommitZoom?.invoke(newSize)
                             onLiveZoom(null)
                         }
@@ -1142,6 +1171,13 @@ fun SplitTerminalPane(
                             palette = palette,
                             fontFamily = fontFamily,
                             fontSizeSp = effectivePaneFontSize,
+                            // liveZoomSize != null: this pane is mid pinch-zoom, rendering
+                            // at a live preview size not yet committed via buffer.resize() -
+                            // see TerminalView's own suppressCursor doc / MainActivity's
+                            // identical wiring for why the block cursor has to sit out
+                            // these frames (otherwise it detaches from the real grid at
+                            // the new scale - "imleç beyaz kalıyor" bug).
+                            suppressCursor = liveZoomSize != null,
                             bufferVersion = bufferVersion,
                             backgroundAlpha = 1f,
                             scrollOffset = scrollOffset,

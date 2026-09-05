@@ -24,6 +24,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -80,6 +81,51 @@ class TerminalSession(
     private var inputStream: FileInputStream? = null
     private var outputStream: FileOutputStream? = null
     private var masterPfd: ParcelFileDescriptor? = null
+    // Opened once and kept for the life of the session, instead of
+    // historyFile.appendText(chunk) (Kotlin stdlib: open, write, close on
+    // EVERY call) which appendHistory used before. That per-chunk
+    // open+write+close syscall round-trip ran synchronously on the reader
+    // thread, between one isr.read() and the next - so it directly delayed
+    // how soon the next chunk of PTY output (cursor moves, redraws, any
+    // ANSI escape sequence) got parsed and rendered. Local shells rarely
+    // send output often enough for that per-chunk cost to be visible, but
+    // an SSH session - frequent small reads from mouse-reporting TUIs,
+    // remote shell redraws, etc. - hits this path far more often per
+    // second, which is what read as "SSH/ANSI escape gecikmesi" (escape
+    // sequences visibly lagging behind, worse over SSH specifically).
+    // A single stream held open for the session's whole lifetime turns
+    // each appendHistory call back into a plain buffered write(), with the
+    // real fd churn paid only once at session start/end instead of on
+    // every read.
+    //
+    // IMPORTANT: an earlier version of this fix called stream.flush()
+    // on every single chunk "to match appendText's per-call durability".
+    // flush() on a FileOutputStream-backed stream is its own syscall
+    // (effectively a write() of whatever's buffered) - forcing one on
+    // EVERY chunk reintroduced almost the same per-chunk syscall cost
+    // this fix exists to remove, and made it WORSE specifically for SSH:
+    // SSH's frequent small reads (mouse reporting, remote redraws) call
+    // appendHistory far more often per second than a local shell does, so
+    // a mandatory flush per chunk multiplies exactly where it hurts most
+    // - measured as SSH sessions opening slower and lagging harder than
+    // before this file's history fix existed at all.
+    //
+    // Fixed by decoupling durability from the reader thread entirely: a
+    // dedicated flusher thread (below, same pattern as the writer thread's
+    // own doc for why a separate thread beats inlining) wakes up on a
+    // fixed interval and flushes ONLY IF something was actually written
+    // since its last pass - not on every appendHistory call, and never
+    // blocking the reader. This keeps data loss on a hard crash bounded to
+    // a fraction of a second of scrollback, same order of magnitude as a
+    // real-time guarantee, without paying a flush syscall per PTY chunk.
+    private var historyStream: BufferedOutputStream? = null
+    // Set (not incremented - a plain flag is all the flusher needs) by
+    // appendHistory after every write, cleared by the flusher right before
+    // it flushes. @Volatile since these two threads only ever communicate
+    // through this one field - no other shared state, so a full lock
+    // would be pure overhead for a single boolean handoff.
+    @Volatile private var historyDirty: Boolean = false
+    private var historyFlusher: Thread? = null
 
     private var reader: Thread? = null
     // All writes to the pty - user keystrokes, mouse events, and (critically)
@@ -236,12 +282,53 @@ class TerminalSession(
                 // longer applies; render whatever was captured instead of
                 // silently dropping the last partial sequence.
                 emulator.flushPendingCluster()
+                // Stop the periodic flusher before closing the stream it
+                // flushes - interrupt() breaks it out of its sleep loop
+                // (see historyFlusher's own doc), then close() below does
+                // one final flush of anything written since its last pass.
+                historyFlusher?.interrupt()
+                // Close the persistent history stream opened by
+                // appendHistory (see historyStream's own doc) - closeable
+                // even if it was never opened (a session with no output).
+                try {
+                    historyStream?.close()
+                } catch (_: IOException) {
+                    // best-effort, same as appendHistory's own write failures
+                }
                 alive = false
                 markExited()
             }
         }
         reader!!.isDaemon = true
         reader!!.start()
+
+        // Periodic history-durability flusher - see historyStream's own
+        // doc for why appendHistory itself no longer flushes per chunk.
+        // Sleeps almost all the time; only touches the stream (a flush()
+        // syscall) on ticks where historyDirty shows real writes happened
+        // since the last one, so an idle session costs nothing here at
+        // all. 200ms bounds how much scrollback a hard crash could lose
+        // to well under a second, while staying far below the frequency
+        // SSH's own chunk rate would hit if every chunk flushed itself.
+        historyFlusher = Thread {
+            try {
+                while (true) {
+                    Thread.sleep(200)
+                    if (historyDirty) {
+                        historyDirty = false
+                        try {
+                            historyStream?.flush()
+                        } catch (_: IOException) {
+                            // best-effort, same as appendHistory's own write failures
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // reader thread's finally block shutting this down at session end
+            }
+        }
+        historyFlusher!!.isDaemon = true
+        historyFlusher!!.start()
 
         // Dedicated writer thread - see writeQueue's doc comment above for
         // why this can't just be outputStream.write() called inline from
@@ -347,7 +434,22 @@ class TerminalSession(
 
     private fun appendHistory(chunk: String) {
         try {
-            historyFile.appendText(chunk)
+            // Lazily opened on the first chunk (not in start(), so a
+            // session that never produces output never touches the file
+            // at all - same as appendText's old behavior). FileOutputStream(file,
+            // append = true) matches appendText's own open mode; wrapped in
+            // BufferedOutputStream so a burst of small chunks (the common
+            // case - PTY reads are rarely large) doesn't turn back into a
+            // write() syscall per chunk, just per buffer-full/flush.
+            val stream = historyStream ?: BufferedOutputStream(
+                FileOutputStream(historyFile, /* append = */ true)
+            ).also { historyStream = it }
+            stream.write(chunk.toByteArray(Charsets.UTF_8))
+            // Not flushed here - see historyStream's own doc for why a
+            // per-chunk flush() was tried and reverted. historyFlusher
+            // picks this up on its own short interval instead; just mark
+            // that there's something worth flushing next time it wakes.
+            historyDirty = true
         } catch (_: IOException) {
             // best-effort persistence; do not interrupt the session on write failure
         }
@@ -365,6 +467,12 @@ class TerminalSession(
         }
         reader?.interrupt()
         writer?.interrupt()
+        // historyFlusher is normally torn down from the reader thread's own
+        // finally block (natural EOF) - but destroy()/kill() can run first,
+        // closing the fd out from under a reader that hasn't reached EOF
+        // yet. Interrupting it here too means it's never left running past
+        // whichever teardown path gets there first.
+        historyFlusher?.interrupt()
         closePfdOnce()
         alive = false
         markExited()
@@ -384,6 +492,8 @@ class TerminalSession(
         }
         reader?.interrupt()
         writer?.interrupt()
+        // See destroy()'s identical comment just above.
+        historyFlusher?.interrupt()
         closePfdOnce()
         alive = false
         markExited()

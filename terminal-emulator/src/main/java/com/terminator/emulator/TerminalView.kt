@@ -26,6 +26,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -289,6 +290,40 @@ class TerminalPalette(
         statusErrorColor != null && (index == 1 || index == 9) -> statusErrorColor
         statusWarningColor != null && (index == 3 || index == 11) -> statusWarningColor
         index in ansiColors.indices -> ansiColors[index]
+        // Truecolor marker (see TerminalEmulator.applySgr's 38;2/48;2
+        // handling): index has TRUECOLOR_MARKER set in its high bits and
+        // the R/G/B bytes packed into the low 24 bits. Programs using
+        // 24-bit SGR (bat, delta, neovim themes, modern ls/fzf themes)
+        // send colors nowhere near the 0-255 ANSI index range at all - this
+        // used to silently fall through to `else -> defaultForeground`
+        // below, which is why truecolor output always rendered as one flat
+        // color instead of the actual RGB the program asked for.
+        (index and TRUECOLOR_MARKER) == TRUECOLOR_MARKER ->
+            (0xFF shl 24) or (index and 0x00FFFFFF)
+        // Standard ANSI 256-color palette, indices 16-255 (the 16 base
+        // colors above only cover 0-15). 16-231 is the 6x6x6 color cube
+        // xterm defines; 232-255 is a 24-step grayscale ramp. Before this,
+        // any SGR 38;5;N/48;5;N with N >= 16 (i.e. almost the entire
+        // 256-color range - most themes/tools pick from the cube or the
+        // grayscale ramp, not the base 16) fell through to
+        // `else -> defaultForeground` below and rendered as one flat color
+        // regardless of which of the 240 possible colors was requested.
+        index in 16..231 -> {
+            val i = index - 16
+            val r = i / 36
+            val g = (i % 36) / 6
+            val b = i % 6
+            // xterm's cube uses 0 or 55+40*n per step (0,95,135,175,215,255),
+            // not a plain evenly-spaced 0-255 - matching that exactly (vs.
+            // a naive r*51) is what makes 256-color output match what the
+            // same escape sequence looks like in a real xterm.
+            fun step(n: Int) = if (n == 0) 0 else 55 + 40 * n
+            (0xFF shl 24) or (step(r) shl 16) or (step(g) shl 8) or step(b)
+        }
+        index in 232..255 -> {
+            val level = 8 + (index - 232) * 10
+            (0xFF shl 24) or (level shl 16) or (level shl 8) or level
+        }
         else -> defaultForeground
     }
 
@@ -302,6 +337,15 @@ class TerminalPalette(
         TerminalPalette(ansiColors, defaultForeground, defaultBackground, errorColor, warningColor)
 
     companion object {
+        // Marker bit distinguishing a packed truecolor RGB value (see
+        // resolve()'s truecolor branch and TerminalEmulator.applySgr's
+        // 38;2/48;2 handling) from a plain 0-255 ANSI palette index in the
+        // same Int-typed Cell.fg/bg field. Real ANSI indices only ever run
+        // 0-255, so any bit at or above 1 shl 24 is unambiguously never a
+        // valid index - safe to repurpose as "the low 24 bits are a packed
+        // RRGGBB value, not a palette lookup".
+        const val TRUECOLOR_MARKER = 1 shl 24
+
         /** A Nord-inspired default palette as a sane out-of-the-box theme. */
         fun nord(): TerminalPalette {
             val colors = intArrayOf(
@@ -470,7 +514,27 @@ fun TerminalView(
     // and the split pane's TerminalView (both log under the same tags)
     // can actually be told apart. "primary" is MainActivity's default;
     // SplitTerminalPane passes "split" explicitly.
-    debugLabel: String = "primary"
+    debugLabel: String = "primary",
+    // True while the caller is mid pinch-to-zoom, i.e. rendering at a
+    // live/preview fontSizeSp that hasn't been committed to buffer.resize()
+    // yet (see MainActivity/SplitTerminalPane's own liveZoomSize doc: the
+    // real buffer/pty resize is throttled to at most once per ~150ms during
+    // an active pinch, but every pinch frame still re-renders immediately
+    // at the new live font size for a smooth preview). The glyph grid below
+    // handles that fine - it just draws buffer.rows/columns worth of cells
+    // at whatever charWidth/charHeight the live font size produces. The
+    // block cursor doesn't: its position is buffer.cursorRow/cursorCol (the
+    // OLD, not-yet-committed grid coordinates) multiplied by the NEW live
+    // charWidth/charHeight, which visibly detaches it from the actual
+    // character grid for the entire pinch gesture - a stray white block
+    // sitting wherever that stale row/col happens to land at the new scale,
+    // only snapping back to the real cursor position once the throttled
+    // commit finally fires. That's the "zoom edince imleç beyaz kalıyor,
+    // yeri değişiyor" bug. Simplest correct fix: just don't draw the block
+    // cursor for the handful of frames where its coordinates are known to
+    // be stale - it reappears the instant the commit lands and bufferVersion
+    // bumps this composable's recomposition.
+    suppressCursor: Boolean = false
 ) {
     val density = LocalDensity.current
     val viewConfiguration = LocalViewConfiguration.current
@@ -490,6 +554,59 @@ fun TerminalView(
             textSize = fontSizeSp * density.density * density.fontScale
         }
         measuringPaint.measureText("M") to measuringPaint.fontSpacing
+    }
+
+    // New PTY output (scrollUp() pushing lines into scrollback) shifts
+    // what every row/scrollOffset pair addresses just as much as the user
+    // dragging scrollOffset does - but nothing about it touches
+    // scrollOffset itself, so none of the shiftRows()/recomputeFrom() call
+    // sites in MainActivity (all gated on scrollOffset changing) ever see
+    // it. A selection left active while a flooding command keeps printing
+    // - or simply a long selection that takes a while to drag out and
+    // lift - could silently go stale and copy the wrong (or, once the
+    // exact scrollback lines it pointed into got evicted, blank) rows.
+    // Runs once per content-change tick (bufferVersion), consuming
+    // whatever scrolled since the last tick:
+    // - mid-drag (draggingHandle), TerminalView's own gesture loop already
+    //   calls recomputeFrom every frame against the CURRENT scrollOffset,
+    //   so compensating here too would double-shift; just drop the count
+    //   without acting, same as scrollOffset-driven shiftRows callers skip
+    //   when applied == 0.
+    // - idle with an active selection, shift anchor/focus to keep pointing
+    //   at the same buffer content and recompute, exactly like the
+    //   user-driven edge-auto-scroll path does for a scrollOffset change.
+    LaunchedEffect(bufferVersion) {
+        val scrolled = buffer.consumePendingScrollLines()
+        val columnsChanged = buffer.consumePendingColumnsChanged()
+        if (columnsChanged && selectionState.active && !selectionState.draggingHandle) {
+            // A resize that changed the column count invalidates
+            // anchorCol/focusCol outright (see
+            // TerminalBuffer.consumePendingColumnsChanged's doc) - there's
+            // no row shift that fixes a selection whose column bounds no
+            // longer mean the same thing, so drop it instead of trying to
+            // shiftRows() it like a pure scroll. This also covers the
+            // rowOffset/growOffset case below for the same tick: no point
+            // shiftRows()-ing a selection this same resize is about to
+            // clear anyway.
+            selectionState.clear()
+        } else if (scrolled != 0 && selectionState.active && !selectionState.draggingHandle) {
+            // scrollUp() moves live content UP by `scrolled` lines while
+            // scrollOffset itself stays put - the same net effect on what
+            // a fixed (row, scrollOffset) pair addresses as the user
+            // DECREASING scrollOffset by that many lines would have (see
+            // TerminalBuffer.lineAt's doc: sliding the window toward the
+            // live screen). shiftRows' sign convention matches
+            // adjustScrollOffset's returned delta (positive = scrollOffset
+            // increased), so this is the negated line count, not +scrolled.
+            // The same delta also carries a pinch-zoom resize's row shift
+            // (rowOffset - growOffset, folded into pendingScrollLines by
+            // resize() itself) alongside any scrollUp()-driven lines from
+            // this same tick, so a resize's row-only shift (column count
+            // unchanged) gets shiftRows()-compensated exactly like normal
+            // PTY-output scrolling instead of losing the selection.
+            selectionState.shiftRows(-scrolled)
+            selectionState.recomputeFrom(buffer, scrollOffset)
+        }
     }
 
     Box(modifier = modifier) {
@@ -531,9 +648,52 @@ fun TerminalView(
         // selectedTexts of size 3 at indices 0/1/2, which this used to
         // read directly as rows 0/1/2 instead of offsetting by startRow.
         val range = if (selectionState.active) selectionState.normalized() else null
-        val selectedRows = selectedTexts.withIndex()
-            .filter { (_, text) -> text.isNotEmpty() }
-            .mapTo(HashSet()) { (index, _) -> (range?.startRow ?: 0) + index }
+        // Per-row [fromCol, toColExclusive) span actually selected on that
+        // row - NOT a whole-row flag. Mirrors recomputeFrom's own column
+        // math (fromCol is startCol only on the first row, 0 on every row
+        // after; toColExclusive is endCol+1 only on the last row, the full
+        // line length on every row before it) so the highlight painted
+        // below covers exactly the characters recomputeFrom put in
+        // selectedTexts/what Copy would actually grab - not the previous
+        // whole-row-regardless-of-column rect, which painted every row
+        // touched by the selection edge-to-edge (blank trailing space
+        // included) even though only part of that row - often just a
+        // single word - was actually selected. That's what read as
+        // "seçmediğim yer de seçili görünüyor": the highlight was telling
+        // the truth about which ROWS were touched, but not about which
+        // COLUMNS within them actually were.
+        val selectedColumnRanges = if (range != null) {
+            selectedTexts.withIndex()
+                .filter { (_, text) -> text.isNotEmpty() }
+                .associate { (index, text) ->
+                    val row = range.startRow + index
+                    val fromCol = if (row == range.startRow) range.startCol else 0
+                    // text here is recomputeFrom's ALREADY-TRIMMED substring
+                    // for this row (line.substring(fromCol, toColExclusive)),
+                    // not the row's full text - so its length alone is only
+                    // the right toColExclusive when fromCol is 0. On the
+                    // selection's start row, fromCol is startCol (non-zero
+                    // whenever the selection doesn't begin at column 0), so
+                    // text.length there is line.length - fromCol, not
+                    // line.length - using it bare left the highlight ending
+                    // `fromCol` columns short of where the actual selected
+                    // (and copyable) text ends on that row. Every row AFTER
+                    // the first has fromCol == 0, where fromCol + text.length
+                    // and text.length happen to be the same number - which
+                    // is exactly why this only ever showed up as a gap on
+                    // the FIRST row of a multi-row selection (colored
+                    // backgrounds - ls output, prompts, grep matches -
+                    // made the missing tail visible; plain text on the
+                    // default background just looked like ordinary
+                    // unhighlighted blank space, which is what read as
+                    // "renkli kısımlar bazen tam seçmiyor, boşluklar
+                    // oluşuyor").
+                    val toColExclusive = if (row == range.endRow) (range.endCol + 1) else (fromCol + text.length)
+                    row to (fromCol until toColExclusive)
+                }
+        } else {
+            emptyMap()
+        }
 
         // The gesture block below is long-lived (its pointerInput key list
         // deliberately does NOT include scrollOffset - restarting mid-drag
@@ -588,6 +748,61 @@ fun TerminalView(
                         val (row, col) = cellOf(x, y)
                         val lastCol = buffer.lastNonBlankColumn(row, latestScrollOffset.value)
                         return if (lastCol != null && col > lastCol) row to lastCol else row to col
+                    }
+
+                    // Word-select-on-double-tap. `lastTapUp*` remembers the
+                    // position/time of the most recent short (non-long-press,
+                    // non-handle-grab) tap-UP across `awaitEachGesture`
+                    // iterations of this SAME pointerInput instance, so the
+                    // very next down can be recognized as its pair. Reset to
+                    // "no recent tap" (nanos = 0) once consumed as either half
+                    // of a double-tap, so a third quick tap doesn't chain into
+                    // treating taps 2+3 as another pair.
+                    var lastTapUpNanos = 0L
+                    var lastTapUpX = 0f
+                    var lastTapUpY = 0f
+                    // Deliberately narrow: letters/digits/underscore. Matches
+                    // what most users mean by "a word" (a flag like -rf or a
+                    // path segment stays a separate word each side of the
+                    // punctuation) - this seeds the initial double-tap
+                    // selection only, dragging a handle afterward can still
+                    // extend it across punctuation/the rest of the line, so
+                    // narrow-by-default here doesn't block selecting more.
+                    fun isWordChar(c: Char): Boolean = c.isLetterOrDigit() || c == '_'
+                    // Argument/flag punctuation that commonly sits directly
+                    // against a word char with no space between - "-rf",
+                    // "--force", "/etc/passwd", "a.txt", "user@host". A
+                    // double-tap landing exactly on one of these used to
+                    // return null from wordRangeAt (isWordChar(line[col])
+                    // false), which fell all the way through to the plain
+                    // long-press path below and started a brand-new
+                    // degenerate one-cell selection instead - that's what
+                    // read as "hep tüm seçme modu aktif oluyor" (double-tap
+                    // silently degrading into the whole-line/long-press
+                    // selection behavior) whenever the tap happened to land
+                    // on the dash of a flag or a slash in a path rather than
+                    // a letter. Treated as its own word-like run here -
+                    // adjacent characters from this SAME set extend the
+                    // selection, same as isWordChar's letters/digits/
+                    // underscore run does - rather than merging with
+                    // isWordChar (which would make "-rf" and "foo" one word
+                    // if they ever sat next to each other) or being left to
+                    // fail outright.
+                    fun isArgPunctChar(c: Char): Boolean = c in "-./_@"
+                    fun wordRangeAt(row: Int, col: Int): Pair<Int, Int>? {
+                        val line = buffer.rowPlainText(row, latestScrollOffset.value)
+                        if (col !in line.indices) return null
+                        val tapped = line[col]
+                        val matches: (Char) -> Boolean = when {
+                            isWordChar(tapped) -> ::isWordChar
+                            isArgPunctChar(tapped) -> ::isArgPunctChar
+                            else -> return null
+                        }
+                        var start = col
+                        while (start > 0 && matches(line[start - 1])) start--
+                        var end = col
+                        while (end < line.length - 1 && matches(line[end + 1])) end++
+                        return start to end
                     }
 
                     awaitEachGesture {
@@ -759,6 +974,50 @@ fun TerminalView(
                             return@awaitEachGesture
                         }
 
+                        // Double-tap-to-select-word: this down landed close
+                        // in time+space to the previous short tap's lift (set
+                        // at the bottom of the `aborted` branch below) and
+                        // over a word character - select that whole word
+                        // immediately (anchor at its start, focus at its
+                        // end) and drop straight into the same drag-extend
+                        // loop long-press-confirmed selections use below, so
+                        // the user can still drag a handle afterward to grow
+                        // the selection across the rest of the line/argument
+                        // ("satırın tamamını da seçsin ama kelime seçmek te
+                        // mümkün olsun"). Only considered when there's no
+                        // existing selection to protect, same as the
+                        // long-press path just below - existingRange came
+                        // back null here already (grabbedStart/grabbedEnd
+                        // both false with existingRange non-null would have
+                        // returned above).
+                        val (tapRow, tapCol) = snappedCellOf(down.position.x, down.position.y)
+                        val isDoubleTap = existingRange == null && lastTapUpNanos != 0L &&
+                            (System.nanoTime() - lastTapUpNanos) < viewConfiguration.doubleTapTimeoutMillis * 1_000_000L &&
+                            kotlin.math.abs(down.position.x - lastTapUpX) < charWidthPx * 2f &&
+                            kotlin.math.abs(down.position.y - lastTapUpY) < charHeightPx * 2f
+                        val wordRange = if (isDoubleTap) wordRangeAt(tapRow, tapCol) else null
+                        if (wordRange != null) {
+                            lastTapUpNanos = 0L
+                            down.consume()
+                            val (wordStart, wordEnd) = wordRange
+                            selectionState.startAt(tapRow, wordStart)
+                            selectionState.updateFocusAt(tapRow, wordEnd)
+                            selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                change.consume()
+                                if (!change.pressed) {
+                                    selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                    break
+                                }
+                                val (row, col) = cellOf(change.position.x, change.position.y)
+                                selectionState.updateFocusAt(row, col)
+                                selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                            }
+                            return@awaitEachGesture
+                        }
+
                         // Not on a handle: wait out the long-press
                         // timeout, watching for movement/lift/a second
                         // finger exactly like MainActivity's own
@@ -889,6 +1148,20 @@ fun TerminalView(
                             if (selectionState.active && !abortedByMovement) {
                                 selectionState.clear()
                             }
+                            // Remember this short tap's lift so the NEXT
+                            // down, if it lands close enough in time/space
+                            // (checked above, at the top of the next
+                            // awaitEachGesture iteration), gets recognized
+                            // as the second half of a double-tap and
+                            // word-selects instead of starting another
+                            // long-press wait. Only for a genuine short tap,
+                            // not a movement-abort (that's a scroll/pan
+                            // starting, not a tap at all).
+                            if (!abortedByMovement) {
+                                lastTapUpNanos = System.nanoTime()
+                                lastTapUpX = down.position.x
+                                lastTapUpY = down.position.y
+                            }
                             return@awaitEachGesture
                         }
 
@@ -937,7 +1210,7 @@ fun TerminalView(
         ) {
             @Suppress("UNUSED_EXPRESSION")
             bufferVersion
-            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedRows, highlightColor)
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedColumnRanges, highlightColor, suppressCursor)
             // Custom selection handles - two small teardrop markers at the
             // normalized start/end of the active selection, drawn directly
             // against the same charWidthPx/charHeightPx grid the gesture
@@ -974,8 +1247,12 @@ private fun DrawScope.drawTerminal(
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
     scrollOffset: Int = 0,
-    selectedRows: Set<Int> = emptySet(),
-    highlightColor: Int = 0x407EC8FF.toInt()
+    selectedColumnRanges: Map<Int, IntRange> = emptyMap(),
+    highlightColor: Int = 0x407EC8FF.toInt(),
+    // See TerminalView's own suppressCursor doc - true while buffer.cursorRow/
+    // cursorCol are known stale relative to the live (not-yet-committed)
+    // charWidth/charHeight this exact draw call is about to compute below.
+    suppressCursor: Boolean = false
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -1007,25 +1284,38 @@ private fun DrawScope.drawTerminal(
     // overlay, which drew its own highlight - but that highlight came
     // from Compose's default text-selection color, not the app's
     // Material palette, and didn't reliably cover blank/whitespace
-    // columns). Drawn here, under the glyph loop below, as one full-width
-    // rect per row in `selectedRows` - every row SelectionContainer
-    // reports as carrying selected text gets its ENTIRE width painted,
-    // text and whitespace alike (see TerminalView's highlightColor doc:
-    // this is deliberately whole-row, not per-character). Must happen
-    // before the glyph/cursor drawing loop so the highlight sits behind
-    // the text instead of covering it.
-    if (selectedRows.isNotEmpty()) {
+    // columns). Drawn here, under the glyph loop below, as one rect PER
+    // SELECTED COLUMN SPAN in `selectedColumnRanges` - only the actual
+    // [fromCol, toColExclusive) run TerminalView's caller computed for
+    // that row (recomputeFrom's own column math, mirrored there) gets
+    // painted, not the row's entire width. This used to paint every row
+    // touched by the selection edge-to-edge regardless of which columns
+    // were actually selected on it - correct for the FULL interior rows
+    // of a multi-row selection (those genuinely are selected end to end),
+    // but wrong for the first/last row of the selection, where only part
+    // of the row (often just the one word actually long-pressed/dragged
+    // over) was selected - the rest of that row's width got the same
+    // highlight anyway, which is what read as "seçmediğim yer de seçili
+    // görünüyor". Must happen before the glyph/cursor drawing loop so the
+    // highlight sits behind the text instead of covering it.
+    if (selectedColumnRanges.isNotEmpty()) {
         val hlPaint = Paint().apply { color = highlightColor }
         val rowCharHeight = Paint().apply {
             typeface = fontFamily
             textSize = fontSizeSp * density * fontScale
         }.fontSpacing
-        val rowWidth = size.width
         drawIntoCanvas { hlCanvas ->
-            for (row in selectedRows) {
+            for ((row, colRange) in selectedColumnRanges) {
                 if (row !in 0 until buffer.rows) continue
+                if (colRange.isEmpty()) continue
                 val top = row * rowCharHeight
-                hlCanvas.nativeCanvas.drawRect(0f, top, rowWidth, top + rowCharHeight, hlPaint)
+                val left = colRange.first * charWidth
+                // colRange.last is inclusive (IntRange) - +1 to get the
+                // exclusive right edge in px, same "up to but not
+                // including" convention recomputeFrom's own toColExclusive
+                // uses.
+                val right = (colRange.last + 1) * charWidth
+                hlCanvas.nativeCanvas.drawRect(left, top, right, top + rowCharHeight, hlPaint)
             }
         }
     }
@@ -1077,7 +1367,7 @@ private fun DrawScope.drawTerminal(
         // (scrollOffset > 0) the cursor's actual row/col don't correspond
         // to what's currently being displayed, so drawing it would just
         // put a stray white block over unrelated scrollback text.
-        if (scrollOffset == 0 && buffer.cursorVisible && buffer.cursorRow in 0 until buffer.rows && buffer.cursorCol in 0 until buffer.columns) {
+        if (!suppressCursor && scrollOffset == 0 && buffer.cursorVisible && buffer.cursorRow in 0 until buffer.rows && buffer.cursorCol in 0 until buffer.columns) {
             val cursorX = buffer.cursorCol * charWidth
             val cursorY = (buffer.cursorRow + 1) * charHeight
             bgPaint.color = android.graphics.Color.WHITE

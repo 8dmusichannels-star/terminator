@@ -156,6 +156,60 @@ class TerminalBuffer(
     // lost - only how much of it this class keeps as live objects.
     val scrollback: ArrayDeque<Array<Cell>> = ArrayDeque()
 
+    // Counts lines pushed into scrollback by scrollUp() since the last
+    // consumePendingScrollLines() call. A running program's own output -
+    // completely separate from the user dragging scrollOffset - also
+    // shifts what every row/scrollOffset pair addresses, but nothing
+    // previously told an in-progress text selection that had happened:
+    // shiftRows()/recomputeFrom() only ever ran from the user-scroll call
+    // sites (edge-auto-scroll, drag-while-selecting), all of which change
+    // scrollOffset itself. New PTY output changes nothing about
+    // scrollOffset - it mutates scrollback/grid directly - so a selection
+    // sitting idle (or a long one still being read before lift) while a
+    // flooding command like `yes` or `cat` keeps printing silently went
+    // stale: the same (row, scrollOffset) pair it was anchored to now
+    // refers to different, newer content, so Copy could grab the wrong
+    // lines or - once enough output evicted the exact scrollback lines a
+    // selection pointed into - some rows resolved to blank Cells instead.
+    // Longer-lived selections (long drags, or a pause before lifting the
+    // handle) simply have a wider window for this to happen in, which is
+    // why it reads as "bazen oluyor, uzun seçimlerde" rather than always.
+    private var pendingScrollLines: Int = 0
+
+    /** Returns and clears the number of lines scrollUp() has pushed into
+     *  scrollback since the last call - lets a caller (TerminalView, once
+     *  per content-change tick) detect PTY-output-driven scrolling that
+     *  scrollOffset-based tracking never sees, and shiftRows()/clear() an
+     *  active selection to match. Not under `lock`: reads/writes of a
+     *  single Int are already atomic enough here, and wrapping this in
+     *  the same lock scrollUp() takes would risk a self-deadlock if a
+     *  future caller ever consumed it from inside another locked call. */
+    fun consumePendingScrollLines(): Int {
+        val n = pendingScrollLines
+        pendingScrollLines = 0
+        return n
+    }
+
+    // Set by resize() whenever newColumns != columns. Row-level shifting
+    // (pendingScrollLines) is enough to keep a selection's row indices
+    // pointing at the right LINE after a resize, but a column-count change
+    // invalidates the selection's anchorCol/focusCol outright - "column 40"
+    // meant something different on an 80-wide grid than it does on a
+    // 47-wide one, and there's no shift that fixes that, only re-selecting.
+    // A caller (TerminalView) should treat this the same as consuming
+    // pendingScrollLines: clear() the selection instead of shiftRows()-ing
+    // it whenever this reads true.
+    private var pendingColumnsChanged: Boolean = false
+
+    /** Returns and clears whether resize() changed the column count since
+     *  the last call - see [pendingColumnsChanged]'s doc for why this means
+     *  "clear the selection", not "shift it". */
+    fun consumePendingColumnsChanged(): Boolean {
+        val v = pendingColumnsChanged
+        pendingColumnsChanged = false
+        return v
+    }
+
     fun cellAt(row: Int, col: Int): Cell = lock.withLock {
         if (row in grid.indices && col in 0 until columns) grid[row][col] else Cell()
     }
@@ -386,6 +440,13 @@ class TerminalBuffer(
             while (scrollback.size > MAX_SCROLLBACK_LINES) {
                 scrollback.removeFirst()
             }
+            // Alternate-screen scrolling (TUI apps) has no scrollback
+            // semantics at all - see the altGrid==null guard just above -
+            // so a selection can't be pointing into it via scrollOffset in
+            // the first place; only count real, primary-screen scrolling
+            // here. See consumePendingScrollLines()'s doc for why this
+            // exists.
+            pendingScrollLines++
         }
         for (r in 0 until rows - 1) {
             grid[r] = grid[r + 1]
@@ -489,9 +550,101 @@ class TerminalBuffer(
 
     /** Resizes the grid, preserving existing content where possible. */
     fun resize(newColumns: Int, newRows: Int) = lock.withLock {
+        val oldColumns = columns
+        // On a shrink, rows above `rowOffset` are about to fall off the top
+        // of the grid. Previously they were just discarded outright - the
+        // helper below always kept rows 0 until newRows of the OLD grid,
+        // i.e. the TOP of the pre-resize screen, and threw away everything
+        // below that, including whatever was near the cursor. That's what
+        // made a floating-pane shrink both destroy scrollback AND make
+        // stale old-top-of-screen content resurface once new output landed
+        // on top of it ("eski komutlar yeni pencereye yansıyor").
+        // On the primary screen (alternate-screen apps like htop/vim have
+        // no scrollback semantics - same altGrid-null guard used for CSI 3J
+        // elsewhere in this class) push those overflowing rows into
+        // scrollback, oldest-first, and keep the BOTTOM newRows rows -
+        // where the cursor and most recent output actually are - as the
+        // new grid, mirroring how a real terminal shrink behaves.
+        val rowOffset = if (altGrid == null && newRows < rows) rows - newRows else 0
+        if (rowOffset > 0) {
+            for (i in 0 until rowOffset) {
+                scrollback.addLast(grid[i])
+            }
+            while (scrollback.size > MAX_SCROLLBACK_LINES) {
+                scrollback.removeFirst()
+            }
+        }
+        // On a grow (pinch-zoom out, or an immediate grow right after a
+        // shrink from the same gesture), newRows > rows means we need MORE
+        // rows than the old grid had. The naive approach - just pad the
+        // extra rows with blank Cell() - is what was happening before, and
+        // it's wrong whenever the primary screen (altGrid == null, same
+        // scrollback-eligible guard as above) just pushed rows into
+        // scrollback moments earlier: those rows are still the most recent
+        // reality of the top of the screen, and the user watching a rapid
+        // pinch (shrink then grow, tick after tick) would see them get
+        // silently erased instead of reappearing, which is exactly the
+        // "growing patches of blank rows eating the screen" symptom.
+        // Pull back up to `growCount` lines from the tail of scrollback
+        // (oldest-appended-last, so the tail is what was most recently
+        // pushed) to seed the newly-added rows at the top instead of
+        // leaving them blank.
+        val growCount = if (altGrid == null && newRows > rows) newRows - rows else 0
+        val reclaimed: List<Array<Cell>> = if (growCount > 0) {
+            val take = minOf(growCount, scrollback.size)
+            val lines = ArrayList<Array<Cell>>(take)
+            repeat(take) { lines.add(0, scrollback.removeLast()) }
+            lines
+        } else {
+            emptyList()
+        }
+        val growOffset = reclaimed.size
+        // scrollback didn't have enough lines to fill the whole grow (the
+        // common case right after a session starts, before enough output
+        // has accumulated to push anything into scrollback yet - exactly
+        // when a floating pane's keyboard-close or corner-drag grow first
+        // happens). The old code only ever inserted `reclaimed.size` blank/
+        // reclaimed rows at the top and left the remaining
+        // growCount - growOffset shortfall for `resized()`'s row-count math
+        // to implicitly pad at the BOTTOM instead (newRows rows total, only
+        // growOffset of them accounted for above the shifted-down old
+        // content) - which put a growing gap of dead blank rows under the
+        // live screen and left the actual content (and the cursor sitting
+        // in it) stranded near the TOP of the now-taller grid instead of
+        // anchored to the bottom where a real terminal keeps it. That's the
+        // "beyaz cursor ekranin ortasinda asili kaliyor" bug: cursorRow's
+        // own coerceIn below never moved it, because rowOffset/growOffset
+        // (the only terms that shift it) didn't reflect this shortfall at
+        // all. Padding the shortfall onto growOffset itself - as genuinely
+        // blank rows, same shape as a reclaimed line - fixes both the
+        // padding side (blanks now land above the content, not below) and
+        // the cursor math below (which reads growOffset) in one place.
+        val growShortfall = growCount - growOffset
+        val totalTopPadding = growOffset + growShortfall
+        // Reclaimed lines were stored at the OLD column width, which may
+        // differ from newColumns (the same pinch tick can change both rows
+        // and columns at once as font size changes). Re-map them through
+        // the same column-width adjustment the rest of the grid gets below,
+        // instead of copying the raw array directly - otherwise a width
+        // change on the same tick would either truncate silently (array too
+        // long for the new row) or crash with an index-out-of-bounds
+        // (array too short).
+        fun resizeRow(line: Array<Cell>): Array<Cell> = Array(newColumns) { c ->
+            if (c < line.size) line[c] else Cell()
+        }
         fun resized(g: Array<Array<Cell>>): Array<Array<Cell>> = Array(newRows) { r ->
-            Array(newColumns) { c ->
-                if (r < rows && c < columns) g[r][c] else Cell()
+            if (r < totalTopPadding) {
+                // First growOffset rows are real reclaimed scrollback;
+                // anything beyond that (the growShortfall) is genuinely
+                // blank - there was no more scrollback left to pull from -
+                // but still belongs at the TOP alongside the reclaimed
+                // rows, not implicitly at the bottom.
+                if (r < growOffset) resizeRow(reclaimed[r]) else Array(newColumns) { Cell() }
+            } else {
+                val srcRow = r - totalTopPadding + rowOffset
+                Array(newColumns) { c ->
+                    if (srcRow < rows && c < columns) g[srcRow][c] else Cell()
+                }
             }
         }
         grid = resized(grid)
@@ -508,11 +661,60 @@ class TerminalBuffer(
         // stale, wrong-sized array. Re-pointing it here keeps the "altGrid
         // is grid, while active" invariant intact across a resize.
         if (altGrid != null) altGrid = grid
-        savedGrid = savedGrid?.let { resized(it) }
+        // savedGrid only exists while altGrid != null (see
+        // enterAlternateScreen/exitAlternateScreen), and growCount above is
+        // gated on altGrid == null - so whenever savedGrid is non-null,
+        // growOffset is guaranteed to be 0 and `reclaimed` is empty. Resize
+        // it with its own rowOffset-only helper (no reclaimed rows) rather
+        // than reusing the closure above, so it never accidentally
+        // double-dips into rows already handed to the primary grid.
+        fun resizedPlain(g: Array<Array<Cell>>): Array<Array<Cell>> = Array(newRows) { r ->
+            val srcRow = r + rowOffset
+            Array(newColumns) { c ->
+                if (srcRow < rows && c < columns) g[srcRow][c] else Cell()
+            }
+        }
+        savedGrid = savedGrid?.let { resizedPlain(it) }
         columns = newColumns
         rows = newRows
-        cursorRow = cursorRow.coerceIn(0, rows - 1)
+        // Content moved up by rowOffset rows above (bottom of the old grid
+        // is now the new grid), so cursorRow/savedCursorRow have to move
+        // with it - otherwise the cursor (and a later DECRC restoring
+        // savedCursorRow) would land on the wrong, now-shifted row.
+        // Conversely, totalTopPadding rows were just inserted ABOVE the old
+        // content (growOffset reclaimed from scrollback, growShortfall
+        // genuinely blank - see totalTopPadding's own doc), so the cursor
+        // has to move DOWN by that same total or it'll end up sitting that
+        // many rows too high, floating over content that isn't actually
+        // where the cursor last was.
+        cursorRow = (cursorRow + totalTopPadding - rowOffset).coerceIn(0, rows - 1)
         cursorCol = cursorCol.coerceIn(0, columns - 1)
+        if (rowOffset > 0) {
+            savedCursorRow = (savedCursorRow - rowOffset).coerceIn(0, rows - 1)
+        }
+        // Same "content moved under a fixed (row, scrollOffset) pair"
+        // situation consumePendingScrollLines()'s doc describes for
+        // scrollUp() - a pinch-zoom resize shifts every row's content up
+        // by rowOffset (shrink) or down by growOffset (grow) without
+        // touching scrollOffset, so an active selection anchored to old
+        // row indices silently points at different content afterward: the
+        // handles/highlight visually "stick" to whatever now occupies
+        // those same row numbers instead of the text the user actually
+        // selected - which is exactly what made a selection appear over
+        // unselected text after zooming. Net delta matches scrollUp()'s
+        // sign convention (positive = pushed into scrollback / content
+        // moved up), so it's rowOffset - totalTopPadding (not just
+        // growOffset - see totalTopPadding's own doc: old content actually
+        // shifts down by growOffset PLUS growShortfall, not growOffset
+        // alone, whenever scrollback ran out before the grow was fully
+        // covered); TerminalView's LaunchedEffect(bufferVersion) picks this
+        // up the same tick it consumes any scrollUp()-driven lines.
+        if (rowOffset != totalTopPadding) {
+            pendingScrollLines += (rowOffset - totalTopPadding)
+        }
+        if (newColumns != oldColumns) {
+            pendingColumnsChanged = true
+        }
     }
 
     fun rowText(row: Int): String = lock.withLock {

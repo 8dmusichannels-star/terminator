@@ -839,6 +839,11 @@ private fun PaneContent(
     // inside it stays pinned at its old column/row count the entire time.
     var isManuallyResizing by remember(runtimeId) { mutableStateOf(false) }
     val latestIsManuallyResizing = rememberUpdatedState(isManuallyResizing)
+    // Wall-clock time (System.currentTimeMillis()) of the last commit
+    // actually pushed to the pty during a manual corner-handle drag - see
+    // onSizeChanged's own doc below for why this turns the 32ms manual
+    // window into a genuine THROTTLE instead of a debounce.
+    var lastManualResizeCommitMs by remember(runtimeId) { mutableStateOf(0L) }
 
     // Local scroll offset into this pane's own scrollback - independent of
     // every other pane's, and of the classic single-pane view's scrollOffset.
@@ -1077,19 +1082,43 @@ private fun PaneContent(
                             //
                             // While a manual corner-handle drag is in
                             // progress (isManuallyResizing, see its own doc
-                            // just above), fall to a much shorter ~2-frame
-                            // delay instead of the full 120ms: still enough
-                            // to coalesce the handful of onSizeChanged calls
-                            // Compose can deliver within a single frame, but
-                            // short enough that the pty (and therefore the
-                            // Canvas grid actually drawing new content) keeps
-                            // up with the finger in real time rather than
-                            // only catching up once the whole drag ends.
+                            // just above), this used to fall to a shorter
+                            // ~2-frame (32ms) DEBOUNCE instead of the full
+                            // 120ms - but a debounce restarts its delay on
+                            // every single call, and a continuous drag
+                            // delivers a new onSizeChanged practically every
+                            // frame, so the 32ms timer kept getting cancelled
+                            // and re-armed the whole time the finger was
+                            // moving - it only ever actually fired in the
+                            // brief gaps where movement paused for a beat,
+                            // which is what still read as laggy ("Floating
+                            // boyutlandirmasi sonrasi... biraz gecikmeli").
+                            // Fixed by throttling instead: while manually
+                            // resizing, if at least ~32ms have passed since
+                            // the last real commit, apply this size
+                            // IMMEDIATELY (no delay at all) rather than
+                            // scheduling another timer - so the pty/Canvas
+                            // grid updates at a steady ~30fps-ish cadence
+                            // that keeps pace with the finger throughout the
+                            // whole drag, not just once it stops.
                             latestPaneSizePx = sizePx
+                            if (latestIsManuallyResizing.value) {
+                                val now = System.currentTimeMillis()
+                                if (now - lastManualResizeCommitMs >= 32L) {
+                                    lastManualResizeCommitMs = now
+                                    paneResizeDebounceJob?.cancel()
+                                    val (charWidth, charHeight) = latestCharMetrics.value
+                                    if (charWidth > 0f && charHeight > 0f) {
+                                        val cols = (sizePx.width / charWidth).toInt().coerceAtLeast(1)
+                                        val rws = (sizePx.height / charHeight).toInt().coerceAtLeast(1)
+                                        latestOnMeasuredSize.value(cols, rws, sizePx.width, sizePx.height)
+                                    }
+                                }
+                                return@onSizeChanged
+                            }
                             paneResizeDebounceJob?.cancel()
-                            val debounceMs = if (latestIsManuallyResizing.value) 32L else 120L
                             paneResizeDebounceJob = paneResizeScope.launch {
-                                delay(debounceMs)
+                                delay(120L)
                                 val (charWidth, charHeight) = latestCharMetrics.value
                                 val finalSize = latestPaneSizePx
                                 if (charWidth > 0f && charHeight > 0f && finalSize != null) {
@@ -1142,7 +1171,16 @@ private fun PaneContent(
                                     if (h <= 0f) continue
                                     val y = pointer.position.y
                                     val edgePx = h * edgeFraction
-                                    val (_, charHeight) = charMetrics
+                                    // latestCharMetrics.value, not the plain charMetrics -
+                                    // this whole edge-auto-scroll loop lives inside
+                                    // pointerInput(runtimeId), a coroutine that (like
+                                    // MainActivity's primary-pane gesture loop) is only
+                                    // relaunched when runtimeId itself changes, not on
+                                    // every font-size/zoom change. See MainActivity's own
+                                    // latestCharMetrics.value fix for the full doc - same
+                                    // stale-closure bug, same fix, just in this tile's
+                                    // copy of the gesture stack.
+                                    val (_, charHeight) = latestCharMetrics.value
                                     if (charHeight <= 0f) continue
                                     val maxOffset = buffer.maxScrollOffset
                                     when {
@@ -1211,10 +1249,12 @@ private fun PaneContent(
                             with(MouseGestureTracker) {
                                 runMouseHoverGesture(
                                     wantsHover = onWantsMouseMoveEvents,
-                                    charSize = { charMetrics },
+                                    // latestCharMetrics.value - see the edge-auto-scroll
+                                    // block above's doc, same stale-closure fix.
+                                    charSize = { latestCharMetrics.value },
                                     bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                 ) { col, row ->
-                                    val (cw, ch) = charMetrics
+                                    val (cw, ch) = latestCharMetrics.value
                                     lastMousePosition = Offset(col * cw, row * ch)
                                     onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
                                 }
@@ -1229,7 +1269,9 @@ private fun PaneContent(
                                 runMouseWheelGesture(
                                     wantsWheelReporting = onWantsMouseEvents,
                                     emitWheelToApp = { kind, col, row -> onMouseEvent(kind, col, row, 0) },
-                                    charSize = { charMetrics },
+                                    // latestCharMetrics.value - same stale-closure fix as
+                                    // the hover/edge-scroll blocks above.
+                                    charSize = { latestCharMetrics.value },
                                     bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                     lastPointerPosition = { lastMousePosition },
                                 ) { deltaLines ->
@@ -1291,7 +1333,7 @@ private fun PaneContent(
                                 scrollFling.track(down.uptimeMillis, down.position)
                                 edgeWheelAutoScroll.reset()
 
-                                if (onWantsMouseEvents() && charMetrics.first > 0f && charMetrics.second > 0f) {
+                                if (onWantsMouseEvents() && latestCharMetrics.value.first > 0f && latestCharMetrics.value.second > 0f) {
                                     // Mouse reporting owns the whole gesture,
                                     // same as before: press/drag/release become
                                     // xterm mouse escape sequences instead of
@@ -1307,7 +1349,9 @@ private fun PaneContent(
                                     with(MouseGestureTracker) {
                                         runMouseReportGesture(
                                             down = down,
-                                            charSize = { charMetrics },
+                                            // latestCharMetrics.value - same stale-closure
+                                            // fix as this block's siblings above.
+                                            charSize = { latestCharMetrics.value },
                                             bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                             onMove = { uptimeMillis, position ->
                                                 scrollFling.track(uptimeMillis, position)
@@ -1356,7 +1400,8 @@ private fun PaneContent(
                                         }
                                     }
                                     scrollFling.releaseAsWheelEvents(
-                                        charHeightPx = { charMetrics.second },
+                                        // latestCharMetrics.value - same stale-closure fix.
+                                        charHeightPx = { latestCharMetrics.value.second },
                                         col = lastCol,
                                         row = lastRow,
                                     ) { kind, col, row ->
@@ -1458,7 +1503,9 @@ private fun PaneContent(
                                         // slop is silently dropped) and fall
                                         // through to the pan/pinch loop below.
                                         primary.consume()
-                                        val (_, charHeight) = charMetrics
+                                        // latestCharMetrics.value - same stale-closure fix
+                                        // as this tile's other gesture blocks above.
+                                        val (_, charHeight) = latestCharMetrics.value
                                         if (charHeight > 0f) {
                                             val deltaLines = -(totalDy / charHeight)
                                             val maxOffset = buffer.maxScrollOffset
@@ -1524,7 +1571,19 @@ private fun PaneContent(
                                         val midY = (p1.position.y + p2.position.y) / 2f
                                         val prevMidY = lastMidY
                                         if (prevMidY != null) {
-                                            val (_, charHeight) = charMetrics
+                                            // latestCharMetrics.value - the actual root
+                                            // cause of the same "imleç/ekran yukarı kayıyor"
+                                            // bug in this tile: this pinch/pan loop lives
+                                            // inside pointerInput(runtimeId), which only
+                                            // relaunches when runtimeId changes, so the
+                                            // plain charMetrics closed over here was frozen
+                                            // at whatever font size was active before this
+                                            // gesture (or session) started - scrolling
+                                            // WHILE pinching kept computing deltaLines
+                                            // against that stale row height instead of the
+                                            // live one, drifting content/cursor position
+                                            // further off with every such frame.
+                                            val (_, charHeight) = latestCharMetrics.value
                                             if (charHeight > 0f) {
                                                 val deltaLines = -((midY - prevMidY) / charHeight)
                                                 if (deltaLines != 0f) {
@@ -1549,7 +1608,9 @@ private fun PaneContent(
                                         change.consume()
                                         val dy = change.position.y - change.previousPosition.y
                                         if (dy != 0f) {
-                                            val (_, charHeight) = charMetrics
+                                            // latestCharMetrics.value - same stale-closure
+                                            // fix as the two-finger branch just above.
+                                            val (_, charHeight) = latestCharMetrics.value
                                             if (charHeight > 0f) {
                                                 val deltaLines = -(dy / charHeight)
                                                 val maxOffset = buffer.maxScrollOffset
@@ -1676,6 +1737,22 @@ private fun PaneContent(
                         // every multi-pane tile regardless of that tile's own palette.
                         highlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f).toArgb(),
                         handleColor = MaterialTheme.colorScheme.primary.toArgb(),
+                        // zoomSizeSp != null: this tile is mid pinch-zoom, rendering at
+                        // a live/preview effectiveFontSizeSp that hasn't reached
+                        // TerminalSession.resize() yet (that only happens once
+                        // onSizeChanged's own 120ms - or 32ms while manually
+                        // resizing - debounce above actually fires). Exactly the same
+                        // gap MainActivity/SplitTerminalPane's own suppressCursor doc
+                        // describes: until that commit lands, buffer.cursorRow/
+                        // cursorCol are still the OLD grid coordinates, and drawTerminal
+                        // would multiply them by the NEW live charWidth/charHeight,
+                        // detaching the block cursor from the actual glyph grid for the
+                        // whole gesture - a stray white block drifting away from (often
+                        // upward of) where the cursor actually is. This tile never got
+                        // that suppressCursor wiring when the fix landed on the other
+                        // two panes, which is why "imleç zoom yaparken yukarı kayıyor"
+                        // kept reproducing specifically in multi-pane/floating mode.
+                        suppressCursor = zoomSizeSp != null,
                         modifier = Modifier.fillMaxSize()
                     )
                     // Anchored in this same Box as TerminalView (top-center
@@ -1810,6 +1887,12 @@ private fun PaneContent(
                                     // follows the finger instead of only
                                     // catching up once it lifts.
                                     isManuallyResizing = true
+                                    // Reset so the very first onSizeChanged of
+                                    // this new drag commits immediately
+                                    // instead of waiting out the 32ms window
+                                    // left over from whenever the previous
+                                    // drag's last commit happened to land.
+                                    lastManualResizeCommitMs = 0L
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
@@ -1863,10 +1946,18 @@ private fun PaneContent(
                             )
                         }
                 ) {
+                    // Full opacity while actively being dragged (0.35f the
+                    // rest of the time, same as before) - a static low alpha
+                    // made the handle hard to track under the finger during
+                    // the resize itself, exactly when the user needs the
+                    // clearest visual feedback ("Floating boyutlandirirken
+                    // parmak opakligi okadar iyi sayilmaz"). isFocused isn't
+                    // involved here on purpose: this is about the drag
+                    // gesture's own state, not which pane has input focus.
                     Icon(
                         Icons.Filled.OpenWith,
                         contentDescription = "Drag to resize",
-                        tint = Color.White.copy(alpha = 0.35f),
+                        tint = Color.White.copy(alpha = if (isManuallyResizing) 0.9f else 0.35f),
                         modifier = Modifier.size(16.dp).align(Alignment.BottomEnd)
                     )
                 }
