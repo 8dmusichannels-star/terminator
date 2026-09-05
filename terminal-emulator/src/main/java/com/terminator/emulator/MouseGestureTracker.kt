@@ -30,6 +30,7 @@ import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerButtons
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.PointerType
@@ -231,6 +232,78 @@ object MouseGestureTracker {
                     emit(col, row)
                 }
                 if (change.changedToUp()) break
+            }
+        }
+    }
+
+    /**
+     * Physical mouse/trackpad scroll-wheel support (Android's
+     * `MotionEvent.ACTION_SCROLL`, surfaced to Compose as
+     * [PointerEventType.Scroll]) - previously never handled anywhere in
+     * this app at all, so a connected mouse's wheel notch did nothing
+     * ("fiziksel mouse scrollback destegi eksik"). Owns its own gesture
+     * loop the same way [runMouseHoverGesture] does, since a scroll event
+     * can arrive with no button ever pressed - it isn't part of the
+     * press/drag/release lifecycle [runMouseReportGesture] tracks.
+     *
+     * Two destinations depending on [wantsWheelReporting]:
+     * - Session wants mouse reporting (an app like htop/mc/less/vim has
+     *   enabled xterm mouse mode): each notch is forwarded as one
+     *   WHEEL_UP/WHEEL_DOWN mouse event via [emitWheelToApp], exactly what
+     *   a real terminal does - the app decides what a wheel notch means
+     *   (scroll its own list, etc), not this terminal.
+     * - Otherwise: each notch adjusts [emitScrollback]'s scrollOffset
+     *   directly (this app's own shell scrollback), same direction/amount
+     *   a touch drag would.
+     *
+     * `scrollDelta.y` is already sign-correct for "content moves with the
+     * gesture" (positive = wheel down / scroll content up) on Android;
+     * xterm's own WHEEL_DOWN encoding matches that directly, so no sign
+     * flip is needed here for the reporting path. For scrollback,
+     * `towardScrollback` (wheel up -> reveal older history) is the
+     * negated sense, same relationship [EdgeWheelAutoScroll] already
+     * documents for its own wheel-direction mapping.
+     */
+    suspend fun PointerInputScope.runMouseWheelGesture(
+        wantsWheelReporting: () -> Boolean,
+        emitWheelToApp: (kind: TerminalEmulator.MouseEventKind, col: Int, row: Int) -> Unit,
+        charSize: () -> Pair<Float, Float>,
+        bufferSize: () -> Pair<Int, Int>,
+        lastPointerPosition: () -> Offset,
+        emitScrollback: (deltaLines: Float) -> Unit,
+    ) {
+        awaitEachGesture {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Main)
+                if (event.type != PointerEventType.Scroll) continue
+                val change = event.changes.firstOrNull() ?: continue
+                // notches -> lines: one full notch (scrollDelta.y == 1f on
+                // Android) is one wheel step. Fractional deltas (some
+                // trackpads / high-res mice report continuous values) are
+                // accumulated as fractional lines rather than rounded away.
+                val notches = change.scrollDelta.y
+                if (notches == 0f) continue
+                change.consume()
+                if (wantsWheelReporting()) {
+                    val (charWidth, charHeight) = charSize()
+                    if (charWidth <= 0f || charHeight <= 0f) continue
+                    val (cols, rows) = bufferSize()
+                    val (col, row) = cellOf(lastPointerPosition(), charWidth, charHeight, cols, rows)
+                    val kind = if (notches > 0f) TerminalEmulator.MouseEventKind.WHEEL_DOWN else TerminalEmulator.MouseEventKind.WHEEL_UP
+                    // One event per whole notch - a fast trackpad fling can
+                    // report several notches worth of delta in one Scroll
+                    // event, and the app on the other end (htop/mc/less)
+                    // expects one discrete wheel event per line, same as a
+                    // real terminal emulator forwards.
+                    repeat(kotlin.math.abs(notches).toInt().coerceAtLeast(1)) {
+                        emitWheelToApp(kind, col, row)
+                    }
+                } else {
+                    // Reversed sign vs `notches`, same "wheel up reveals
+                    // older history" convention [EdgeWheelAutoScroll] and
+                    // the existing touch-drag scrollback path both use.
+                    emitScrollback(-notches)
+                }
             }
         }
     }

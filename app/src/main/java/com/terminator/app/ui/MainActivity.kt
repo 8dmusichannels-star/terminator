@@ -1073,6 +1073,14 @@ class MainActivity : ComponentActivity() {
                             val edgeWheelAutoScroll = remember(activeSessionId) { MouseGestureTracker.EdgeWheelAutoScroll() }
                             var resizeDebounceJob by remember { mutableStateOf<Job?>(null) }
                             var latestTerminalSize by remember { mutableStateOf<IntSize?>(null) }
+                            // Last known pointer position (px, terminal-local) for a real
+                            // mouse - kept fresh by the hover-MOVE gesture block below and
+                            // reused as the fixed col/row a wheel notch reports at, same as
+                            // Termux holds mMouseScrollStartX/Y for the same purpose. A wheel
+                            // Scroll event carries a delta, not a position, so without this
+                            // wheel-triggered WHEEL_UP/WHEEL_DOWN mouse events would have
+                            // nowhere real to report against.
+                            var lastMousePosition by remember { mutableStateOf(Offset.Zero) }
                             // Tracks device orientation so a rotation can skip the IME
                             // debounce below and resize immediately instead. The 120ms
                             // debounce exists to ignore transient mid-animation sizes
@@ -1115,28 +1123,24 @@ class MainActivity : ComponentActivity() {
                             val latestCharMetrics = rememberUpdatedState(charMetrics)
 
                             // Recomputes cols/rows from the current pixel size and char metrics,
-                            // then pushes them to the pty (SIGWINCH). Normally cols stays pinned
-                            // to Settings > Appearance > "Terminal width" and only rows auto-fit
-                            // to the available height (see the comment below). But while this
-                            // session has an active pinch-zoom override (liveZoomSize mid-pinch,
-                            // or sessionTextSize once committed), cols is derived from the real
-                            // pixel width / charWidth too, so full-screen apps (nano, vim, htop)
-                            // actually reflow to match what the user is seeing instead of quietly
-                            // keeping the old grid. The moment the override is gone - pinch back
-                            // to the global size, or the session closes - cols snaps back to the
-                            // fixed setting on the next resize.
+                            // then pushes them to the pty (SIGWINCH). Both cols and rows are
+                            // always derived from the real pixel viewport (same math
+                            // MultiPaneContainer's per-pane resize already used) so full-screen
+                            // apps (nano, vim, htop, mc) actually reflow to fill whatever space
+                            // is really on screen - resizing the window (split-screen,
+                            // freeform, folding) previously only adjusted rows while cols stayed
+                            // pinned to Settings > Appearance > "Terminal width" (default 80),
+                            // so those apps could never actually fill a wider viewport and
+                            // SIGWINCH kept reporting a stale column count. columnsSetting is
+                            // no longer read here; it's still exposed as a UI setting, but does
+                            // nothing until a future "fixed width" toggle re-enables it.
                             fun applyResize() {
                                 val (charWidth, charHeight) = charMetrics
                                 val finalSize = latestTerminalSize
                                 if (charWidth <= 0f || charHeight <= 0f || finalSize == null) return
-                                val zoomActive = liveZoomSize != null || sessionTextSize != null
-                                val cols = if (zoomActive) {
-                                    (finalSize.width / charWidth).toInt().coerceAtLeast(1)
-                                } else {
-                                    columnsSetting.toInt().coerceAtLeast(1)
-                                }
+                                val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                 val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
-                                viewModel.updateTerminalSize(cols, rws)
+                                viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
                             }
 
                             // Forces an immediate (non-debounced) resize whenever orientation
@@ -1241,7 +1245,7 @@ class MainActivity : ComponentActivity() {
                                     onClosePane = { runtimeId -> viewModel.removePane(runtimeId) },
                                     onMovePane = { runtimeId, offset -> viewModel.movePane(runtimeId, offset) },
                                     onResizePane = { runtimeId, size -> viewModel.resizePane(runtimeId, size) },
-                                    onResizeSessionPty = { runtimeId, cols, rws -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws) },
+                                    onResizeSessionPty = { runtimeId, cols, rws, pxW, pxH -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws, pxW, pxH) },
                                     onSetMode = { mode -> viewModel.setPaneMode(mode) },
                                     onAddPaneRequested = {
                                         // Same "don't pop up an empty list"
@@ -1627,7 +1631,34 @@ class MainActivity : ComponentActivity() {
                                                         (buf?.columns ?: 0) to (buf?.rows ?: 0)
                                                     },
                                                 ) { col, row ->
+                                                    lastMousePosition = Offset(col * latestCharMetrics.value.first, row * latestCharMetrics.value.second)
                                                     viewModel.sendMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row)
+                                                }
+                                            }
+                                        }
+                                        .pointerInput(activeSessionId) {
+                                            // Physical mouse/trackpad scroll wheel - see
+                                            // runMouseWheelGesture's own doc for the full
+                                            // rationale ("fiziksel mouse scrollback destegi
+                                            // eksik"). Its own gesture loop, same reasoning
+                                            // as the hover block just above: a wheel notch can
+                                            // arrive with no button ever pressed, so it can't
+                                            // share the press/drag/release lifecycle below.
+                                            with(MouseGestureTracker) {
+                                                runMouseWheelGesture(
+                                                    wantsWheelReporting = { viewModel.activeSessionWantsMouseEvents() },
+                                                    emitWheelToApp = { kind, col, row -> viewModel.sendMouseEvent(kind, col, row) },
+                                                    charSize = { latestCharMetrics.value },
+                                                    bufferSize = {
+                                                        val buf = viewModel.activeBuffer()
+                                                        (buf?.columns ?: 0) to (buf?.rows ?: 0)
+                                                    },
+                                                    lastPointerPosition = { lastMousePosition },
+                                                ) { deltaLines ->
+                                                    val applied = viewModel.adjustScrollOffset(deltaLines)
+                                                    if (applied != 0) {
+                                                        selectionState.shiftRows(applied)
+                                                    }
                                                 }
                                             }
                                         }
@@ -2038,7 +2069,7 @@ class MainActivity : ComponentActivity() {
                                                                         if (charWidth > 0f && newCharHeight > 0f && finalSize != null) {
                                                                             val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                                                             val rws = (finalSize.height / newCharHeight).toInt().coerceAtLeast(1)
-                                                                            viewModel.updateTerminalSize(cols, rws)
+                                                                            viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
                                                                             // Re-anchor: the row the fingers were
                                                                             // over (anchorRow, in OLD char-height
                                                                             // units) should land at the same pixel

@@ -1423,12 +1423,12 @@ class MainViewModel(
      * keeps them legible when the IME or the virtual key bar covers part of
      * the screen and shrinks the visible terminal area.
      */
-    fun updateTerminalSize(newColumns: Int, newRows: Int) {
+    fun updateTerminalSize(newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         if (newColumns <= 0 || newRows <= 0) return
         if (newColumns == columns && newRows == rows) return
         columns = newColumns
         rows = newRows
-        liveSessions.values.forEach { it.resize(newColumns, newRows) }
+        liveSessions.values.forEach { it.resize(newColumns, newRows, pixelWidth, pixelHeight) }
         bumpVersion()
     }
 
@@ -1445,12 +1445,12 @@ class MainViewModel(
      * to the now-single active session on its next measured layout pass,
      * same as it always has.
      */
-    fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int) {
+    fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         if (newColumns <= 0 || newRows <= 0) return
         val current = paneColumnsRows[runtimeId]
         if (current != null && current.first == newColumns && current.second == newRows) return
         paneColumnsRows[runtimeId] = newColumns to newRows
-        liveSessions[runtimeId]?.resize(newColumns, newRows)
+        liveSessions[runtimeId]?.resize(newColumns, newRows, pixelWidth, pixelHeight)
         bumpVersion()
     }
 

@@ -54,6 +54,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
@@ -652,6 +653,10 @@ fun SplitTerminalPane(
                     // top/bottom edge while dragging did nothing.
                     val scrollFling = remember(runtimeId) { ScrollFling(paneCoroutineScope) }
                     val edgeWheelAutoScroll = remember(runtimeId) { MouseGestureTracker.EdgeWheelAutoScroll() }
+                    // Last known pointer position for a real mouse - see
+                    // MainActivity's own lastMousePosition doc for why a wheel
+                    // notch (a delta, not a position) needs this.
+                    var lastMousePosition by remember(runtimeId) { mutableStateOf(Offset.Zero) }
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -772,8 +777,26 @@ fun SplitTerminalPane(
                                         charSize = { charWidthPx to charHeightPx },
                                         bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                     ) { col, row ->
+                                        lastMousePosition = Offset(col * charWidthPx, row * charHeightPx)
                                         onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
                                     }
+                                }
+                            }
+                            .pointerInput(runtimeId) {
+                                // Physical mouse/trackpad scroll wheel - same
+                                // gap and same fix as MainActivity's own
+                                // primary-pane wheel block; see
+                                // runMouseWheelGesture's doc for the full
+                                // rationale.
+                                with(MouseGestureTracker) {
+                                    runMouseWheelGesture(
+                                        wantsWheelReporting = wantsMouseEvents,
+                                        emitWheelToApp = { kind, col, row -> onMouseEvent(kind, col, row, 0) },
+                                        charSize = { charWidthPx to charHeightPx },
+                                        bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
+                                        lastPointerPosition = { lastMousePosition },
+                                        emitScrollback = onScroll,
+                                    )
                                 }
                             }
                             .pointerInput(runtimeId) {
