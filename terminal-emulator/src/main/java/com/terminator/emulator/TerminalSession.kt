@@ -62,10 +62,13 @@ class TerminalSession(
     private val historyFile: File,
     private val useRoot: Boolean = false,
     // User-selectable via Settings > Keyboard > Terminal Type. Defaults to
-    // xterm-256color for full feature support; vt100/ansi are there for
-    // devices/binaries where full-screen apps don't recognize
-    // xterm-256color for lack of a matching terminfo entry.
-    private val termType: String = "xterm-256color",
+    // "NONE" (don't inject a TERM env var at all - see buildEnvironment's
+    // own doc); the other choices cover the common terminfo entries a
+    // full-screen program might expect (xterm-256color for full feature
+    // support, vt100/ANSI for devices/binaries with no matching terminfo
+    // entry for anything fancier, screen/tmux variants for running inside
+    // a multiplexer, xterm-kitty for kitty-protocol-aware programs, ...).
+    private val termType: String = "NONE",
     // Settings > Keyboard > SECCOMP. See NativePty.createSubprocess for what
     // this actually changes at the syscall level.
     private val seccompWorkaround: Boolean = false,
@@ -368,9 +371,26 @@ class TerminalSession(
         val base = mutableListOf(
             "PATH=$path",
             "HOME=${cwd ?: Environment.getExternalStorageDirectory().path}",
-            "TERM=$termType",
             "TMPDIR=${cwd ?: Environment.getExternalStorageDirectory().path}"
         )
+        // "NONE" (Settings > Keyboard > Terminal Type's own default) means
+        // don't inject a TERM at all - leave whatever the shell/exec
+        // environment would otherwise provide alone, rather than actually
+        // setting the literal string "TERM=NONE" (which is itself a
+        // recognized-but-nearly-featureless terminfo entry, not "unset").
+        if (termType != "NONE") {
+            // The Keyboard settings popup shows "ANSI" (matching the other
+            // display labels' capitalization), but the only terminfo entry
+            // that actually exists - ncurses' own hardcoded fallback and
+            // this app's bundled one alike - is the lowercase "ansi".
+            // ncurses' TERM/TERMINFO lookup is case-sensitive, so passing
+            // the label through as-is would set TERM=ANSI, which resolves
+            // to nothing and silently downgrades full-screen apps to a
+            // dumb terminal. Every other entry in TERM_TYPE_OPTIONS is
+            // already lowercase and needs no such mapping.
+            val envTermType = if (termType == "ANSI") "ansi" else termType
+            base += "TERM=$envTermType"
+        }
         if (!terminfoDir.isNullOrBlank()) {
             base += "TERMINFO=$terminfoDir"
         }
@@ -437,11 +457,44 @@ class TerminalSession(
      * cols*font-width (mouse-pixel reporting, sixel/image output, some
      * ncurses builds) need these to be non-zero to lay out correctly;
      * everything else ignores them.
+     *
+     * [deferIoctl]: true means "still mid-gesture" - buffer.resize() (and
+     * the whole onBufferResized()/cellHeightPx follow-up) still runs, so
+     * the visible grid and drawn font size stay in sync frame-to-frame
+     * (this is what keeps a continuous pinch-zoom from showing a growing
+     * black gap - see MainActivity's applyResize/zoomCommitJob docs), but
+     * the actual ioctl(TIOCSWINSZ) call - and the SIGWINCH it raises in
+     * whatever's running - is skipped. A pinch that changes columns/rows
+     * on nearly every ~150ms throttled tick was previously raising
+     * SIGWINCH that same number of times per second for the ENTIRE
+     * gesture; ncurses full-screen apps (btop chief among them) redraw
+     * their whole screen from scratch on every SIGWINCH, so a several-
+     * second pinch fired several dozen full btop redraws back to back -
+     * "zoom bug'ı tum screenlerde ... btop gibi uygulamalar glitch
+     * oluyor" was this SIGWINCH storm, not a rendering bug in btop
+     * itself or in this app's own grid math (both already correct).
+     * lastAppliedColumns/Rows is intentionally left UNCHANGED while
+     * deferred, so the final post-gesture resize() call (deferIoctl =
+     * false, from the pinch's own trailing commit or any other caller)
+     * still sees a genuine size change against the last value the PTY
+     * itself was actually told about, and fires the real ioctl exactly
+     * once for the whole gesture.
      */
-    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
         buffer.resize(columns, rows)
         if (::emulator.isInitialized) {
             emulator.onBufferResized()
+            // Keeps emulator.cellHeightPx (used only to size a natural-size
+            // Sixel/Kitty image's cursor-advance in rows - see its own doc)
+            // in sync with the view's real layout. rows > 0 guard avoids a
+            // divide-by-zero during the brief window before the first real
+            // layout pass; pixelHeight == 0 (caller hasn't measured yet, or
+            // never wires pixel size in at all) leaves cellHeightPx at 0,
+            // which imageRowSpan already treats as "unknown, use the old
+            // single-line fallback" - so this is never worse than before.
+            if (pixelHeight > 0 && rows > 0) {
+                emulator.cellHeightPx = pixelHeight / rows
+            }
         }
         // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
         // whatever's running) when cols/rows haven't actually changed - see
@@ -449,7 +502,10 @@ class TerminalSession(
         // the same cols/rows (e.g. font metrics settling a frame later)
         // isn't worth a second kernel round-trip either; the next real
         // cols/rows change will carry the corrected pixel size along.
-        if (masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
+        // deferIoctl (see this function's own doc) skips it unconditionally
+        // while a gesture is still in flight, regardless of whether cols/
+        // rows actually changed this tick.
+        if (!deferIoctl && masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
             NativePty.setWindowSize(masterFd, rows, columns, pixelWidth, pixelHeight)
             lastAppliedColumns = columns
             lastAppliedRows = rows

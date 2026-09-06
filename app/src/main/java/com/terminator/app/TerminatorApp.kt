@@ -155,6 +155,30 @@ class TerminatorApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Lets OSC 8 hyperlinks that point at a local directory (file://
+        // with no file extension to type - e.g. `ls --hyperlink` on a
+        // folder) be handed to a file manager as a raw file:// Uri typed
+        // "resource/folder", which is the convention most Android file
+        // managers (Files by Google, Solid Explorer, MiXplorer, etc.)
+        // actually look for to open a folder browser - a content:// Uri
+        // from FileProvider only exposes a single readable stream, so
+        // those apps can't browse into it as a directory at all. Passing
+        // a raw file:// Uri to another app would otherwise trip
+        // StrictMode's FileUriExposedException (an uncaught
+        // RuntimeException) on this app's targetSdk; setting a fresh,
+        // default VmPolicy (no detectFileUriExposure()) disables that
+        // death penalty for the process instead of avoiding file://
+        // Uris altogether, since here it's the only Uri shape the
+        // receiving apps understand. Regular files still go through
+        // FileProvider (see TerminalView's tap handler) since that path
+        // works fine and is the safer default - this only matters for
+        // directory links. (There is no
+        // StrictMode.disableDeathOnFileUriExposure()/permitFileUriExposure()
+        // API - the detector is opt-in per VmPolicy.Builder, so a plain
+        // rebuilt policy with nothing enabled is the actual way to turn it
+        // off; the previous line here referenced a method that doesn't
+        // exist and failed to compile.)
+        android.os.StrictMode.setVmPolicy(android.os.StrictMode.VmPolicy.Builder().build())
         sessionRepository = SessionRepository(applicationContext)
         settingsRepository = SettingsRepository(applicationContext)
         terminfoDir = extractBundledTerminfo().absolutePath
@@ -162,25 +186,51 @@ class TerminatorApp : Application() {
     }
 
     /**
-     * Settings > Keyboard > Terminal Type offers xterm-256color, vt100 and
-     * ansi. vt100/ansi work everywhere because ncurses ships hardcoded
-     * fallback definitions for those exact names - no terminfo file needed.
-     * xterm-256color has no such fallback: without a matching compiled
+     * Settings > Keyboard > Terminal Type (TERM_TYPE_OPTIONS in
+     * KeyboardSettingsScreen.kt) offers NONE, xterm, xterm-color,
+     * xterm-256color, screen, screen-256color, tmux-256color, xterm-kitty,
+     * tmux, vt220, vt100 and ANSI. Of these, vt100/ansi work everywhere
+     * with no terminfo file at all because ncurses ships hardcoded
+     * fallback definitions for those two exact (lowercase) names; every
+     * other entry has no such fallback - without a matching compiled
      * terminfo entry somewhere ncurses can find it, full-screen apps
-     * (nano/vim/htop) either misrender or silently downgrade, and most
-     * stock Android /system images don't carry one.
+     * (nano/vim/htop/tmux) either misrender or silently downgrade to a
+     * dumb terminal, and most stock Android /system images don't carry
+     * one for anything beyond maybe xterm.
      *
-     * The app bundles pre-compiled entries for all three (see
+     * The app bundles a pre-compiled entry per option below (see
      * assets/terminfo/<first-letter>/<name>, copied straight from a real
-     * ncurses install - terminfo's binary format is architecture-neutral so
-     * these work as-is on bionic) and copies them into app-private storage
-     * once per install/update. TerminalSession then points the child
-     * process's $TERMINFO env var at this directory, so ncurses looks here
-     * first regardless of what (if anything) the device itself provides.
+     * ncurses install - terminfo's binary format is architecture-neutral
+     * so these work as-is on bionic) and copies them into app-private
+     * storage once per install/update. TerminalSession then points the
+     * child process's $TERMINFO env var at this directory, so ncurses
+     * looks here first regardless of what (if anything) the device
+     * itself provides. NONE never sets $TERM at all (see
+     * buildEnvironment()) so it needs no entry; ANSI is mapped down to
+     * the lowercase "ansi" file at the same spot, since terminfo lookup
+     * is case-sensitive and only the lowercase name exists anywhere.
+     *
+     * xterm-kitty is the one exception worth calling out: unlike the
+     * others, it isn't part of the standard ncurses terminfo database -
+     * kitty ships and distributes it separately (Debian/Ubuntu's
+     * `kitty-terminfo` package) - so this entry can't be pulled from a
+     * plain ncurses install the way the rest can.
      */
     private fun extractBundledTerminfo(): File {
         val root = File(filesDir, "terminfo")
-        val entries = listOf("x/xterm-256color", "v/vt100", "a/ansi")
+        val entries = listOf(
+            "x/xterm-256color",
+            "v/vt100",
+            "a/ansi",
+            "x/xterm",
+            "x/xterm-color",
+            "x/xterm-kitty",
+            "s/screen",
+            "s/screen-256color",
+            "t/tmux",
+            "t/tmux-256color",
+            "v/vt220"
+        )
         entries.forEach { relativePath ->
             val dest = File(root, relativePath)
             // Re-copied on every startup (files are a few KB each) rather
