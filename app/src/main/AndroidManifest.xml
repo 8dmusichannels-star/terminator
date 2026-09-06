@@ -48,5 +48,21 @@
                 android:value="Keeps user-started terminal sessions alive in the background" />
         </service>
 
+        <!-- Lets OSC 8 hyperlinks that point at a local file:// path be
+             handed to other apps (a PDF viewer, image viewer, etc.) as a
+             content:// Uri instead. Passing a raw file:// Uri in an
+             Intent to another app throws FileUriExposedException on
+             Android 7.0+ (targetSdk 24+), which crashed the app on tap
+             since only ActivityNotFoundException was being caught. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 </manifest>

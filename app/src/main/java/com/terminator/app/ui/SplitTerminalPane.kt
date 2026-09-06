@@ -143,7 +143,13 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
             if (prevDist > 0f) {
                 val zoom = curDist / prevDist
                 if (zoom != 1f) {
-                    val newSize = (latestFontSize.value * zoom).coerceIn(8f, 40f)
+                    // Lower bound dropped from 8f to 4f so pinch-zoom-out can
+                    // actually pack in a lot more columns/rows than before -
+                    // 8f was cutting the gesture off well before the user's
+                    // fingers stopped moving ("uzaklaştırma az"). Below ~4f
+                    // the glyphs themselves become unmeasurable/illegible at
+                    // most device densities, so this isn't pushed further.
+                    val newSize = (latestFontSize.value * zoom).coerceIn(4f, 40f)
                     onLiveZoom(newSize)
                     cancelPendingZoomCommit()
                     // Same fix as MainActivity's own primary-pane pinch
@@ -452,7 +458,15 @@ fun SplitTerminalPane(
     // per-runtime path MultiPaneContainer's own tiles already use. Defaults
     // to a no-op so any other existing caller of this composable keeps
     // today's behavior unchanged.
-    onResize: (cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit = { _, _, _, _ -> }
+    onResize: (cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit = { _, _, _, _ -> },
+    // Settings > Terminal Behaviour > Allow custom app schemes - same flag
+    // MultiPaneContainer threads down to its own tiles' TerminalView calls.
+    // Gates whether hyperlink taps outside DEFAULT_ALLOWED_HYPERLINK_SCHEMES
+    // (market://, intent:, other app-specific deep links) are allowed to
+    // launch, vs. only the fixed whitelist. Defaults to false so any other
+    // existing caller of this composable keeps today's (whitelist-only)
+    // behavior unchanged.
+    allowCustomHyperlinkSchemes: Boolean = false
 ) {
     // Direct-tap-to-type, no separate "Type here..." input box - tapping
     // the terminal area itself focuses it and brings up the keyboard, same
@@ -785,6 +799,56 @@ fun SplitTerminalPane(
                     var paneResizeDebounceJob by remember(runtimeId) { mutableStateOf<Job?>(null) }
                     var latestPaneSizePx by remember(runtimeId) { mutableStateOf<IntSize?>(null) }
                     var paneHasSizedOnce by remember(runtimeId) { mutableStateOf(false) }
+                    // Wraps onZoomTextSize (which only persists the new font
+                    // size via viewModel.setSessionTextSize - see MainActivity's
+                    // own onZoomTextSize doc) with the same cols/rows resize
+                    // onSizeChanged below already does. A pinch changes
+                    // effectivePaneFontSize/charWidthPx/charHeightPx, not this
+                    // Box's own pixel size, so onSizeChanged never fires for a
+                    // pinch on its own - onResize (the actual
+                    // updateTerminalSizeFor call, see this pane's own onResize
+                    // doc) was only ever reached via a real pixel-size change,
+                    // leaving buffer.rows/columns exactly what they were
+                    // before the pinch while TerminalView kept drawing that
+                    // same grid at the new, smaller-or-larger char size - the
+                    // same "zoom yaparken siyah boşluk" gap already fixed for
+                    // the primary pane and the multi-pane/floating tiles, just
+                    // still open here. Reuses this pane's OWN
+                    // paneResizeDebounceJob/latestPaneSizePx pair (NOT
+                    // latestCharMetrics - see the inline doc just below for
+                    // why) rather than introducing a separate commit path, so
+                    // a pinch-driven resize and an onSizeChanged-driven one
+                    // can never race each other into two different final
+                    // sizes.
+                    val commitZoomAndResize: (Float) -> Unit = { newSize ->
+                        onZoomTextSize?.invoke(newSize)
+                        paneResizeDebounceJob?.cancel()
+                        paneResizeDebounceJob = paneCoroutineScope.launch {
+                            // Recomputed directly from newSize/density/fontScale,
+                            // NOT read off latestCharMetrics - this runs in the
+                            // same call as onLiveZoom(null) resetting liveZoomSize
+                            // back to null (see runSplitPinchZoom's own onCommitZoom/
+                            // onLiveZoom(null) pairing), so effectivePaneFontSize/
+                            // charWidthPx/charHeightPx haven't recomposed against
+                            // newSize yet - reading latestCharMetrics.value here
+                            // would still see the PRE-pinch (or previous-commit)
+                            // metrics on a session's first pinch, same stale-closure
+                            // hazard MainActivity's own primary-pane commit already
+                            // documents and works around the identical way.
+                            val metricsPaint = android.graphics.Paint().apply {
+                                typeface = fontFamily
+                                textSize = newSize * density.density * density.fontScale
+                            }
+                            val cw = metricsPaint.measureText("M")
+                            val ch = metricsPaint.fontSpacing
+                            val finalSize = latestPaneSizePx
+                            if (cw > 0f && ch > 0f && finalSize != null) {
+                                val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
+                                val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
+                                onResize(cols, rws, finalSize.width, finalSize.height)
+                            }
+                        }
+                    }
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -1066,7 +1130,7 @@ fun SplitTerminalPane(
                                                     latestFontSize = latestEffectivePaneFontSize,
                                                     coroutineScope = paneCoroutineScope,
                                                     onLiveZoom = { liveZoomSize = it },
-                                                    onCommitZoom = onZoomTextSize,
+                                                    onCommitZoom = commitZoomAndResize,
                                                     setZoomCommitJob = { zoomCommitJob = it },
                                                     cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
                                                 )
@@ -1180,7 +1244,7 @@ fun SplitTerminalPane(
                                                         latestFontSize = latestEffectivePaneFontSize,
                                                         coroutineScope = paneCoroutineScope,
                                                         onLiveZoom = { liveZoomSize = it },
-                                                        onCommitZoom = onZoomTextSize,
+                                                        onCommitZoom = commitZoomAndResize,
                                                         setZoomCommitJob = { zoomCommitJob = it },
                                                         cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
                                                     )
@@ -1318,7 +1382,8 @@ fun SplitTerminalPane(
                             highlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f).toArgb(),
                             handleColor = MaterialTheme.colorScheme.primary.toArgb(),
                             modifier = Modifier.fillMaxWidth().fillMaxHeight(),
-                            debugLabel = "split"
+                            debugLabel = "split",
+                            allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes
                         )
                         HiddenPaneInputField(
                             // wantsKeyboard added so a tap toggle-close (see the

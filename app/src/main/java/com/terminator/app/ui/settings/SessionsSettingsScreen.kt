@@ -29,7 +29,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
@@ -73,6 +75,12 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
     var editingSession by remember { mutableStateOf<SessionEntry?>(null) }
     val sessions by repo.sessions.collectAsState(initial = emptyList())
     val clearAlwaysPty by settingsRepo.flow(SettingsKeys.CLEAR_ALWAYS_PTY, false).collectAsState(initial = false)
+    val allowCustomHyperlinkSchemes by settingsRepo.flow(SettingsKeys.ALLOW_CUSTOM_HYPERLINK_SCHEMES, false)
+        .collectAsState(initial = false)
+    val allowOsc52ClipboardRead by settingsRepo.flow(SettingsKeys.ALLOW_OSC52_CLIPBOARD_READ, false)
+        .collectAsState(initial = false)
+    val forceLocalEcho by settingsRepo.flow(SettingsKeys.FORCE_LOCAL_ECHO, false)
+        .collectAsState(initial = false)
 
     Scaffold(
         topBar = {
@@ -96,7 +104,16 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            // Terminal Behaviour toggles: four Row+Column blocks of
+            // title/description text that, on a narrow or landscape
+            // screen, can add up to more height than fits above the
+            // session list - a plain, unscrollable Column here would
+            // just clip the last toggle instead of scrolling to it.
+            Column(
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
                 Text("Terminal Behaviour", style = MaterialTheme.typography.labelLarge)
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -116,6 +133,84 @@ fun SessionsSettingsScreen(onBack: () -> Unit) {
                     Switch(
                         checked = clearAlwaysPty,
                         onCheckedChange = { scope.launch { settingsRepo.set(SettingsKeys.CLEAR_ALWAYS_PTY, it) } }
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Allow custom app schemes", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Tapping a hyperlink in terminal output (OSC 8 - " +
+                                "`ls --hyperlink`, git, eza...) opens it via the " +
+                                "system, but that link's URI is whatever the " +
+                                "running command chose to print, not something " +
+                                "you typed. Off (default): only common, safe " +
+                                "schemes are opened - web links, email, phone/SMS, " +
+                                "maps, ftp/ssh/samba paths, local files, and IPFS/" +
+                                "IPNS addresses. On: any scheme is allowed through, " +
+                                "including custom app deep links (e.g. a specific " +
+                                "app's own \"appname:\" links) - only enable this " +
+                                "if you trust everything that runs in your " +
+                                "sessions.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = allowCustomHyperlinkSchemes,
+                        onCheckedChange = {
+                            scope.launch { settingsRepo.set(SettingsKeys.ALLOW_CUSTOM_HYPERLINK_SCHEMES, it) }
+                        }
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Allow OSC 52 clipboard reads", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "A program can ask (OSC 52) to read back the " +
+                                "system clipboard through the terminal - useful " +
+                                "for things like nvim's `\"+p` picking up text " +
+                                "copied outside the terminal, but also a way for " +
+                                "any command in this shell, a remote ssh session, " +
+                                "or another pane in a shared tmux to silently " +
+                                "read whatever's on your clipboard. Off " +
+                                "(default): these requests are ignored - copying " +
+                                "still works normally, only reading back is " +
+                                "blocked. On: the real clipboard contents are " +
+                                "sent back - only enable this if you trust " +
+                                "everything that runs in your sessions.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = allowOsc52ClipboardRead,
+                        onCheckedChange = {
+                            scope.launch { settingsRepo.set(SettingsKeys.ALLOW_OSC52_CLIPBOARD_READ, it) }
+                        }
+                    )
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Force local echo", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Off (default): the shell/program itself decides " +
+                                "whether to echo what you type - correct for almost " +
+                                "everything, since most programs already echo your " +
+                                "input back over the pty on their own. On: this app " +
+                                "echoes typed characters locally, on top of " +
+                                "whatever the program sends back - only useful for " +
+                                "a remote session (e.g. a raw serial or ssh -T " +
+                                "connection) that has echo disabled on its end, " +
+                                "where nothing appears as you type otherwise. " +
+                                "Turning this on for a normal local shell will " +
+                                "double up every character you type.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = forceLocalEcho,
+                        onCheckedChange = { scope.launch { settingsRepo.set(SettingsKeys.FORCE_LOCAL_ECHO, it) } }
                     )
                 }
             }
