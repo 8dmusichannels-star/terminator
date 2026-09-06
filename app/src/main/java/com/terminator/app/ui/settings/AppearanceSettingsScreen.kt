@@ -157,7 +157,12 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
             Slider(
                 value = textSize,
                 onValueChange = { scope.launch { repo.set(SettingsKeys.TEXT_SIZE, it) } },
-                valueRange = 8f..28f
+                // Lower bound dropped from 8f to 4f to match pinch-zoom's own
+                // widened zoom-out range (see MainActivity/SplitTerminalPane/
+                // MultiPaneContainer's coerceIn fixes) - keeps this slider and
+                // pinch-zoom capable of reaching the same minimum instead of
+                // pinch allowing a smaller size than Settings can set directly.
+                valueRange = 4f..28f
             )
 
             Spacer(modifier = Modifier.height(16.dp))

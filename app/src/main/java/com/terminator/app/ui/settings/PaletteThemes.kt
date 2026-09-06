@@ -128,7 +128,34 @@ object PalettePresets {
         background = 0xFF2E3440.toInt()
     )
 
-    val all: List<NamedPalette> = listOf(default, solarizedDark, gruvboxDark, dracula, nord)
+    /**
+     * "X11" preset - the 16 ANSI slots filled with their closest classic
+     * X11/`rgb.txt` named-color counterparts (Black, Red, Green, Yellow,
+     * Blue, Magenta, Cyan, White/Silver, then the "Dim"/"Light" bright
+     * variants), so picking this preset gives a palette built entirely out
+     * of recognizable X11 names rather than a hand-tuned theme's hues. The
+     * full X11 name table itself - all ~150 entries - lives in
+     * [X11Colors] and backs the per-slot X11 name picker in
+     * [X11ColorPickerDialog], so any individual slot (or fg/bg) can also be
+     * set to *any* X11 color, not just the ones baked into this preset.
+     */
+    val x11 = NamedPalette(
+        name = "X11",
+        colors = intArrayOf(
+            X11Colors.byName("Black")!!.argb, X11Colors.byName("Red")!!.argb,
+            X11Colors.byName("Green")!!.argb, X11Colors.byName("Yellow")!!.argb,
+            X11Colors.byName("Blue")!!.argb, X11Colors.byName("Magenta")!!.argb,
+            X11Colors.byName("Cyan")!!.argb, X11Colors.byName("Silver")!!.argb,
+            X11Colors.byName("Dim Gray")!!.argb, X11Colors.byName("Orange Red")!!.argb,
+            X11Colors.byName("Lime Green")!!.argb, X11Colors.byName("Gold")!!.argb,
+            X11Colors.byName("Dodger Blue")!!.argb, X11Colors.byName("Orchid")!!.argb,
+            X11Colors.byName("Turquoise")!!.argb, X11Colors.byName("White")!!.argb
+        ),
+        foreground = X11Colors.byName("Gainsboro")!!.argb,
+        background = X11Colors.byName("Black")!!.argb
+    )
+
+    val all: List<NamedPalette> = listOf(default, solarizedDark, gruvboxDark, dracula, nord, x11)
 }
 
 /** ANSI slot names in index order, for labeling each row in the palette editor. */

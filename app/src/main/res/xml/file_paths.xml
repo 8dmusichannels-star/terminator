@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Whole external storage, since OSC 8 hyperlinks emitted by shell
+         tools (ls with hyperlink support, eza, git, etc.) can point to
+         any file:// path the user's session has access to, and the app
+         already holds MANAGE_EXTERNAL_STORAGE for that. Deliberately NOT
+         exposing files-path/cache-path (the app's own private storage,
+         e.g. the bundled terminfo under filesDir) here: a hyperlink's
+         target is untrusted program output (see ALLOWED_HYPERLINK_SCHEMES
+         in TerminalView.kt), and a file:// link pointing into this app's
+         private storage should fail closed rather than have FileProvider
+         happily re-share it to whatever app the tap opens. Sessions never
+         legitimately need to link into private storage anyway - $HOME
+         defaults to external storage (see TerminalSession.buildEnvironment). -->
+    <external-path name="external_files" path="." />
+</paths>

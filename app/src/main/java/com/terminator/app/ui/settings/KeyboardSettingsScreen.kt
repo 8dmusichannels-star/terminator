@@ -21,6 +21,8 @@
 package com.terminator.app.ui.settings
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
@@ -48,10 +50,18 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
     val softKeyboard by repo.flow(SettingsKeys.SOFT_KEYBOARD, true).collectAsState(initial = true)
     val virtualKeys by repo.flow(SettingsKeys.VIRTUAL_KEYS, true).collectAsState(initial = true)
     val keymapperEnabled by repo.flow(SettingsKeys.KEYMAPPER_ENABLED, true).collectAsState(initial = true)
+    val physicalKeyRepeatEnabled by repo.flow(SettingsKeys.PHYSICAL_KEY_REPEAT_ENABLED, true).collectAsState(initial = true)
     val inputMode by repo.flow(SettingsKeys.INPUT_MODE, "Default").collectAsState(initial = "Default")
     val seccompEnabled by repo.flow(SettingsKeys.SECCOMP_ENABLED, false).collectAsState(initial = false)
-    val termType by repo.flow(SettingsKeys.TERM_TYPE, "xterm-256color").collectAsState(initial = "xterm-256color")
+    // Default is NONE (see TERM_TYPE_OPTIONS' own doc below, and
+    // buildEnvironment's own doc in TerminalSession, for why that means
+    // "don't set $TERM" rather than literally "TERM=NONE"). The
+    // stringPreferencesKey default only ever applies to a key that was
+    // never written, so this doesn't change what an existing user who
+    // already picked xterm-256color/vt100/ansi sees.
+    val termType by repo.flow(SettingsKeys.TERM_TYPE, "NONE").collectAsState(initial = "NONE")
     var showKeymapper by remember { mutableStateOf(false) }
+    var showTermTypeDialog by remember { mutableStateOf(false) }
 
     if (showKeymapper) {
         KeymapperScreen(onBack = { showKeymapper = false })
@@ -72,7 +82,13 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
             SwitchRow("Soft keyboard (tap terminal to open/close)", softKeyboard) {
                 scope.launch { repo.set(SettingsKeys.SOFT_KEYBOARD, it) }
             }
@@ -86,6 +102,13 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
             // keep keyboard shortcuts working while hiding the bar itself.
             SwitchRow("Keyboard shortcuts & keymapper", keymapperEnabled) {
                 scope.launch { repo.set(SettingsKeys.KEYMAPPER_ENABLED, it) }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            // Local override only - a running program's own DECARM state
+            // (CSI ?8 h/l) is untouched by this; see
+            // SettingsKeys.PHYSICAL_KEY_REPEAT_ENABLED's own doc.
+            SwitchRow("Physical keyboard key repeat", physicalKeyRepeatEnabled) {
+                scope.launch { repo.set(SettingsKeys.PHYSICAL_KEY_REPEAT_ENABLED, it) }
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -116,24 +139,13 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
                     "Only takes effect for sessions started after changing it.",
                 style = MaterialTheme.typography.bodySmall
             )
-
-            InputModeOption(
-                title = "xterm-256color (Recommended)",
-                description = "Full color and feature support; uses this app's bundled terminfo entry",
-                selected = termType == "xterm-256color"
-            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "xterm-256color") } }
-
-            InputModeOption(
-                title = "vt100",
-                description = "Minimal, near-universal - works even without a terminfo entry",
-                selected = termType == "vt100"
-            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "vt100") } }
-
-            InputModeOption(
-                title = "ansi",
-                description = "Basic ANSI/DOS-style compatibility, no color extensions",
-                selected = termType == "ansi"
-            ) { scope.launch { repo.set(SettingsKeys.TERM_TYPE, "ansi") } }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { showTermTypeDialog = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (termType == "NONE") "NONE (don't set \$TERM)" else termType)
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
             OutlinedButton(onClick = { showKeymapper = true }) {
@@ -150,6 +162,91 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
             )
         }
     }
+
+    if (showTermTypeDialog) {
+        TermTypeDialog(
+            selected = termType,
+            onSelect = {
+                scope.launch { repo.set(SettingsKeys.TERM_TYPE, it) }
+                showTermTypeDialog = false
+            },
+            onDismiss = { showTermTypeDialog = false }
+        )
+    }
+}
+
+// Full $TERM picker list - every entry a program is realistically going to
+// check for/recognize via terminfo, roughly ordered by how likely a user is
+// to want it: NONE (don't set $TERM - the default, see TerminalSession.
+// buildEnvironment's own doc for why that's different from literally
+// setting "TERM=NONE"), the xterm family (plain/color/256color/kitty),
+// screen/tmux (+ their 256color variants, for the common "TERM already set
+// by an outer multiplexer" case), then the older vt220/vt100/ANSI entries
+// for programs or devices with no modern terminfo available at all.
+private val TERM_TYPE_OPTIONS = listOf(
+    "NONE", "xterm", "xterm-color", "xterm-256color", "screen",
+    "screen-256color", "tmux-256color", "xterm-kitty", "tmux", "vt220",
+    "vt100", "ANSI"
+)
+
+/**
+ * Popup (was previously an inline radio list directly on this screen) so
+ * the growing 3->12-entry $TERM list doesn't push every other Keyboard
+ * setting further down the page. Dismissible via scrim tap/back without
+ * picking anything, same as [AlertDialog]'s default onDismissRequest
+ * behavior - the screen's own current [selected] value is left untouched
+ * either way.
+ */
+@Composable
+private fun TermTypeDialog(
+    selected: String,
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Terminal Type (TERM)") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                TERM_TYPE_OPTIONS.forEach { option ->
+                    InputModeOption(
+                        title = if (option == "NONE") "NONE (don't set \$TERM)" else option,
+                        description = termTypeDescription(option),
+                        selected = selected == option
+                    ) { onSelect(option) }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+// Short per-entry blurb shown under each TERM_TYPE_OPTIONS row - kept as
+// its own function rather than zipped inline into the list above so the
+// option identifiers themselves (what actually gets written to
+// SettingsKeys.TERM_TYPE / passed as $TERM) stay a plain, easily-diffable
+// list of strings.
+private fun termTypeDescription(option: String): String = when (option) {
+    "NONE" -> "Leave \$TERM unset - whatever the shell/exec environment would otherwise provide"
+    "xterm" -> "Base xterm entry, no 256-color extension"
+    "xterm-color" -> "xterm with basic (16) color support"
+    "xterm-256color" -> "Full color and feature support; uses this app's bundled terminfo entry"
+    "screen" -> "For running inside GNU screen, no 256-color extension"
+    "screen-256color" -> "GNU screen with 256-color support"
+    "tmux-256color" -> "tmux with 256-color support"
+    "xterm-kitty" -> "For kitty-protocol-aware programs (kitty graphics/keyboard protocol)"
+    "tmux" -> "For running inside tmux, no 256-color extension"
+    "vt220" -> "Older DEC VT220 compatibility"
+    "vt100" -> "Minimal, near-universal - works even without a terminfo entry"
+    "ANSI" -> "Basic ANSI/DOS-style compatibility, no color extensions"
+    else -> ""
 }
 
 @Composable

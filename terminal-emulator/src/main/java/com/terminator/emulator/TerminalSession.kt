@@ -62,10 +62,13 @@ class TerminalSession(
     private val historyFile: File,
     private val useRoot: Boolean = false,
     // User-selectable via Settings > Keyboard > Terminal Type. Defaults to
-    // xterm-256color for full feature support; vt100/ansi are there for
-    // devices/binaries where full-screen apps don't recognize
-    // xterm-256color for lack of a matching terminfo entry.
-    private val termType: String = "xterm-256color",
+    // "NONE" (don't inject a TERM env var at all - see buildEnvironment's
+    // own doc); the other choices cover the common terminfo entries a
+    // full-screen program might expect (xterm-256color for full feature
+    // support, vt100/ANSI for devices/binaries with no matching terminfo
+    // entry for anything fancier, screen/tmux variants for running inside
+    // a multiplexer, xterm-kitty for kitty-protocol-aware programs, ...).
+    private val termType: String = "NONE",
     // Settings > Keyboard > SECCOMP. See NativePty.createSubprocess for what
     // this actually changes at the syscall level.
     private val seccompWorkaround: Boolean = false,
@@ -73,7 +76,17 @@ class TerminalSession(
     // TerminatorApp.extractBundledTerminfo), or null to leave $TERMINFO
     // unset and rely on whatever the device itself provides (or ncurses'
     // hardcoded vt100/ansi fallbacks).
-    private val terminfoDir: String? = null
+    private val terminfoDir: String? = null,
+    // Settings > Sessions > "Force local echo". See SettingsKeys.
+    // FORCE_LOCAL_ECHO's own doc for the full reasoning - default false
+    // because every session runs over a real pty that already echoes on
+    // its own; this exists only for raw connections that don't. A `var`,
+    // not `val`: MainViewModel pushes every settings-flow update onto
+    // this field directly on the live session (liveSessions.values.forEach),
+    // not just at construction time, so flipping the toggle takes effect
+    // on a session already open - the user doesn't have to close and
+    // reopen the tab to see a blank/dead connection start echoing.
+    var forceLocalEcho: Boolean = false
 ) {
     private var masterFd: Int = -1
     private var pid: Int = -1
@@ -128,6 +141,18 @@ class TerminalSession(
     private var historyFlusher: Thread? = null
 
     private var reader: Thread? = null
+
+    // emulator.append() was always only ever called from one place - the
+    // reader thread's loop below - so it (and the pendingCluster/buffer
+    // state it mutates) was never made thread-safe. "Force local echo"
+    // (see write()'s own doc) is the first caller of append() from
+    // somewhere other than the reader thread - typically the UI thread,
+    // since that's what invokes write(). Without this lock, a keystroke's
+    // local-echo append() and a concurrent pty-output append() could
+    // interleave mid-mutation on two different threads - a real data
+    // race, not a hypothetical one. Both call sites synchronize on this
+    // same object so at most one is ever inside append() at a time.
+    private val emulatorAppendLock = Any()
     // All writes to the pty - user keystrokes, mouse events, and (critically)
     // DSR/CPR auto-replies from TerminalEmulator.Listener.onRespond - go
     // through this queue instead of a direct outputStream.write() call. The
@@ -269,7 +294,7 @@ class TerminalSession(
                     val n = isr.read(buf)
                     if (n < 0) break
                     val chunk = String(buf, 0, n)
-                    emulator.append(chunk)
+                    synchronized(emulatorAppendLock) { emulator.append(chunk) }
                     appendHistory(chunk)
                 }
             } catch (_: IOException) {
@@ -368,9 +393,26 @@ class TerminalSession(
         val base = mutableListOf(
             "PATH=$path",
             "HOME=${cwd ?: Environment.getExternalStorageDirectory().path}",
-            "TERM=$termType",
             "TMPDIR=${cwd ?: Environment.getExternalStorageDirectory().path}"
         )
+        // "NONE" (Settings > Keyboard > Terminal Type's own default) means
+        // don't inject a TERM at all - leave whatever the shell/exec
+        // environment would otherwise provide alone, rather than actually
+        // setting the literal string "TERM=NONE" (which is itself a
+        // recognized-but-nearly-featureless terminfo entry, not "unset").
+        if (termType != "NONE") {
+            // The Keyboard settings popup shows "ANSI" (matching the other
+            // display labels' capitalization), but the only terminfo entry
+            // that actually exists - ncurses' own hardcoded fallback and
+            // this app's bundled one alike - is the lowercase "ansi".
+            // ncurses' TERM/TERMINFO lookup is case-sensitive, so passing
+            // the label through as-is would set TERM=ANSI, which resolves
+            // to nothing and silently downgrades full-screen apps to a
+            // dumb terminal. Every other entry in TERM_TYPE_OPTIONS is
+            // already lowercase and needs no such mapping.
+            val envTermType = if (termType == "ANSI") "ansi" else termType
+            base += "TERM=$envTermType"
+        }
         if (!terminfoDir.isNullOrBlank()) {
             base += "TERMINFO=$terminfoDir"
         }
@@ -378,6 +420,20 @@ class TerminalSession(
     }
 
     fun write(data: String) {
+        if (forceLocalEcho && ::emulator.isInitialized) {
+            localEchoAppend(data)
+        }
+        writeRaw(data)
+    }
+
+    /**
+     * The actual, unwrapped queue put - shared by [write] and [writePaste]
+     * so paste's bracketed-paste wrapper never goes through write()'s own
+     * forceLocalEcho echo path a second time (see [writePaste]'s own doc
+     * on why it echoes the plain [data] itself instead of calling this
+     * via [write]).
+     */
+    private fun writeRaw(data: String) {
         // Non-blocking: hands the bytes to writeQueue and returns
         // immediately. The writer thread (started in start()) does the
         // actual, potentially-blocking outputStream.write() - see
@@ -391,6 +447,70 @@ class TerminalSession(
             writeQueue.put(data.toByteArray(Charsets.UTF_8))
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+        }
+    }
+
+    /**
+     * "Force local echo" override (Settings > Sessions) - shared by
+     * [write] and [writePaste] so the exact same DEL/BS/CR handling
+     * applies to both instead of being duplicated at each call site.
+     * Feeds [data] straight into the emulator's own append(), the same
+     * entry point the pty reader thread uses for incoming output (see
+     * start()'s reader loop). This is deliberately a plain, unconditional
+     * append with no de-dup against whatever the pty itself might echo
+     * back a moment later - that's the documented trade-off users are
+     * opting into by turning this on for a connection that doesn't echo
+     * on its own; see SettingsKeys.FORCE_LOCAL_ECHO's doc.
+     *
+     * Raw DEL (0x7F - what this app's own key mapping sends for
+     * Backspace, see PhysicalKeyEvent.kt) has no erase effect in this
+     * emulator: handleNormal only treats literal BS (\b) as "move cursor
+     * left one column" and has no case for DEL at all, so an echoed DEL
+     * falls to its `else` branch and gets written into the grid as an
+     * actual glyph - cursor moves the WRONG way and nothing gets erased.
+     * That never showed up before this setting existed because the real
+     * erase effect always came from the REMOTE side's own line-editing
+     * echo, which answers a DEL with a proper "\b \b" (backspace, space,
+     * backspace) - never a bare DEL byte. Rather than synthesizing that
+     * "\b \b" substitution as text and routing it back through
+     * append()/handleNormal (which would make the erase depend on
+     * handleNormal's own '\b' case and however IT happens to treat the
+     * left edge), DEL/BS goes straight to emulator.localEchoBackspace() -
+     * a single, predictable buffer-level cursor-back-and-clear that's a
+     * guaranteed no-op at cursorCol == 0 rather than however a
+     * synthesized "\b \b" would land there. See localEchoBackspace's own
+     * doc for the full reasoning.
+     *
+     * Same DEL/BS reasoning doesn't apply to Enter, which this app's own
+     * key mapping sends as a bare CR (\r, see PhysicalKeyEvent.kt):
+     * handleNormal's '\r' case only resets cursorCol to 0, it never
+     * advances a line - on a real remote, the shell's own canonical-mode
+     * echo answers a typed CR with "\r\n", not a bare CR. Echoing a lone
+     * \r locally would just return the cursor to the start of the
+     * CURRENT line instead of moving to a new one, so every line typed
+     * after the first would overwrite the previous one instead of
+     * stacking below it - CR is substituted with "\r\n" and still goes
+     * through the normal append() path, just split into runs around the
+     * DEL/BS bytes handled separately above.
+     */
+    private fun localEchoAppend(data: String) {
+        synchronized(emulatorAppendLock) {
+            var runStart = 0
+            var i = 0
+            while (i < data.length) {
+                val ch = data[i]
+                if (ch == '\u007F' || ch == '\b') {
+                    if (i > runStart) emulator.append(data.substring(runStart, i))
+                    emulator.localEchoBackspace()
+                    runStart = i + 1
+                } else if (ch == '\r') {
+                    if (i > runStart) emulator.append(data.substring(runStart, i))
+                    emulator.append("\r\n")
+                    runStart = i + 1
+                }
+                i++
+            }
+            if (runStart < data.length) emulator.append(data.substring(runStart))
         }
     }
 
@@ -415,7 +535,16 @@ class TerminalSession(
         } else {
             data
         }
-        write(wrapped)
+        // Echoes the plain [data] itself, not [wrapped] - feeding the
+        // ESC[200~/201~ bracketed-paste markers into emulator.append would
+        // have the emulator parse them as real escape sequences rather than
+        // display them, corrupting the echoed text. Goes through writeRaw
+        // (not write()) so this doesn't ALSO trigger write()'s own
+        // forceLocalEcho echo of the wrapped string underneath.
+        if (forceLocalEcho && ::emulator.isInitialized) {
+            localEchoAppend(data)
+        }
+        writeRaw(wrapped)
     }
 
     /**
@@ -437,11 +566,44 @@ class TerminalSession(
      * cols*font-width (mouse-pixel reporting, sixel/image output, some
      * ncurses builds) need these to be non-zero to lay out correctly;
      * everything else ignores them.
+     *
+     * [deferIoctl]: true means "still mid-gesture" - buffer.resize() (and
+     * the whole onBufferResized()/cellHeightPx follow-up) still runs, so
+     * the visible grid and drawn font size stay in sync frame-to-frame
+     * (this is what keeps a continuous pinch-zoom from showing a growing
+     * black gap - see MainActivity's applyResize/zoomCommitJob docs), but
+     * the actual ioctl(TIOCSWINSZ) call - and the SIGWINCH it raises in
+     * whatever's running - is skipped. A pinch that changes columns/rows
+     * on nearly every ~150ms throttled tick was previously raising
+     * SIGWINCH that same number of times per second for the ENTIRE
+     * gesture; ncurses full-screen apps (btop chief among them) redraw
+     * their whole screen from scratch on every SIGWINCH, so a several-
+     * second pinch fired several dozen full btop redraws back to back -
+     * "zoom bug'ı tum screenlerde ... btop gibi uygulamalar glitch
+     * oluyor" was this SIGWINCH storm, not a rendering bug in btop
+     * itself or in this app's own grid math (both already correct).
+     * lastAppliedColumns/Rows is intentionally left UNCHANGED while
+     * deferred, so the final post-gesture resize() call (deferIoctl =
+     * false, from the pinch's own trailing commit or any other caller)
+     * still sees a genuine size change against the last value the PTY
+     * itself was actually told about, and fires the real ioctl exactly
+     * once for the whole gesture.
      */
-    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
         buffer.resize(columns, rows)
         if (::emulator.isInitialized) {
             emulator.onBufferResized()
+            // Keeps emulator.cellHeightPx (used only to size a natural-size
+            // Sixel/Kitty image's cursor-advance in rows - see its own doc)
+            // in sync with the view's real layout. rows > 0 guard avoids a
+            // divide-by-zero during the brief window before the first real
+            // layout pass; pixelHeight == 0 (caller hasn't measured yet, or
+            // never wires pixel size in at all) leaves cellHeightPx at 0,
+            // which imageRowSpan already treats as "unknown, use the old
+            // single-line fallback" - so this is never worse than before.
+            if (pixelHeight > 0 && rows > 0) {
+                emulator.cellHeightPx = pixelHeight / rows
+            }
         }
         // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
         // whatever's running) when cols/rows haven't actually changed - see
@@ -449,7 +611,10 @@ class TerminalSession(
         // the same cols/rows (e.g. font metrics settling a frame later)
         // isn't worth a second kernel round-trip either; the next real
         // cols/rows change will carry the corrected pixel size along.
-        if (masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
+        // deferIoctl (see this function's own doc) skips it unconditionally
+        // while a gesture is still in flight, regardless of whether cols/
+        // rows actually changed this tick.
+        if (!deferIoctl && masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
             NativePty.setWindowSize(masterFd, rows, columns, pixelWidth, pixelHeight)
             lastAppliedColumns = columns
             lastAppliedRows = rows
