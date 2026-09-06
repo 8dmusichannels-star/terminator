@@ -77,9 +77,46 @@ class SettingsActivity : ComponentActivity() {
             settingsRepo.flow(SettingsKeys.AMOLED_BLACK, false).first()
         }
 
+        // SettingsActivity never touched the status bar at all, so it always
+        // rendered with the plain OS default (shown) regardless of Settings >
+        // Display > "Show statusbar". With that toggle off, MainActivity's
+        // status bar is hidden edge-to-edge, so opening Settings made it pop
+        // back in, and returning to the terminal made it disappear again - a
+        // visible flicker on every transition in/out of Settings. Applying
+        // the same hide/show here, read synchronously up front (same
+        // "avoid a flash on the first frame" reasoning as initialAmoledBlack
+        // above) so this activity's very first frame already matches
+        // MainActivity's state instead of racing DataStore's first emission.
+        val initialShowStatusbar = runBlocking {
+            settingsRepo.flow(SettingsKeys.SHOW_STATUSBAR, false).first()
+        }
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        run {
+            val controller = androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+            if (initialShowStatusbar) {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller.systemBarsBehavior =
+                    androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+            }
+        }
+
         setContent {
             val amoledBlack by settingsRepo.flow(SettingsKeys.AMOLED_BLACK, false)
                 .collectAsState(initial = initialAmoledBlack)
+            val showStatusbar by settingsRepo.flow(SettingsKeys.SHOW_STATUSBAR, false)
+                .collectAsState(initial = initialShowStatusbar)
+            androidx.compose.runtime.LaunchedEffect(showStatusbar) {
+                val controller = androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+                if (showStatusbar) {
+                    controller.show(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+                } else {
+                    controller.systemBarsBehavior =
+                        androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    controller.hide(androidx.core.view.WindowInsetsCompat.Type.statusBars())
+                }
+            }
             TerminatorTheme(amoledBlack = amoledBlack) {
                 SettingsRoot()
             }
@@ -94,6 +131,7 @@ private enum class SettingsCategory(val title: String) {
     SOUND("Sound"),
     DISPLAY("Display"),
     KEYBOARD("Keyboard"),
+    NOTIFICATIONS("Notifications"),
     STORAGE("Storage & Permissions")
 }
 
@@ -111,6 +149,7 @@ private fun SettingsRoot() {
         SettingsCategory.SOUND -> SoundSettingsScreen(onBack = { openCategory = null })
         SettingsCategory.DISPLAY -> DisplaySettingsScreen(onBack = { openCategory = null })
         SettingsCategory.KEYBOARD -> KeyboardSettingsScreen(onBack = { openCategory = null })
+        SettingsCategory.NOTIFICATIONS -> NotificationsSettingsScreen(onBack = { openCategory = null })
         SettingsCategory.STORAGE -> StorageSettingsScreen(onBack = { openCategory = null })
         null -> Scaffold(
             topBar = {

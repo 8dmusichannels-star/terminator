@@ -64,7 +64,18 @@ enum class AppAction(val label: String, val group: String) {
     TOGGLE_SESSION_DRAWER("Toggle session drawer", "Navigation"),
     SCROLL_UP_PAGE("Scroll up one page", "Navigation"),
     SCROLL_DOWN_PAGE("Scroll down one page", "Navigation"),
-    SCROLL_TO_LIVE("Jump to live output (scroll to bottom)", "Navigation");
+    SCROLL_TO_LIVE("Jump to live output (scroll to bottom)", "Navigation"),
+    // OSC 133 shell-integration ('A' prompt-start marks, see
+    // TerminalEmulator.promptMarks' own doc) jump navigation. Resolves
+    // which session/pane's scrollback to jump - the focused multi-pane
+    // tile, the split's secondary pane, or the plain active session -
+    // exactly like every other focus-aware action in this enum's own
+    // execute() (see MainViewModel.JumpTarget's own doc for the three
+    // targets and how each is reached). A no-op if the running shell never
+    // sends OSC 133 marks, or there's no prompt further in that direction
+    // yet.
+    JUMP_TO_PREVIOUS_COMMAND("Jump to previous command", "Navigation"),
+    JUMP_TO_NEXT_COMMAND("Jump to next command", "Navigation");
 
     companion object {
         fun groupsInOrder(): List<String> =
@@ -219,6 +230,18 @@ fun AppAction.execute(viewModel: MainViewModel, routing: PhysicalKeyboardRouting
         AppAction.SCROLL_TO_LIVE -> {
             if (routing.splitPaneFocused) viewModel.adjustSplitScrollOffset(-1_000_000f)
             else viewModel.adjustScrollOffset(-1_000_000f)
+        }
+        AppAction.JUMP_TO_PREVIOUS_COMMAND -> {
+            val target = if (routing.isMultiPane && focusedPaneId != null) MainViewModel.JumpTarget.Pane(focusedPaneId)
+                else if (routing.splitPaneFocused) MainViewModel.JumpTarget.Split
+                else MainViewModel.JumpTarget.Primary
+            viewModel.jumpToAdjacentPrompt(forward = false, target = target)
+        }
+        AppAction.JUMP_TO_NEXT_COMMAND -> {
+            val target = if (routing.isMultiPane && focusedPaneId != null) MainViewModel.JumpTarget.Pane(focusedPaneId)
+                else if (routing.splitPaneFocused) MainViewModel.JumpTarget.Split
+                else MainViewModel.JumpTarget.Primary
+            viewModel.jumpToAdjacentPrompt(forward = true, target = target)
         }
     }
 }
