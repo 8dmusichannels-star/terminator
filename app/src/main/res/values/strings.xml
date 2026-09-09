@@ -3,6 +3,15 @@
     <string name="app_name">Terminator</string>
     <string name="settings_title">Settings</string>
     <string name="notification_channel_name">Terminal Sessions</string>
+    <!-- Separate channel from the persistent "Terminal Sessions" one above -
+         that one is IMPORTANCE_LOW (silent, always-there while a session
+         runs); OSC 9/777 notifications are one-shot pings a running command
+         explicitly asked to surface (see SettingsKeys.OSC_NOTIFICATIONS_ENABLED
+         and TerminalEmulator.Listener.onNotification's own docs), so they get
+         their own higher-importance channel the user can also mute/configure
+         independently of the session-list one in Android's own per-app
+         notification settings. -->
+    <string name="notification_channel_name_osc">Terminal notifications</string>
     <string name="notification_session_running">A session is running</string>
     <!-- Single-session notification: no name repetition needed, the content
          text already shows the session's own label. -->

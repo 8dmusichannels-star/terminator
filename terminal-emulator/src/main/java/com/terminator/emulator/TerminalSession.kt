@@ -24,6 +24,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -61,10 +62,13 @@ class TerminalSession(
     private val historyFile: File,
     private val useRoot: Boolean = false,
     // User-selectable via Settings > Keyboard > Terminal Type. Defaults to
-    // xterm-256color for full feature support; vt100/ansi are there for
-    // devices/binaries where full-screen apps don't recognize
-    // xterm-256color for lack of a matching terminfo entry.
-    private val termType: String = "xterm-256color",
+    // "NONE" (don't inject a TERM env var at all - see buildEnvironment's
+    // own doc); the other choices cover the common terminfo entries a
+    // full-screen program might expect (xterm-256color for full feature
+    // support, vt100/ANSI for devices/binaries with no matching terminfo
+    // entry for anything fancier, screen/tmux variants for running inside
+    // a multiplexer, xterm-kitty for kitty-protocol-aware programs, ...).
+    private val termType: String = "NONE",
     // Settings > Keyboard > SECCOMP. See NativePty.createSubprocess for what
     // this actually changes at the syscall level.
     private val seccompWorkaround: Boolean = false,
@@ -80,6 +84,51 @@ class TerminalSession(
     private var inputStream: FileInputStream? = null
     private var outputStream: FileOutputStream? = null
     private var masterPfd: ParcelFileDescriptor? = null
+    // Opened once and kept for the life of the session, instead of
+    // historyFile.appendText(chunk) (Kotlin stdlib: open, write, close on
+    // EVERY call) which appendHistory used before. That per-chunk
+    // open+write+close syscall round-trip ran synchronously on the reader
+    // thread, between one isr.read() and the next - so it directly delayed
+    // how soon the next chunk of PTY output (cursor moves, redraws, any
+    // ANSI escape sequence) got parsed and rendered. Local shells rarely
+    // send output often enough for that per-chunk cost to be visible, but
+    // an SSH session - frequent small reads from mouse-reporting TUIs,
+    // remote shell redraws, etc. - hits this path far more often per
+    // second, which is what read as "SSH/ANSI escape gecikmesi" (escape
+    // sequences visibly lagging behind, worse over SSH specifically).
+    // A single stream held open for the session's whole lifetime turns
+    // each appendHistory call back into a plain buffered write(), with the
+    // real fd churn paid only once at session start/end instead of on
+    // every read.
+    //
+    // IMPORTANT: an earlier version of this fix called stream.flush()
+    // on every single chunk "to match appendText's per-call durability".
+    // flush() on a FileOutputStream-backed stream is its own syscall
+    // (effectively a write() of whatever's buffered) - forcing one on
+    // EVERY chunk reintroduced almost the same per-chunk syscall cost
+    // this fix exists to remove, and made it WORSE specifically for SSH:
+    // SSH's frequent small reads (mouse reporting, remote redraws) call
+    // appendHistory far more often per second than a local shell does, so
+    // a mandatory flush per chunk multiplies exactly where it hurts most
+    // - measured as SSH sessions opening slower and lagging harder than
+    // before this file's history fix existed at all.
+    //
+    // Fixed by decoupling durability from the reader thread entirely: a
+    // dedicated flusher thread (below, same pattern as the writer thread's
+    // own doc for why a separate thread beats inlining) wakes up on a
+    // fixed interval and flushes ONLY IF something was actually written
+    // since its last pass - not on every appendHistory call, and never
+    // blocking the reader. This keeps data loss on a hard crash bounded to
+    // a fraction of a second of scrollback, same order of magnitude as a
+    // real-time guarantee, without paying a flush syscall per PTY chunk.
+    private var historyStream: BufferedOutputStream? = null
+    // Set (not incremented - a plain flag is all the flusher needs) by
+    // appendHistory after every write, cleared by the flusher right before
+    // it flushes. @Volatile since these two threads only ever communicate
+    // through this one field - no other shared state, so a full lock
+    // would be pure overhead for a single boolean handoff.
+    @Volatile private var historyDirty: Boolean = false
+    private var historyFlusher: Thread? = null
 
     private var reader: Thread? = null
     // All writes to the pty - user keystrokes, mouse events, and (critically)
@@ -236,12 +285,53 @@ class TerminalSession(
                 // longer applies; render whatever was captured instead of
                 // silently dropping the last partial sequence.
                 emulator.flushPendingCluster()
+                // Stop the periodic flusher before closing the stream it
+                // flushes - interrupt() breaks it out of its sleep loop
+                // (see historyFlusher's own doc), then close() below does
+                // one final flush of anything written since its last pass.
+                historyFlusher?.interrupt()
+                // Close the persistent history stream opened by
+                // appendHistory (see historyStream's own doc) - closeable
+                // even if it was never opened (a session with no output).
+                try {
+                    historyStream?.close()
+                } catch (_: IOException) {
+                    // best-effort, same as appendHistory's own write failures
+                }
                 alive = false
                 markExited()
             }
         }
         reader!!.isDaemon = true
         reader!!.start()
+
+        // Periodic history-durability flusher - see historyStream's own
+        // doc for why appendHistory itself no longer flushes per chunk.
+        // Sleeps almost all the time; only touches the stream (a flush()
+        // syscall) on ticks where historyDirty shows real writes happened
+        // since the last one, so an idle session costs nothing here at
+        // all. 200ms bounds how much scrollback a hard crash could lose
+        // to well under a second, while staying far below the frequency
+        // SSH's own chunk rate would hit if every chunk flushed itself.
+        historyFlusher = Thread {
+            try {
+                while (true) {
+                    Thread.sleep(200)
+                    if (historyDirty) {
+                        historyDirty = false
+                        try {
+                            historyStream?.flush()
+                        } catch (_: IOException) {
+                            // best-effort, same as appendHistory's own write failures
+                        }
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // reader thread's finally block shutting this down at session end
+            }
+        }
+        historyFlusher!!.isDaemon = true
+        historyFlusher!!.start()
 
         // Dedicated writer thread - see writeQueue's doc comment above for
         // why this can't just be outputStream.write() called inline from
@@ -281,9 +371,26 @@ class TerminalSession(
         val base = mutableListOf(
             "PATH=$path",
             "HOME=${cwd ?: Environment.getExternalStorageDirectory().path}",
-            "TERM=$termType",
             "TMPDIR=${cwd ?: Environment.getExternalStorageDirectory().path}"
         )
+        // "NONE" (Settings > Keyboard > Terminal Type's own default) means
+        // don't inject a TERM at all - leave whatever the shell/exec
+        // environment would otherwise provide alone, rather than actually
+        // setting the literal string "TERM=NONE" (which is itself a
+        // recognized-but-nearly-featureless terminfo entry, not "unset").
+        if (termType != "NONE") {
+            // The Keyboard settings popup shows "ANSI" (matching the other
+            // display labels' capitalization), but the only terminfo entry
+            // that actually exists - ncurses' own hardcoded fallback and
+            // this app's bundled one alike - is the lowercase "ansi".
+            // ncurses' TERM/TERMINFO lookup is case-sensitive, so passing
+            // the label through as-is would set TERM=ANSI, which resolves
+            // to nothing and silently downgrades full-screen apps to a
+            // dumb terminal. Every other entry in TERM_TYPE_OPTIONS is
+            // already lowercase and needs no such mapping.
+            val envTermType = if (termType == "ANSI") "ansi" else termType
+            base += "TERM=$envTermType"
+        }
         if (!terminfoDir.isNullOrBlank()) {
             base += "TERMINFO=$terminfoDir"
         }
@@ -308,6 +415,30 @@ class TerminalSession(
     }
 
     /**
+     * Like [write], but for text arriving from a clipboard paste
+     * specifically (as opposed to real keystrokes) - the one distinction
+     * bracketed paste (DECSET 2004) exists to preserve. When the running
+     * program has requested it (emulator.bracketedPasteMode), the text is
+     * wrapped in ESC[200~ / ESC[201~ so the program can tell "this whole
+     * blob arrived from a paste" and treat embedded newlines as literal
+     * text rather than as Enter being pressed after each line - which is
+     * exactly what shells with bracketed-paste support (bash/zsh/fish with
+     * a recent readline/line-editor) use it for: a multi-line paste lands
+     * as one editable block instead of executing line-by-line. When the
+     * program hasn't asked for it, this is identical to a plain write() -
+     * unwrapped, matching a real terminal's behavior toward programs that
+     * never opted in.
+     */
+    fun writePaste(data: String) {
+        val wrapped = if (::emulator.isInitialized && emulator.bracketedPasteMode) {
+            "\u001B[200~$data\u001B[201~"
+        } else {
+            data
+        }
+        write(wrapped)
+    }
+
+    /**
      * Reports a touch as an xterm mouse-tracking escape sequence, if (and
      * only if) the running program has actually asked for mouse reporting
      * via DECSET - see TerminalEmulator.encodeMouseEvent. col/row are
@@ -326,11 +457,44 @@ class TerminalSession(
      * cols*font-width (mouse-pixel reporting, sixel/image output, some
      * ncurses builds) need these to be non-zero to lay out correctly;
      * everything else ignores them.
+     *
+     * [deferIoctl]: true means "still mid-gesture" - buffer.resize() (and
+     * the whole onBufferResized()/cellHeightPx follow-up) still runs, so
+     * the visible grid and drawn font size stay in sync frame-to-frame
+     * (this is what keeps a continuous pinch-zoom from showing a growing
+     * black gap - see MainActivity's applyResize/zoomCommitJob docs), but
+     * the actual ioctl(TIOCSWINSZ) call - and the SIGWINCH it raises in
+     * whatever's running - is skipped. A pinch that changes columns/rows
+     * on nearly every ~150ms throttled tick was previously raising
+     * SIGWINCH that same number of times per second for the ENTIRE
+     * gesture; ncurses full-screen apps (btop chief among them) redraw
+     * their whole screen from scratch on every SIGWINCH, so a several-
+     * second pinch fired several dozen full btop redraws back to back -
+     * "zoom bug'ı tum screenlerde ... btop gibi uygulamalar glitch
+     * oluyor" was this SIGWINCH storm, not a rendering bug in btop
+     * itself or in this app's own grid math (both already correct).
+     * lastAppliedColumns/Rows is intentionally left UNCHANGED while
+     * deferred, so the final post-gesture resize() call (deferIoctl =
+     * false, from the pinch's own trailing commit or any other caller)
+     * still sees a genuine size change against the last value the PTY
+     * itself was actually told about, and fires the real ioctl exactly
+     * once for the whole gesture.
      */
-    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
         buffer.resize(columns, rows)
         if (::emulator.isInitialized) {
             emulator.onBufferResized()
+            // Keeps emulator.cellHeightPx (used only to size a natural-size
+            // Sixel/Kitty image's cursor-advance in rows - see its own doc)
+            // in sync with the view's real layout. rows > 0 guard avoids a
+            // divide-by-zero during the brief window before the first real
+            // layout pass; pixelHeight == 0 (caller hasn't measured yet, or
+            // never wires pixel size in at all) leaves cellHeightPx at 0,
+            // which imageRowSpan already treats as "unknown, use the old
+            // single-line fallback" - so this is never worse than before.
+            if (pixelHeight > 0 && rows > 0) {
+                emulator.cellHeightPx = pixelHeight / rows
+            }
         }
         // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
         // whatever's running) when cols/rows haven't actually changed - see
@@ -338,7 +502,10 @@ class TerminalSession(
         // the same cols/rows (e.g. font metrics settling a frame later)
         // isn't worth a second kernel round-trip either; the next real
         // cols/rows change will carry the corrected pixel size along.
-        if (masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
+        // deferIoctl (see this function's own doc) skips it unconditionally
+        // while a gesture is still in flight, regardless of whether cols/
+        // rows actually changed this tick.
+        if (!deferIoctl && masterFd >= 0 && (columns != lastAppliedColumns || rows != lastAppliedRows)) {
             NativePty.setWindowSize(masterFd, rows, columns, pixelWidth, pixelHeight)
             lastAppliedColumns = columns
             lastAppliedRows = rows
@@ -347,7 +514,22 @@ class TerminalSession(
 
     private fun appendHistory(chunk: String) {
         try {
-            historyFile.appendText(chunk)
+            // Lazily opened on the first chunk (not in start(), so a
+            // session that never produces output never touches the file
+            // at all - same as appendText's old behavior). FileOutputStream(file,
+            // append = true) matches appendText's own open mode; wrapped in
+            // BufferedOutputStream so a burst of small chunks (the common
+            // case - PTY reads are rarely large) doesn't turn back into a
+            // write() syscall per chunk, just per buffer-full/flush.
+            val stream = historyStream ?: BufferedOutputStream(
+                FileOutputStream(historyFile, /* append = */ true)
+            ).also { historyStream = it }
+            stream.write(chunk.toByteArray(Charsets.UTF_8))
+            // Not flushed here - see historyStream's own doc for why a
+            // per-chunk flush() was tried and reverted. historyFlusher
+            // picks this up on its own short interval instead; just mark
+            // that there's something worth flushing next time it wakes.
+            historyDirty = true
         } catch (_: IOException) {
             // best-effort persistence; do not interrupt the session on write failure
         }
@@ -365,6 +547,12 @@ class TerminalSession(
         }
         reader?.interrupt()
         writer?.interrupt()
+        // historyFlusher is normally torn down from the reader thread's own
+        // finally block (natural EOF) - but destroy()/kill() can run first,
+        // closing the fd out from under a reader that hasn't reached EOF
+        // yet. Interrupting it here too means it's never left running past
+        // whichever teardown path gets there first.
+        historyFlusher?.interrupt()
         closePfdOnce()
         alive = false
         markExited()
@@ -384,6 +572,8 @@ class TerminalSession(
         }
         reader?.interrupt()
         writer?.interrupt()
+        // See destroy()'s identical comment just above.
+        historyFlusher?.interrupt()
         closePfdOnce()
         alive = false
         markExited()

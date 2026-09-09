@@ -132,6 +132,16 @@ fun MultiPaneContainer(
     focusedRuntimeId: String?,
     bufferVersion: Int,
     bufferFor: (String) -> TerminalBuffer?,
+    // Parallel to bufferFor but for this tile's TerminalEmulator instance -
+    // see PaneContent's own onRegisterJumpHandler doc for why a tile needs
+    // this (findAdjacentPromptMark lives on TerminalEmulator, not
+    // TerminalBuffer, and this ViewModel doesn't own a multi-pane tile's
+    // local scrollOffset to do the lookup itself). Defaults to a no-op
+    // returning null so any existing caller not yet updated keeps compiling;
+    // jump-to-previous/next-command silently no-ops for multi-pane tiles
+    // until wired, same "hidden not broken" degradation bufferFor's own
+    // absence would already cause elsewhere in this composable.
+    emulatorFor: (String) -> TerminalEmulator? = { null },
     labelFor: (String) -> String,
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
@@ -150,7 +160,23 @@ fun MultiPaneContainer(
     // focus-tracking bookkeeping). Defaults to true so any other existing
     // caller of this composable keeps today's behavior unchanged.
     softKeyboardEnabled: Boolean = true,
+    // Settings > Terminal > Behaviour > "Allow custom app schemes" -
+    // threaded down to each tile's own TerminalView (see that
+    // composable's identically-named param for the full doc). Defaults to
+    // false (the safe default) so any other existing caller of this
+    // composable keeps the restricted-scheme behavior with no wiring
+    // needed.
+    allowCustomHyperlinkSchemes: Boolean = false,
     onInput: (runtimeId: String, text: String) -> Unit,
+    // Parallel to onInput but for clipboard pastes (see SplitTerminalPane's
+    // onPasteInput doc for the full rationale - same reasoning applies
+    // here: a paste shouldn't go through whatever per-keystroke CTRL/ALT
+    // chip processing the caller's onInput does, and needs to reach
+    // TerminalSession.writePaste for bracketed-paste wrapping instead of
+    // plain write). Defaults to onInput so any existing caller not yet
+    // updated keeps today's (unbracketed) behavior instead of failing to
+    // compile.
+    onPasteInput: (runtimeId: String, text: String) -> Unit = onInput,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
@@ -183,7 +209,16 @@ fun MultiPaneContainer(
     // there). Null (the default) keeps any other caller's behavior
     // unchanged.
     onImeRequestShow: (() -> Unit)? = null,
-    onImeRequestHide: (() -> Unit)? = null
+    onImeRequestHide: (() -> Unit)? = null,
+    // Wires each tile's own PaneContent into MainViewModel.paneJumpHandlers
+    // (see that map's own doc) so jump-to-previous/next-command can reach a
+    // multi-pane tile's local scrollOffset, which this ViewModel doesn't own
+    // - see PaneContent's identically-named params for the full doc. Both
+    // default to no-ops so any existing caller not yet updated keeps
+    // compiling; jump-to-prompt silently no-ops for multi-pane tiles (same
+    // degradation as emulatorFor's own default) until wired.
+    onRegisterJumpHandler: (runtimeId: String, handler: (forward: Boolean) -> Unit) -> Unit = { _, _ -> },
+    onUnregisterJumpHandler: (runtimeId: String) -> Unit = {}
 ) {
     Column(modifier = modifier.fillMaxSize()) {
         MultiPaneToolbar(
@@ -200,13 +235,16 @@ fun MultiPaneContainer(
                     focusedRuntimeId = focusedRuntimeId,
                     bufferVersion = bufferVersion,
                     bufferFor = bufferFor,
+                    emulatorFor = emulatorFor,
                     labelFor = labelFor,
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
+                    allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
                     onInput = onInput,
+                    onPasteInput = onPasteInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
                     onResizeSessionPty = onResizeSessionPty,
@@ -219,20 +257,25 @@ fun MultiPaneContainer(
                     onSaveSession = onSaveSession,
                     focusRequestSignal = focusRequestSignal,
                     onImeRequestShow = onImeRequestShow,
-                    onImeRequestHide = onImeRequestHide
+                    onImeRequestHide = onImeRequestHide,
+                    onRegisterJumpHandler = onRegisterJumpHandler,
+                    onUnregisterJumpHandler = onUnregisterJumpHandler
                 )
                 PaneMode.Floating -> FloatingLayout(
                     panes = panes,
                     focusedRuntimeId = focusedRuntimeId,
                     bufferVersion = bufferVersion,
                     bufferFor = bufferFor,
+                    emulatorFor = emulatorFor,
                     labelFor = labelFor,
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
+                    allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
                     onInput = onInput,
+                    onPasteInput = onPasteInput,
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
                     onMovePane = onMovePane,
@@ -259,7 +302,9 @@ fun MultiPaneContainer(
                     // was written.
                     focusRequestSignal = focusRequestSignal,
                     onImeRequestShow = onImeRequestShow,
-                    onImeRequestHide = onImeRequestHide
+                    onImeRequestHide = onImeRequestHide,
+                    onRegisterJumpHandler = onRegisterJumpHandler,
+                    onUnregisterJumpHandler = onUnregisterJumpHandler
                 )
             }
         }
@@ -324,13 +369,16 @@ private fun TilingLayout(
     focusedRuntimeId: String?,
     bufferVersion: Int,
     bufferFor: (String) -> TerminalBuffer?,
+    emulatorFor: (String) -> TerminalEmulator? = { null },
     labelFor: (String) -> String,
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
     zoomEnabled: Boolean = true,
     softKeyboardEnabled: Boolean = true,
+    allowCustomHyperlinkSchemes: Boolean = false,
     onInput: (String, String) -> Unit,
+    onPasteInput: (String, String) -> Unit = onInput,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
     onResizeSessionPty: (String, Int, Int, Int, Int) -> Unit,
@@ -346,7 +394,9 @@ private fun TilingLayout(
     onSaveSession: ((String) -> Unit)? = null,
     focusRequestSignal: Int = 0,
     onImeRequestShow: (() -> Unit)? = null,
-    onImeRequestHide: (() -> Unit)? = null
+    onImeRequestHide: (() -> Unit)? = null,
+    onRegisterJumpHandler: (runtimeId: String, handler: (forward: Boolean) -> Unit) -> Unit = { _, _ -> },
+    onUnregisterJumpHandler: (runtimeId: String) -> Unit = {}
 ) {
     if (panes.isEmpty()) return
     // Grid shape: as close to square as possible, favoring one extra
@@ -407,13 +457,16 @@ private fun TilingLayout(
                                     label = labelFor(pane.runtimeId),
                                     isFocused = pane.runtimeId == focusedRuntimeId,
                                     buffer = bufferFor(pane.runtimeId),
+                                    emulatorForPane = { emulatorFor(pane.runtimeId) },
                                     bufferVersion = bufferVersion,
                                     palette = palette,
                                     fontFamily = fontFamily,
                                     fontSizeSp = fontSizeSp,
                                     zoomEnabled = zoomEnabled,
                                     softKeyboardEnabled = softKeyboardEnabled,
+                                    allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
                                     onInput = { text -> onInput(pane.runtimeId, text) },
+                                    onPasteInput = { text -> onPasteInput(pane.runtimeId, text) },
                                     onFocus = { onFocusPane(pane.runtimeId) },
                                     onClose = { onClosePane(pane.runtimeId) },
                                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
@@ -429,6 +482,8 @@ private fun TilingLayout(
                                     focusRequestSignal = focusRequestSignal,
                                     onImeRequestShow = onImeRequestShow,
                                     onImeRequestHide = onImeRequestHide,
+                                    onRegisterJumpHandler = onRegisterJumpHandler,
+                                    onUnregisterJumpHandler = onUnregisterJumpHandler,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -528,13 +583,16 @@ private fun FloatingLayout(
     focusedRuntimeId: String?,
     bufferVersion: Int,
     bufferFor: (String) -> TerminalBuffer?,
+    emulatorFor: (String) -> TerminalEmulator? = { null },
     labelFor: (String) -> String,
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
     zoomEnabled: Boolean = true,
     softKeyboardEnabled: Boolean = true,
+    allowCustomHyperlinkSchemes: Boolean = false,
     onInput: (String, String) -> Unit,
+    onPasteInput: (String, String) -> Unit = onInput,
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
@@ -549,7 +607,9 @@ private fun FloatingLayout(
     onSaveSession: ((String) -> Unit)? = null,
     focusRequestSignal: Int = 0,
     onImeRequestShow: (() -> Unit)? = null,
-    onImeRequestHide: (() -> Unit)? = null
+    onImeRequestHide: (() -> Unit)? = null,
+    onRegisterJumpHandler: (runtimeId: String, handler: (forward: Boolean) -> Unit) -> Unit = { _, _ -> },
+    onUnregisterJumpHandler: (runtimeId: String) -> Unit = {}
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val density = LocalDensity.current.density
@@ -609,13 +669,16 @@ private fun FloatingLayout(
                     label = labelFor(pane.runtimeId),
                     isFocused = pane.runtimeId == focusedRuntimeId,
                     buffer = bufferFor(pane.runtimeId),
+                    emulatorForPane = { emulatorFor(pane.runtimeId) },
                     bufferVersion = bufferVersion,
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
+                    allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
                     onInput = { text -> onInput(pane.runtimeId, text) },
+                    onPasteInput = { text -> onPasteInput(pane.runtimeId, text) },
                     onFocus = { onFocusPane(pane.runtimeId) },
                     onClose = { onClosePane(pane.runtimeId) },
                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
@@ -652,6 +715,8 @@ private fun FloatingLayout(
                     focusRequestSignal = focusRequestSignal,
                     onImeRequestShow = onImeRequestShow,
                     onImeRequestHide = onImeRequestHide,
+                    onRegisterJumpHandler = onRegisterJumpHandler,
+                    onUnregisterJumpHandler = onUnregisterJumpHandler,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -673,6 +738,15 @@ private fun PaneContent(
     label: String,
     isFocused: Boolean,
     buffer: TerminalBuffer?,
+    // Parallel to buffer but for this pane's TerminalEmulator instance -
+    // see the DisposableEffect(runtimeId) below for why this pane needs it
+    // (findAdjacentPromptMark lives on TerminalEmulator, not TerminalBuffer).
+    // Named distinctly from MultiPaneContainer's own emulatorFor(runtimeId)
+    // param since this one is already resolved to this specific pane.
+    // Defaults to null so any existing caller not yet updated keeps
+    // compiling; jump-to-prompt silently no-ops for this pane until wired,
+    // same degradation as onRegisterJumpHandler's own default below.
+    emulatorForPane: () -> TerminalEmulator? = { null },
     bufferVersion: Int,
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
@@ -683,6 +757,7 @@ private fun PaneContent(
     // gate in MainActivity).
     zoomEnabled: Boolean = true,
     onInput: (String) -> Unit,
+    onPasteInput: (String) -> Unit = onInput,
     onFocus: () -> Unit,
     onClose: () -> Unit,
     onMeasuredSize: (columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit,
@@ -720,6 +795,7 @@ private fun PaneContent(
     // keyboard is turned off. Defaults to true so any other existing caller
     // of this composable keeps today's behavior unchanged.
     softKeyboardEnabled: Boolean = true,
+    allowCustomHyperlinkSchemes: Boolean = false,
     // Same "reclaim this pane's IME focus" signal SplitTerminalPane's own
     // focusRequestSignal is (see its doc): MainActivity bumps this after
     // VirtualKeyBar's long-text page swipes closed. Without a per-pane
@@ -748,7 +824,16 @@ private fun PaneContent(
     // attached to. Null (the default) keeps any other caller's behavior
     // unchanged.
     onImeRequestShow: (() -> Unit)? = null,
-    onImeRequestHide: (() -> Unit)? = null
+    onImeRequestHide: (() -> Unit)? = null,
+    // Registers/unregisters this pane's own jump-to-previous/next-command
+    // handler into MainViewModel.paneJumpHandlers (see that map's own doc)
+    // so AppShortcuts.kt's JUMP_TO_PREVIOUS/NEXT_COMMAND can reach this
+    // pane's local scrollOffset, which the ViewModel doesn't own - see the
+    // DisposableEffect(runtimeId) below for the actual registration. Both
+    // default to no-ops so any existing caller not yet updated keeps
+    // compiling; this pane's jump handler is simply never registered.
+    onRegisterJumpHandler: (runtimeId: String, handler: (forward: Boolean) -> Unit) -> Unit = { _, _ -> },
+    onUnregisterJumpHandler: (runtimeId: String) -> Unit = {}
 ) {
     // Per-pane pinch-zoom override, local to this composable only (not
     // persisted) - matches the lightweight-vs-primary-pane tradeoff this
@@ -840,6 +925,35 @@ private fun PaneContent(
     var isManuallyResizing by remember(runtimeId) { mutableStateOf(false) }
     val latestIsManuallyResizing = rememberUpdatedState(isManuallyResizing)
 
+    // Re-derives this tile's own cols/rows whenever effectiveFontSizeSp
+    // changes with its pixel size UNCHANGED - same gap MainActivity's own
+    // LaunchedEffect(effectiveTextSize) fixes for the primary/split pane
+    // (see that one's doc for the full mechanism). charMetrics above
+    // already reacts to effectiveFontSizeSp via its own remember() key, but
+    // nothing previously re-ran the cols/rows math off the back of that:
+    // only this tile's onSizeChanged (a real pixel-size change) ever pushed
+    // a new size to onMeasuredSize. So changing Settings > Appearance >
+    // Text Size while a multi-pane tile is open left buffer.rows/columns
+    // (and the pty's SIGWINCH) pinned to the grid computed from the OLD
+    // font size while the Canvas immediately painted glyphs at the new
+    // charWidth/charHeight - a full-screen program in that tile (btop,
+    // htop, vim) still draws its old column/row count, which no longer
+    // reaches the tile's true edges at the new metrics, leaving a black gap
+    // along the right/bottom exactly like the primary pane's own case.
+    // Skipped while zoomSizeSp is non-null so this never fights an
+    // in-progress pinch's own gesture-loop resize.
+    LaunchedEffect(effectiveFontSizeSp) {
+        if (zoomSizeSp == null) {
+            val finalSize = latestPaneSizePx
+            val (charWidth, charHeight) = latestCharMetrics.value
+            if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
+            }
+        }
+    }
+
     // Local scroll offset into this pane's own scrollback - independent of
     // every other pane's, and of the classic single-pane view's scrollOffset.
     var scrollOffset by remember(runtimeId) { androidx.compose.runtime.mutableIntStateOf(0) }
@@ -882,6 +996,49 @@ private fun PaneContent(
         if (!lastScrollWasEdgeAutoScroll) {
             paneSelectionState.clear()
         }
+    }
+
+    // Compensates this pane's own local scrollOffset when a resize (the
+    // corner-handle drag, pinch-zoom, or an orientation change while this
+    // pane happens to be active) relocates content the user might already
+    // be scrolled up into - same fix and same reasoning as
+    // MainViewModel.updateTerminalSize's own compensation for the classic
+    // single/split-pane view (see TerminalBuffer.consumePendingResizeScrollLines's
+    // doc for the full mechanism and the "beyaz cursor uçuyor, siyah
+    // boşluklar beliriyor" symptom this addresses). This pane's
+    // scrollOffset is local Compose state rather than ViewModel-owned
+    // (see its own doc above), so it needs its own LaunchedEffect here
+    // rather than being covered by the ViewModel-side fix.
+    androidx.compose.runtime.LaunchedEffect(bufferVersion) {
+        val buf = buffer ?: return@LaunchedEffect
+        val shift = buf.consumePendingResizeScrollLines()
+        if (shift != 0 && scrollOffset != 0) {
+            scrollOffset = (scrollOffset + shift).coerceIn(0, buf.maxScrollOffset)
+        }
+    }
+
+    // Registers this pane's own jump-to-previous/next-command handler for
+    // the duration this composable is in the composition, keyed by
+    // runtimeId - mirrors the DisposableEffect(Unit) { onDispose { ... } }
+    // registration idiom this file already uses elsewhere (see e.g.
+    // MultiPaneToolbar's neighbor DisposableEffect(Unit) below). Reads
+    // buffer/emulatorForPane/scrollOffset fresh on each invocation (not a
+    // captured snapshot) since this DisposableEffect only re-runs when
+    // runtimeId itself changes, not on every recomposition - a stale
+    // buffer/scrollOffset closure would silently jump against an old
+    // buffer or write to nothing once a resize or new session cycled this
+    // slot's content without changing its runtimeId key. See
+    // MainViewModel.jumpToAdjacentPrompt's own JumpTarget.Pane doc for why
+    // this ViewModel-side handler-registry approach was chosen over moving
+    // scrollOffset itself into MainViewModel.
+    DisposableEffect(runtimeId) {
+        onRegisterJumpHandler(runtimeId) { forward ->
+            val emulator = emulatorForPane() ?: return@onRegisterJumpHandler
+            val buf = buffer ?: return@onRegisterJumpHandler
+            val newOffset = emulator.findAdjacentPromptMark(buf, scrollOffset, forward) ?: return@onRegisterJumpHandler
+            scrollOffset = newOffset
+        }
+        onDispose { onUnregisterJumpHandler(runtimeId) }
     }
 
     // Same focusToken pattern SplitTerminalPane uses: bumped on every real
@@ -1077,19 +1234,52 @@ private fun PaneContent(
                             //
                             // While a manual corner-handle drag is in
                             // progress (isManuallyResizing, see its own doc
-                            // just above), fall to a much shorter ~2-frame
-                            // delay instead of the full 120ms: still enough
-                            // to coalesce the handful of onSizeChanged calls
-                            // Compose can deliver within a single frame, but
-                            // short enough that the pty (and therefore the
-                            // Canvas grid actually drawing new content) keeps
-                            // up with the finger in real time rather than
-                            // only catching up once the whole drag ends.
+                            // just above), every onSizeChanged commits
+                            // IMMEDIATELY instead of going through either the
+                            // 120ms debounce or an earlier ~32ms throttle
+                            // that used to gate this branch. That throttle
+                            // existed to keep SIGWINCH/redraw cost down
+                            // during a drag, but it left buffer.rows/columns
+                            // lagging up to 32ms behind the Box's own,
+                            // already-current pixel size on every frame the
+                            // throttle skipped - drawTerminal draws
+                            // buffer.rows x buffer.columns worth of cells
+                            // against whatever the Canvas's REAL (already
+                            // shrunk) size is, and clipToBounds() (this
+                            // pane's own Box, two levels up) hides whatever
+                            // of that stale, still-too-large grid no longer
+                            // fits - which is exactly the brief, distracting
+                            // "content clips away mid-drag, comes back the
+                            // instant I lift my finger" flicker (buffer
+                            // catches up to the Box's true size only once
+                            // the drag pauses long enough for the skipped
+                            // throttle window to actually land a commit).
+                            // Committing on every single onSizeChanged call
+                            // keeps buffer.rows/columns exactly matched to
+                            // the Box's pixel size on every frame instead of
+                            // trailing it - the resize is already cheap
+                            // (updateTerminalSizeFor only touches this one
+                            // runtime's session, see its own doc), and a
+                            // real 60-120Hz touch-driven drag calling this
+                            // once per onSizeChanged is a small, bounded
+                            // cost for the length of the drag, not the
+                            // unbounded IME-animation flood the ORIGINAL
+                            // 120ms debounce above (still used outside a
+                            // manual drag) exists to guard against.
                             latestPaneSizePx = sizePx
+                            if (latestIsManuallyResizing.value) {
+                                paneResizeDebounceJob?.cancel()
+                                val (charWidth, charHeight) = latestCharMetrics.value
+                                if (charWidth > 0f && charHeight > 0f) {
+                                    val cols = (sizePx.width / charWidth).toInt().coerceAtLeast(1)
+                                    val rws = (sizePx.height / charHeight).toInt().coerceAtLeast(1)
+                                    latestOnMeasuredSize.value(cols, rws, sizePx.width, sizePx.height)
+                                }
+                                return@onSizeChanged
+                            }
                             paneResizeDebounceJob?.cancel()
-                            val debounceMs = if (latestIsManuallyResizing.value) 32L else 120L
                             paneResizeDebounceJob = paneResizeScope.launch {
-                                delay(debounceMs)
+                                delay(120L)
                                 val (charWidth, charHeight) = latestCharMetrics.value
                                 val finalSize = latestPaneSizePx
                                 if (charWidth > 0f && charHeight > 0f && finalSize != null) {
@@ -1142,7 +1332,16 @@ private fun PaneContent(
                                     if (h <= 0f) continue
                                     val y = pointer.position.y
                                     val edgePx = h * edgeFraction
-                                    val (_, charHeight) = charMetrics
+                                    // latestCharMetrics.value, not the plain charMetrics -
+                                    // this whole edge-auto-scroll loop lives inside
+                                    // pointerInput(runtimeId), a coroutine that (like
+                                    // MainActivity's primary-pane gesture loop) is only
+                                    // relaunched when runtimeId itself changes, not on
+                                    // every font-size/zoom change. See MainActivity's own
+                                    // latestCharMetrics.value fix for the full doc - same
+                                    // stale-closure bug, same fix, just in this tile's
+                                    // copy of the gesture stack.
+                                    val (_, charHeight) = latestCharMetrics.value
                                     if (charHeight <= 0f) continue
                                     val maxOffset = buffer.maxScrollOffset
                                     when {
@@ -1211,10 +1410,12 @@ private fun PaneContent(
                             with(MouseGestureTracker) {
                                 runMouseHoverGesture(
                                     wantsHover = onWantsMouseMoveEvents,
-                                    charSize = { charMetrics },
+                                    // latestCharMetrics.value - see the edge-auto-scroll
+                                    // block above's doc, same stale-closure fix.
+                                    charSize = { latestCharMetrics.value },
                                     bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                 ) { col, row ->
-                                    val (cw, ch) = charMetrics
+                                    val (cw, ch) = latestCharMetrics.value
                                     lastMousePosition = Offset(col * cw, row * ch)
                                     onMouseEvent(TerminalEmulator.MouseEventKind.MOVE, col, row, 0)
                                 }
@@ -1229,7 +1430,9 @@ private fun PaneContent(
                                 runMouseWheelGesture(
                                     wantsWheelReporting = onWantsMouseEvents,
                                     emitWheelToApp = { kind, col, row -> onMouseEvent(kind, col, row, 0) },
-                                    charSize = { charMetrics },
+                                    // latestCharMetrics.value - same stale-closure fix as
+                                    // the hover/edge-scroll blocks above.
+                                    charSize = { latestCharMetrics.value },
                                     bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                     lastPointerPosition = { lastMousePosition },
                                 ) { deltaLines ->
@@ -1291,7 +1494,7 @@ private fun PaneContent(
                                 scrollFling.track(down.uptimeMillis, down.position)
                                 edgeWheelAutoScroll.reset()
 
-                                if (onWantsMouseEvents() && charMetrics.first > 0f && charMetrics.second > 0f) {
+                                if (onWantsMouseEvents() && latestCharMetrics.value.first > 0f && latestCharMetrics.value.second > 0f) {
                                     // Mouse reporting owns the whole gesture,
                                     // same as before: press/drag/release become
                                     // xterm mouse escape sequences instead of
@@ -1307,7 +1510,9 @@ private fun PaneContent(
                                     with(MouseGestureTracker) {
                                         runMouseReportGesture(
                                             down = down,
-                                            charSize = { charMetrics },
+                                            // latestCharMetrics.value - same stale-closure
+                                            // fix as this block's siblings above.
+                                            charSize = { latestCharMetrics.value },
                                             bufferSize = { (buffer?.columns ?: 0) to (buffer?.rows ?: 0) },
                                             onMove = { uptimeMillis, position ->
                                                 scrollFling.track(uptimeMillis, position)
@@ -1356,7 +1561,8 @@ private fun PaneContent(
                                         }
                                     }
                                     scrollFling.releaseAsWheelEvents(
-                                        charHeightPx = { charMetrics.second },
+                                        // latestCharMetrics.value - same stale-closure fix.
+                                        charHeightPx = { latestCharMetrics.value.second },
                                         col = lastCol,
                                         row = lastRow,
                                     ) { kind, col, row ->
@@ -1458,7 +1664,9 @@ private fun PaneContent(
                                         // slop is silently dropped) and fall
                                         // through to the pan/pinch loop below.
                                         primary.consume()
-                                        val (_, charHeight) = charMetrics
+                                        // latestCharMetrics.value - same stale-closure fix
+                                        // as this tile's other gesture blocks above.
+                                        val (_, charHeight) = latestCharMetrics.value
                                         if (charHeight > 0f) {
                                             val deltaLines = -(totalDy / charHeight)
                                             val maxOffset = buffer.maxScrollOffset
@@ -1502,6 +1710,17 @@ private fun PaneContent(
                                 }
 
                                 var lastMidY: Float? = pinchStartMidY
+                                // Whether this gesture actually changed
+                                // zoomSizeSp at all (vs. being a pure
+                                // one-finger-then-second-finger pan that
+                                // never crossed the `zoom != 1f` branch
+                                // below). Only a gesture that touched the
+                                // font size needs the resize commit after
+                                // the loop - an ordinary two-finger pan
+                                // that never zoomed has no buffer/pty
+                                // mismatch to fix and shouldn't pay for a
+                                // resize call on every pinch-loop exit.
+                                var zoomedThisGesture = false
 
                                 while (true) {
                                     val event = awaitPointerEvent()
@@ -1517,14 +1736,35 @@ private fun PaneContent(
                                         if (prevDist > 0f && zoomEnabled) {
                                             val zoom = curDist / prevDist
                                             if (zoom != 1f) {
-                                                val newSize = (latestEffectiveFontSizeSp.value * zoom).coerceIn(8f, 32f)
+                                                // Lower bound dropped from 8f to 4f - matches
+                                                // MainActivity/SplitTerminalPane's own zoom-out
+                                                // range fix (see their doc): 8f was stopping the
+                                                // gesture well short of what the user actually
+                                                // wanted ("uzaklaştırma az"). Upper bound (32f
+                                                // here vs 40f for the primary/split pane) is a
+                                                // pre-existing, separate difference for tiles and
+                                                // left untouched.
+                                                val newSize = (latestEffectiveFontSizeSp.value * zoom).coerceIn(4f, 32f)
                                                 zoomSizeSp = newSize
+                                                zoomedThisGesture = true
                                             }
                                         }
                                         val midY = (p1.position.y + p2.position.y) / 2f
                                         val prevMidY = lastMidY
                                         if (prevMidY != null) {
-                                            val (_, charHeight) = charMetrics
+                                            // latestCharMetrics.value - the actual root
+                                            // cause of the same "imleç/ekran yukarı kayıyor"
+                                            // bug in this tile: this pinch/pan loop lives
+                                            // inside pointerInput(runtimeId), which only
+                                            // relaunches when runtimeId changes, so the
+                                            // plain charMetrics closed over here was frozen
+                                            // at whatever font size was active before this
+                                            // gesture (or session) started - scrolling
+                                            // WHILE pinching kept computing deltaLines
+                                            // against that stale row height instead of the
+                                            // live one, drifting content/cursor position
+                                            // further off with every such frame.
+                                            val (_, charHeight) = latestCharMetrics.value
                                             if (charHeight > 0f) {
                                                 val deltaLines = -((midY - prevMidY) / charHeight)
                                                 if (deltaLines != 0f) {
@@ -1549,7 +1789,9 @@ private fun PaneContent(
                                         change.consume()
                                         val dy = change.position.y - change.previousPosition.y
                                         if (dy != 0f) {
-                                            val (_, charHeight) = charMetrics
+                                            // latestCharMetrics.value - same stale-closure
+                                            // fix as the two-finger branch just above.
+                                            val (_, charHeight) = latestCharMetrics.value
                                             if (charHeight > 0f) {
                                                 val deltaLines = -(dy / charHeight)
                                                 val maxOffset = buffer.maxScrollOffset
@@ -1564,6 +1806,71 @@ private fun PaneContent(
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                                // Pinch-zoom ended (all fingers lifted, loop
+                                // above broke). zoomSizeSp only changes what
+                                // font size TerminalView draws at
+                                // (effectiveFontSizeSp) and, through
+                                // charMetrics, only what THIS composable
+                                // thinks each cell measures in px - it never
+                                // touches buffer.rows/columns or the actual
+                                // pty size, both of which are driven
+                                // entirely by this Box's own onSizeChanged
+                                // (see that callback's own doc: "each
+                                // multi-pane pane has its own independent
+                                // on-screen size"). A pinch changes the
+                                // FONT size, not the Box's pixel size, so
+                                // onSizeChanged never fires for it at all -
+                                // buffer.rows/columns stayed exactly what
+                                // they were before the pinch while
+                                // drawTerminal (TerminalView.kt) kept
+                                // painting that same fixed grid at the new,
+                                // smaller-or-larger charWidth/charHeight.
+                                // Zooming OUT (smaller cells) left the
+                                // now-too-small grid covering only PART of
+                                // this Box, with unfilled canvas - which
+                                // paints as the true-black background fill
+                                // drawTerminal always clears to first - for
+                                // the rest ("zoom yaparken siyah boşluk
+                                // bugu", content that filled the screen
+                                // pre-zoom staying that same physical size
+                                // and leaving a growing black margin as the
+                                // font shrinks around it). Zooming IN did
+                                // the opposite: the grid became too WIDE/
+                                // TALL for the Box, and clipToBounds() (two
+                                // Box levels up) silently cropped whatever
+                                // now ran past the edge - no visible
+                                // artifact there, just missing columns/rows,
+                                // which is why this only ever got reported
+                                // as a zoom-OUT bug even though both
+                                // directions were equally unresized underneath.
+                                //
+                                // Firing the exact same debounced commit
+                                // onSizeChanged already uses - this Box's
+                                // latest known pixel size (unchanged by the
+                                // pinch) against latestCharMetrics.value
+                                // (which DOES already track effectiveFontSizeSp
+                                // live, see charMetrics' own doc) - closes
+                                // the gap: buffer.resize() runs against the
+                                // pinch's final font size the instant the
+                                // last finger lifts, same as every other
+                                // resize path in this pane funnels through
+                                // paneResizeDebounceJob/latestOnMeasuredSize.
+                                // Only runs when this gesture actually
+                                // zoomed (zoomedThisGesture) - a pure pan
+                                // has nothing to resize.
+                                if (zoomedThisGesture) {
+                                    paneResizeDebounceJob?.cancel()
+                                    paneResizeDebounceJob = paneResizeScope.launch {
+                                        delay(120L)
+                                        val (charWidth, charHeight) = latestCharMetrics.value
+                                        val finalSize = latestPaneSizePx
+                                        if (charWidth > 0f && charHeight > 0f && finalSize != null) {
+                                            val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                            val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                            latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
                                         }
                                     }
                                 }
@@ -1639,8 +1946,13 @@ private fun PaneContent(
                                             // onPaste - real terminals want CR for a
                                             // line break, not the LF a multi-line
                                             // clipboard selection naturally contains.
+                                            // onPasteInput (not onInput) - see its
+                                            // own doc on this composable: routes
+                                            // through TerminalSession.writePaste for
+                                            // bracketed-paste wrapping instead of
+                                            // onInput's plain keystroke path.
                                             scrollOffset = 0
-                                            onInput(pasted.replace('\n', '\r'))
+                                            onPasteInput(pasted.replace('\n', '\r'))
                                         }
                                     }
                                     paneSelectionState.clear()
@@ -1676,6 +1988,41 @@ private fun PaneContent(
                         // every multi-pane tile regardless of that tile's own palette.
                         highlightColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f).toArgb(),
                         handleColor = MaterialTheme.colorScheme.primary.toArgb(),
+                        allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+                        // zoomSizeSp != null: this tile is mid pinch-zoom, rendering at
+                        // a live/preview effectiveFontSizeSp that hasn't reached
+                        // TerminalSession.resize() yet (that only happens once
+                        // onSizeChanged's own 120ms - or 32ms while manually
+                        // resizing - debounce above actually fires). Exactly the same
+                        // gap MainActivity/SplitTerminalPane's own suppressCursor doc
+                        // describes: until that commit lands, buffer.cursorRow/
+                        // cursorCol are still the OLD grid coordinates, and drawTerminal
+                        // would multiply them by the NEW live charWidth/charHeight,
+                        // detaching the block cursor from the actual glyph grid for the
+                        // whole gesture - a stray white block drifting away from (often
+                        // upward of) where the cursor actually is.
+                        //
+                        // isManuallyResizing covers the SAME gap for the OTHER way this
+                        // tile's pixel size can change out from under buffer.rows/
+                        // columns: dragging the corner resize handle. Compose repaints
+                        // this Box at its new pixel size the instant floatSize changes
+                        // (every frame the finger moves), while the actual
+                        // TerminalSession.resize() commit is throttled to ~32ms
+                        // intervals (see onSizeChanged's own doc above) - so for most of
+                        // a drag the canvas is already at the new size while
+                        // buffer.cursorRow/cursorCol (and the charWidth/charHeight this
+                        // draw call derives from the CURRENT sizePx) still describe the
+                        // previous commit's grid. Only gating on zoomSizeSp left exactly
+                        // that gap open for a manual corner-drag, which is what showed
+                        // up as the cursor visibly wandering/leaving its actual cell -
+                        // even briefly appearing outside the intended text area - purely
+                        // from being drawn against a size it doesn't correspond to yet,
+                        // not from any actual cursorRow/cursorCol corruption. Suppressing
+                        // it for the whole drag (like the pinch-zoom case already does)
+                        // means the cursor simply reappears at the right spot the moment
+                        // the drag ends and the final resize commits, instead of
+                        // visibly drifting the entire time.
+                        suppressCursor = zoomSizeSp != null || isManuallyResizing,
                         modifier = Modifier.fillMaxSize()
                     )
                     // Anchored in this same Box as TerminalView (top-center
@@ -1804,11 +2151,13 @@ private fun PaneContent(
                                     accumulated = Offset.Zero
                                     onDragStart()
                                     // See isManuallyResizing's own doc above -
-                                    // switches onSizeChanged's debounce down
-                                    // to a short throttle for the duration of
-                                    // this drag so the terminal grid actually
-                                    // follows the finger instead of only
-                                    // catching up once it lifts.
+                                    // switches onSizeChanged into committing
+                                    // every single frame's size immediately
+                                    // for the duration of this drag so the
+                                    // terminal grid stays matched to the
+                                    // Box's real pixel size the whole time,
+                                    // instead of only catching up once it
+                                    // pauses or lifts.
                                     isManuallyResizing = true
                                 },
                                 onDrag = { change, dragAmount ->
@@ -1863,10 +2212,18 @@ private fun PaneContent(
                             )
                         }
                 ) {
+                    // Full opacity while actively being dragged (0.35f the
+                    // rest of the time, same as before) - a static low alpha
+                    // made the handle hard to track under the finger during
+                    // the resize itself, exactly when the user needs the
+                    // clearest visual feedback ("Floating boyutlandirirken
+                    // parmak opakligi okadar iyi sayilmaz"). isFocused isn't
+                    // involved here on purpose: this is about the drag
+                    // gesture's own state, not which pane has input focus.
                     Icon(
                         Icons.Filled.OpenWith,
                         contentDescription = "Drag to resize",
-                        tint = Color.White.copy(alpha = 0.35f),
+                        tint = Color.White.copy(alpha = if (isManuallyResizing) 0.9f else 0.35f),
                         modifier = Modifier.size(16.dp).align(Alignment.BottomEnd)
                     )
                 }

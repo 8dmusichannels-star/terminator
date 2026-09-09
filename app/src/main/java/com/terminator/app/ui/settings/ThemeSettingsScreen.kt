@@ -23,12 +23,14 @@ package com.terminator.app.ui.settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -442,6 +444,10 @@ private fun CustomPaletteEditor(
     onForegroundChange: (String) -> Unit,
     onBackgroundChange: (String) -> Unit
 ) {
+    // Which slot index (or null) the X11 name picker dialog is currently
+    // open for - one shared dialog instance rather than one per row.
+    var x11PickerForSlot by remember { mutableStateOf<Int?>(null) }
+
     Column {
         CustomRgbEditor(
             foregroundHex = foregroundHex,
@@ -481,9 +487,97 @@ private fun CustomPaletteEditor(
                     singleLine = true,
                     modifier = Modifier.weight(1f)
                 )
+                Spacer(modifier = Modifier.width(4.dp))
+                IconButton(onClick = { x11PickerForSlot = index }) {
+                    Icon(Icons.Filled.Palette, contentDescription = "Pick X11 color for $label")
+                }
             }
         }
     }
+
+    x11PickerForSlot?.let { slotIndex ->
+        X11ColorPickerDialog(
+            onDismiss = { x11PickerForSlot = null },
+            onColorSelected = { x11Color ->
+                onColorChange(slotIndex, x11Color.argb)
+                x11PickerForSlot = null
+            }
+        )
+    }
+}
+
+/**
+ * Searchable list of every [X11Colors] entry, each row showing a swatch,
+ * the display name, and its hex - lets any single ANSI slot (via
+ * [CustomPaletteEditor]'s per-row picker button) be set to any of the
+ * ~150 classic X11 named colors, not just the 16 baked into the "X11"
+ * [PalettePresets] entry.
+ */
+@Composable
+private fun X11ColorPickerDialog(
+    onDismiss: () -> Unit,
+    onColorSelected: (X11Color) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val results = remember(query) { X11Colors.search(query) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pick an X11 color") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = { Text("Search (e.g. \"dodger\")") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    results.forEach { color ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onColorSelected(color) }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                        ) {
+                            androidx.compose.foundation.layout.Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .background(
+                                        androidx.compose.ui.graphics.Color(color.argb),
+                                        androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
+                                    )
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(color.name, modifier = Modifier.weight(1f))
+                            Text(
+                                "#%06X".format(color.argb and 0xFFFFFF),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                    if (results.isEmpty()) {
+                        Text(
+                            "No matching X11 color",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
 }
 
 /**

@@ -21,6 +21,8 @@
 package com.terminator.app.ui
 
 import android.os.Environment
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.terminator.app.NotificationSessionInfo
@@ -164,11 +166,80 @@ class MainViewModel(
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
+    // Throttle for bumpVersion() calls driven by raw pty output (onContentChanged/
+    // onCursorMoved below) - NOT used by the other bumpVersion() call sites
+    // (session start/exit, resize commit), which stay immediate/untouched.
+    //
+    // Root cause of the btop/full-screen-TUI "flicker/tearing, çizimler tekrar
+    // tekrar çiziliyor" glitch: a single full-screen redraw from a program like
+    // btop is tens of escape sequences (cursor moves + writes) arriving as
+    // several separate pty reads. Each onCursorMoved AND each onContentChanged
+    // called bumpVersion() directly - a synchronous StateFlow write that
+    // collectAsState() turns into a full recomposition/Canvas repaint on this
+    // thread's next opportunity. During one btop refresh that fired dozens of
+    // recompositions in a few milliseconds, each painting a different
+    // half-updated slice of the same frame - visually indistinguishable from
+    // tearing, and the redundant paints are the "tekrar tekrar çiziliyor"
+    // part. The pty reader thread was never the bottleneck; the display only
+    // needs to be told once per frame that something changed.
+    //
+    // pendingVersionBump tracks whether a flush is already scheduled so a
+    // burst of calls within one throttle window schedules at most one
+    // delayed flush (not one per call); lastVersionBumpNanos is compared
+    // against System.nanoTime() so a call arriving well after the last real
+    // flush applies immediately instead of always paying the wait - this
+    // keeps normal, sparse typing/output exactly as responsive as before and
+    // only coalesces genuine bursts.
+    private val pendingVersionBump = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var lastVersionBumpNanos = 0L
+    // ~1 display frame at 60Hz. Chosen over Choreographer since this is
+    // driven from the pty reader thread (a plain background Thread, not
+    // Compose/main) - Choreographer callbacks must be posted from/to a
+    // Looper thread, which would add a hop back to main for no benefit here.
+    private val versionBumpThrottleNanos = 16_000_000L
+
     // Live sessions kept alive tab-style; keyed by runtime id.
     private val liveSessions = mutableMapOf<String, TerminalSession>()
     // Which entry each runtime id was spawned from, so "+" can duplicate
     // whatever is currently active and the drawer can label running rows.
     private val liveEntries = mutableMapOf<String, SessionEntry>()
+
+    // Per-multi-pane-tile "jump to adjacent OSC 133 prompt" callback,
+    // registered by PaneContent (MultiPaneContainer.kt) itself and keyed by
+    // runtimeId - see jumpToAdjacentPrompt's own doc for why this registry
+    // exists at all. A multi-pane tile's scrollOffset is local Compose
+    // state private to that one PaneContent composable (unlike the primary
+    // pane's _uiState.scrollOffset or the split pane's splitScrollOffset,
+    // both of which already live here), so this ViewModel has no field of
+    // its own to write for "jump this tile's scroll position" - it can only
+    // ask the tile to do it via whatever callback that tile last registered.
+    // registerPaneJumpHandler/unregisterPaneJumpHandler below are the
+    // register/unregister halves PaneContent calls from a
+    // DisposableEffect(runtimeId), so a tile's entry here can never outlive
+    // the tile itself (a removed/recomposed-away tile unregisters in
+    // onDispose, same lifecycle discipline as every other per-runtimeId map
+    // in this class).
+    private val paneJumpHandlers = mutableMapOf<String, (forward: Boolean) -> Unit>()
+
+    /** Registers this multi-pane tile's own "jump to adjacent prompt"
+     *  handler so [jumpToAdjacentPrompt] can reach a tile's local
+     *  scrollOffset - see [paneJumpHandlers]'s own doc for why this
+     *  indirection exists. Call from a DisposableEffect keyed on runtimeId;
+     *  pair with [unregisterPaneJumpHandler] in that effect's onDispose. */
+    fun registerPaneJumpHandler(runtimeId: String, handler: (forward: Boolean) -> Unit) {
+        paneJumpHandlers[runtimeId] = handler
+    }
+
+    /** Removes a tile's jump handler - see [registerPaneJumpHandler]'s own
+     *  doc. Guarded on identity-of-registration via the runtimeId key alone
+     *  (not the handler instance) since only one tile ever owns a given
+     *  runtimeId at a time; a stale unregister from an already-replaced
+     *  entry simply removes whatever's currently there, which is always the
+     *  right thing since a runtimeId is never shared between two live
+     *  tiles. */
+    fun unregisterPaneJumpHandler(runtimeId: String) {
+        paneJumpHandlers.remove(runtimeId)
+    }
 
     // Latest value of Settings > Keyboard > Terminal Type. Kept as a plain
     // field (rather than read fresh per-launch) so a newly spawned session
@@ -176,7 +247,7 @@ class MainViewModel(
     // call site needing to be a suspend function just to read one
     // preference. Sessions already running keep whatever TERM they started
     // with - this only affects new ones from this point on.
-    private var termType: String = "xterm-256color"
+    private var termType: String = "NONE"
 
     // Latest value of Settings > Keyboard > SECCOMP. Same "plain field kept
     // fresh via a collector" pattern as termType above - applies to every
@@ -191,6 +262,34 @@ class MainViewModel(
     // (unlike termType/seccomp, which only matter at spawn time).
     private var clearAlwaysPurgesScrollback: Boolean = false
 
+    // Latest value of Settings > Terminal Behaviour > "Allow OSC 52
+    // clipboard reads" (ALLOW_OSC52_CLIPBOARD_READ). Same "plain field kept
+    // fresh via a collector" pattern as clearAlwaysPurgesScrollback above -
+    // read directly (not via a suspend call) inside onClipboardGet below,
+    // which fires synchronously off the emulator's own parse loop and has
+    // no coroutine scope of its own to suspend into. Applies to every live
+    // session immediately, same as clearAlwaysPurgesScrollback: this is a
+    // live security posture, not a spawn-time default, so a user turning it
+    // off mid-session must stop answering GET requests on that same
+    // keystroke, not just for sessions opened afterward.
+    private var allowOsc52ClipboardRead: Boolean = false
+
+    // Latest value of Settings > Notifications > "OSC 9 / OSC 777
+    // notifications" (OSC_NOTIFICATIONS_ENABLED) - same fresh-field-via-
+    // collector pattern as allowOsc52ClipboardRead just above, read
+    // directly inside onNotification below for the same "fires
+    // synchronously off the emulator's own parse loop, no coroutine scope
+    // to suspend into" reason.
+    private var oscNotificationsEnabled: Boolean = false
+    // Monotonically increasing id for postOscNotification's own
+    // NotificationCompat.Builder calls - each OSC 9/777 request is its own
+    // independent, one-shot ping (unlike SessionForegroundService's single
+    // ever-updated NOTIFICATION_ID), so reusing one fixed id would make
+    // each new notification silently replace/dismiss the previous one
+    // instead of stacking, which defeats "tell me when each of several
+    // background jobs finishes" - the exact use case this exists for.
+    private var oscNotificationIdCounter = 0
+
     // Last measured terminal viewport, in character columns/rows. Updated by
     // MainActivity whenever the actual drawing area changes size (rotation,
     // IME opening/closing, virtual key bar toggling) so every session -
@@ -198,6 +297,13 @@ class MainViewModel(
     // really on screen instead of a fixed guess.
     private var columns = 80
     private var rows = 24
+    // Pixel size updateTerminalSize's LAST ACTUAL COMMIT used to arrive at
+    // columns/rows above - see updateTerminalSize's own early-return doc
+    // for why this has to be tracked separately from columns/rows
+    // themselves. 0 means "never committed a real pixel size yet" (fresh
+    // launch, before the first real layout pass).
+    private var lastCommittedPixelWidth = 0
+    private var lastCommittedPixelHeight = 0
 
     // Persists/restores each session's last floating-mode pane geometry -
     // see PaneGeometryStore's own doc and PaneState's doc for why this is
@@ -208,8 +314,10 @@ class MainViewModel(
     // below can skip a no-op resize() call the same way updateTerminalSize
     // does for the classic shared-size path - each pane's own size,
     // independent of the shared columns/rows pair above and of every other
-    // pane's size.
-    private val paneColumnsRows = mutableMapOf<String, Pair<Int, Int>>()
+    // pane's size. Third/fourth ints are the pixel width/height that size
+    // was last committed with - see updateTerminalSizeFor's own doc for
+    // why cols/rows alone aren't enough to detect "nothing to resize".
+    private val paneColumnsRows = mutableMapOf<String, IntArray>()
 
     init {
         viewModelScope.launch {
@@ -221,10 +329,20 @@ class MainViewModel(
             }
         }
         viewModelScope.launch {
-            settingsRepository.flow(SettingsKeys.TERM_TYPE, "xterm-256color").collect { termType = it }
+            settingsRepository.flow(SettingsKeys.TERM_TYPE, "NONE").collect { termType = it }
         }
         viewModelScope.launch {
             settingsRepository.flow(SettingsKeys.SECCOMP_ENABLED, false).collect { seccompEnabled = it }
+        }
+        viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.ALLOW_OSC52_CLIPBOARD_READ, false).collect { value ->
+                allowOsc52ClipboardRead = value
+            }
+        }
+        viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.OSC_NOTIFICATIONS_ENABLED, false).collect { value ->
+                oscNotificationsEnabled = value
+            }
         }
         viewModelScope.launch {
             settingsRepository.flow(SettingsKeys.CLEAR_ALWAYS_PTY, false).collect { value ->
@@ -497,6 +615,110 @@ class MainViewModel(
 
     private fun newRuntimeId(entryId: String): String = "$entryId#${System.currentTimeMillis()}"
 
+    /**
+     * Posts a real system notification for an OSC 9 ("just a message") or
+     * OSC 777 ("notify", title+body) request the emulator parsed - see
+     * TerminalEmulator.Listener.onNotification's own doc for why this is
+     * gated behind oscNotificationsEnabled (an explicit user opt-in,
+     * mirroring the OSC 52 clipboard-read posture: this is untrusted
+     * program output getting to trigger a real OS-level side effect) and
+     * why [title] can be null (a bare OSC 9 never carries one) - falls
+     * back to the app name in that case, same as any other notification
+     * needs SOME title. A silent no-op when the setting is off (identical
+     * to today's "OSC 9/777 does nothing" behavior) or when Android's own
+     * POST_NOTIFICATIONS runtime permission (API 33+) hasn't been granted -
+     * NotificationManagerCompat would otherwise just silently drop the
+     * post anyway on those versions, so checking first avoids relying on
+     * that undocumented-from-the-caller's-perspective behavior.
+     */
+    private fun postOscNotification(title: String?, body: String) {
+        if (!oscNotificationsEnabled) return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(app, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val channelId = "osc_notifications"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                channelId,
+                app.getString(com.terminator.app.R.string.notification_channel_name_osc),
+                android.app.NotificationManager.IMPORTANCE_DEFAULT
+            )
+            val manager = app.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+        val notification = NotificationCompat.Builder(app, channelId)
+            .setSmallIcon(com.terminator.app.R.drawable.ic_notification_terminal)
+            .setContentTitle(title ?: app.getString(com.terminator.app.R.string.app_name))
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        val manager = app.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        manager.notify(oscNotificationIdCounter++, notification)
+    }
+
+    /**
+     * Decodes an OSC 1337 File= inline image THAT TerminalEmulator ITSELF
+     * COULDN'T (see Listener.onInlineImageData's own doc): this is only
+     * ever reached as the fallback for a payload its in-module PNG
+     * decoder declined (a non-PNG format - JPEG/GIF/WebP - or a PNG
+     * outside that decoder's supported subset; see finishOsc's own "1337"
+     * case for why PNG is tried in-module first and this only ever sees
+     * what that attempt already ruled out). BitmapFactory covers every
+     * format Android's own codec stack supports, which is the strictly
+     * larger set this fallback exists to catch - the same
+     * "android.graphics needs to live outside terminal-emulator, which
+     * imports no android.* type at all" boundary onClipboardSet's base64
+     * clipboard payload already crosses.
+     *
+     * [widthSpec]/[heightSpec] (iTerm2's raw width=/height= control
+     * fields - a bare cell count, "Npx", "N%", or "auto"/absent) are
+     * accepted but not resolved into a target cell size: BitmapFactory
+     * decodes at the image's own native pixel dimensions and
+     * TerminalBuffer.PlacedImage is drawn by TerminalView at that native
+     * size the same way a plain Sixel image already is (see
+     * decodeAndPlaceSixel's own "no font-metrics of its own" doc for why
+     * that resolution step lives in the render layer, not here either) -
+     * so an explicit width=/height= request that asks for something OTHER
+     * than the image's native size is accepted but not honored, same
+     * "not modeled" posture the OSC 1337 doc already documents for
+     * preserveAspectRatio.
+     */
+    private fun decodeAndPlaceOsc1337Image(
+        session: TerminalSession,
+        base64Data: String,
+        widthSpec: String?,
+        heightSpec: String?
+    ) {
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(base64Data)
+        } catch (e: IllegalArgumentException) {
+            // Malformed base64 (torn stream, a sender that violated the
+            // spec) - nothing to place, same silent-drop posture
+            // finishOsc's own malformed-input handling uses elsewhere.
+            return
+        }
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) {
+            bitmap.recycle()
+            return
+        }
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        bitmap.recycle()
+        // placeDecodedInlineImage does the actual buffer.placeImage +
+        // cursor-advance - see its own doc for why this hands decoded
+        // pixels back into TerminalEmulator rather than calling
+        // session.buffer.placeImage directly from here.
+        session.emulator.placeDecodedInlineImage(pixels, width, height)
+    }
+
     private fun launchLiveSession(runtimeId: String, entry: SessionEntry) {
         // One history file per *session definition* (entryId), not per
         // launch (runtimeId) - runtimeId is "$entryId#$timestamp" (see
@@ -537,8 +759,8 @@ class MainViewModel(
                 _uiState.value = _uiState.value.copy(bellTick = _uiState.value.bellTick + 1)
             }
             override fun onTitleChanged(title: String) { /* surfaced via titlebar if desired */ }
-            override fun onCursorMoved(row: Int, col: Int) { bumpVersion() }
-            override fun onContentChanged() { bumpVersion() }
+            override fun onCursorMoved(row: Int, col: Int) { bumpVersionThrottled() }
+            override fun onContentChanged() { bumpVersionThrottled() }
             // DSR/CPR replies (CSI 6n/5n) - the emulator computed the
             // answer, this just has to get those bytes back onto the pty.
             // Without this, anything that probes cursor position on
@@ -548,6 +770,143 @@ class MainViewModel(
             // breaking it out of that wait, not any real recovery.
             override fun onRespond(data: String) {
                 session.write(data)
+            }
+            // OSC 52 clipboard-set: decode the base64 payload the emulator
+            // handed over as-is (see TerminalEmulator.Listener.onClipboardSet's
+            // own doc for why decoding happens here, not in that module) and
+            // write it to the system clipboard - the same effect a manual
+            // copy would have, just triggered from inside e.g. tmux/nvim over
+            // ssh via "OSC 52 ; c ; <base64> ST" (nvim's `"+y`, for one).
+            // Malformed base64 (a torn/garbled sequence) is dropped silently
+            // rather than crashing the session over a clipboard write.
+            override fun onClipboardSet(base64Data: String) {
+                val text = try {
+                    String(android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT), Charsets.UTF_8)
+                } catch (e: IllegalArgumentException) {
+                    return
+                }
+                val clipboard = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Terminator", text))
+            }
+            // OSC 52 clipboard-GET: only ever answered when the user has
+            // explicitly opted in via Settings > Terminal Behaviour > Allow
+            // OSC 52 clipboard reads (allowOsc52ClipboardRead, read fresh
+            // here rather than captured at session-launch time, so flipping
+            // it off mid-session takes effect on the very next request -
+            // see that field's own doc). When off, this is a silent no-op:
+            // identical to today's behavior of just never responding, so a
+            // program blocked waiting on the reply times out on its own
+            // terms rather than the app sending back an explicit "denied"
+            // that would itself confirm a human is watching.
+            //
+            // When on: reads the REAL system clipboard (not merely
+            // whatever this session last set via OSC 52 SET - a stale echo
+            // would be a lie about clipboard state, and answering only with
+            // this session's own prior SET would defeat the actual use case
+            // for GET, e.g. nvim's `"+p` picking up something copied
+            // outside the terminal), encodes it, and writes the full OSC 52
+            // reply straight back over the pty via onRespond's own
+            // session.write(data) path - same "emulator hands over a
+            // string, TerminalSession writes it verbatim" wiring already
+            // used for DSR/CPR. `selection` is attacker-controlled (comes
+            // straight off the pty from whatever program sent the GET), so
+            // unlike a real xterm - which trusts its own input enough to
+            // echo the letter back raw - it's filtered down to
+            // a-z/A-Z/0-9 before being spliced into the reply: this is a
+            // reply THIS app constructs and writes back onto its own pty,
+            // so a selection value smuggling in a stray ';', ESC, or BEL
+            // could otherwise forge extra OSC/DCS sequences (a "response
+            // splitting" onto the pty) riding along with the legitimate
+            // clipboard reply. The filtered value never reaches the
+            // clipboard lookup itself either way, since Android exposes
+            // only one system clipboard regardless of which OSC 52
+            // selection buffer ('c'/'p'/'s') was named.
+            override fun onClipboardGet(selection: String) {
+                if (!allowOsc52ClipboardRead) return
+                val safeSelection = selection.filter { it.isLetterOrDigit() && it.code < 128 }
+                val clipboard = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                val text = clipboard?.primaryClip?.let { clip ->
+                    if (clip.itemCount > 0) clip.getItemAt(0).coerceToText(app)?.toString() else null
+                } ?: ""
+                val encoded = android.util.Base64.encodeToString(text.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+                session.write("\u001b]52;$safeSelection;$encoded\u001b\\")
+            }
+            // OSC 133 shell-integration marks - the emulator itself already
+            // records every 'A' (prompt-start) mark for jump navigation
+            // (see TerminalEmulator.promptMarks' own doc), so there's
+            // nothing this callback needs to do with the mark data itself.
+            // bumpVersion() still runs so a 'D' mark's exit code becomes
+            // visible to anything (e.g. a future per-command status
+            // indicator) reading off the buffer/emulator on the next
+            // recomposition, same as any other content change.
+            override fun onShellIntegrationMark(marker: Char, row: Int, exitCode: Int?) { bumpVersion() }
+            // OSC 4/10/11/12 color queries - this module has no live theme
+            // access of its own (see onQueryDynamicColor's own doc for why
+            // that boundary exists), so answering means resolving [slot]
+            // against whatever TerminalBuffer override map/palette this
+            // session is actually using and writing the reply straight
+            // back over the pty via session.write - same "emulator hands
+            // over a request, caller answers over the same wire" shape as
+            // onRespond. No live-theme plumbing reaches this listener
+            // object yet (it's built once per session launch, before any
+            // Compose theme state exists to read), so this only ever
+            // checks the per-session override maps for now - a query for
+            // a slot that was never explicitly SET (via a prior OSC 4/10/
+            // 11/12) simply goes unanswered, same as today's blanket
+            // silence for every dynamic-color query.
+            override fun onQueryDynamicColor(code: Int, slot: Int, isDynamic: Boolean) {
+                val override = if (isDynamic) {
+                    session.emulator.buffer.getDynamicColorOverride(slot)
+                } else {
+                    session.emulator.buffer.getPaletteOverride(slot)
+                }
+                val rgb = override ?: return
+                val r = (rgb shr 16) and 0xFF
+                val g = (rgb shr 8) and 0xFF
+                val b = rgb and 0xFF
+                fun scale(c: Int) = (c or (c shl 8)).let { "%04x".format(it) }
+                session.write("\u001B]$code;rgb:${scale(r)}/${scale(g)}/${scale(b)}\u001B\\")
+            }
+            // OSC 7 (shell-integration working-directory report) - purely
+            // informational for now (see its own doc on the Listener
+            // interface: a future "open new session in the same directory"
+            // feature could read this), so there's nothing for THIS
+            // listener to actively do with [path] yet beyond making sure
+            // it doesn't fall through as an unimplemented abstract member.
+            override fun onWorkingDirectoryChanged(path: String) { /* no UI consumer yet */ }
+            // DECCOLM (80/132-column switch) - see onDeccolmChanged's own
+            // doc for why honoring this means an actual resize() call.
+            // Phone-sized layouts render 132 columns illegibly small, so
+            // this only actually resizes on a wide-enough viewport (a
+            // tablet in landscape, a DeX/desktop-mode window) - elsewhere
+            // it's accepted (not left hanging) but the physical column
+            // count is left alone, the same tolerance already extended to
+            // e.g. kittyAnchor's own pixel-size fallback.
+            override fun onDeccolmChanged(columns: Int) {
+                if (this@MainViewModel.columns >= 132) {
+                    session.resize(columns, rows)
+                }
+            }
+            // OSC 1 (icon name) - see onIconNameChanged's own doc. No
+            // dedicated "icon name" UI surface exists on a mobile layout
+            // (there's no taskbar icon to relabel), so this is folded into
+            // the same per-session label OSC 0/2's title would use if this
+            // listener acted on onTitleChanged - kept as its own no-op-for-
+            // now override (rather than omitted) purely so a future label
+            // feature has a clear, already-wired hook to fill in.
+            override fun onIconNameChanged(name: String) { /* no dedicated UI surface yet */ }
+            // OSC 9 / OSC 777 notifications - see postOscNotification's
+            // own doc for the opt-in gating and permission check.
+            override fun onNotification(title: String?, body: String) {
+                postOscNotification(title, body)
+            }
+            // OSC 1337 File= inline images - see
+            // decodeAndPlaceOsc1337Image's own doc for the actual
+            // BitmapFactory decode + placeImage hand-off (the step
+            // TerminalEmulator itself can't do - see
+            // Listener.onInlineImageData's own doc on why).
+            override fun onInlineImageData(base64Data: String, widthSpec: String?, heightSpec: String?) {
+                decodeAndPlaceOsc1337Image(session, base64Data, widthSpec, heightSpec)
             }
         }
         // Fires once, either off the pty reader thread (natural EOF) or
@@ -803,6 +1162,14 @@ class MainViewModel(
      *  pane can show "session ended" instead of crashing on a stale buffer. */
     fun bufferFor(runtimeId: String): TerminalBuffer? = liveSessions[runtimeId]?.buffer
 
+    /** Emulator for an arbitrary runtimeId, not just the active one - lets a
+     *  multi-pane tile's own PaneContent build its jump-to-prompt handler
+     *  (findAdjacentPromptMark lives on TerminalEmulator, not TerminalBuffer -
+     *  see that function's own doc) without this ViewModel having to own the
+     *  tile's local scrollOffset itself (see [paneJumpHandlers]'s doc). Same
+     *  liveSessions-map/null-if-not-live shape as [bufferFor]. */
+    fun emulatorFor(runtimeId: String): TerminalEmulator? = liveSessions[runtimeId]?.emulator
+
     fun sendInput(text: String) {
         val state = _uiState.value
         liveSessions[state.activeSessionId]?.write(text)
@@ -822,6 +1189,26 @@ class MainViewModel(
         }
     }
 
+    /**
+     * Same routing as [sendInput] (active session + broadcast mirror +
+     * jump back to live screen), but for a clipboard paste specifically -
+     * goes through TerminalSession.writePaste so a program that requested
+     * bracketed paste (DECSET 2004) gets the ESC[200~/201~ wrapper (see
+     * writePaste's own doc). A plain sendInput() call here would never be
+     * able to make that distinction, since by the time text reaches
+     * TerminalSession it looks identical to typed keystrokes.
+     */
+    fun sendPaste(text: String) {
+        val state = _uiState.value
+        liveSessions[state.activeSessionId]?.writePaste(text)
+        if (state.broadcastInput) {
+            state.splitRuntimeId?.let { liveSessions[it]?.writePaste(text) }
+        }
+        if (_uiState.value.scrollOffset != 0) {
+            _uiState.value = _uiState.value.copy(scrollOffset = 0)
+        }
+    }
+
     /** Sends input to one specific pane's session, bypassing broadcast -
      *  used by the split-screen secondary pane's own keyboard/paste so
      *  typing directly into pane 2 never doubles into pane 1 regardless of
@@ -830,6 +1217,14 @@ class MainViewModel(
      *  own typing back into itself). */
     fun sendInputTo(runtimeId: String, text: String) {
         liveSessions[runtimeId]?.write(text)
+    }
+
+    /** Paste counterpart to [sendInputTo] - same bracketed-paste wrapping
+     *  as [sendPaste], but targeted at one specific pane's session (split-
+     *  screen secondary pane's own paste), bypassing broadcast for the
+     *  same reason sendInputTo does. */
+    fun sendPasteTo(runtimeId: String, text: String) {
+        liveSessions[runtimeId]?.writePaste(text)
     }
 
     /**
@@ -1246,6 +1641,24 @@ class MainViewModel(
         }
     }
 
+    /** Paste counterpart to [sendPaneInput] - same focused-pane/broadcast
+     *  targeting, but goes through [sendPasteTo] for bracketed-paste
+     *  wrapping (see its own doc) instead of plain sendInputTo. Doesn't
+     *  need sendPaneInput's Ctrl+D/exited-pane handling: a paste is never
+     *  a literal EOT byte and pasting into an already-exited pane's dead
+     *  pty is a harmless no-op the same way it already is for the primary
+     *  pane's own paste path. */
+    fun sendPanePaste(text: String, broadcastAllPanes: Boolean) {
+        val state = _uiState.value
+        if (state.panes.isEmpty()) return
+        val targets = if (broadcastAllPanes) {
+            state.panes.map { it.runtimeId }
+        } else {
+            listOfNotNull(state.focusedPaneRuntimeId)
+        }
+        targets.forEach { target -> sendPasteTo(target, text) }
+    }
+
     /** Clamped well away from 0/1 so neither pane can be dragged down to an
      *  unusable sliver - matches the drag handle's own min-size guard in
      *  SplitScreenContainer, kept here too since this is also reachable
@@ -1336,6 +1749,60 @@ class MainViewModel(
         return next - current
     }
 
+    /**
+     * Jumps a session's scroll position to the previous (further back in
+     * history) or next (closer to live) shell prompt, per OSC 133
+     * shell-integration marks the running shell has sent (see
+     * TerminalEmulator.promptMarks' own doc) - a no-op if that session's
+     * shell doesn't send them, or if already at the oldest/newest prompt in
+     * that direction.
+     *
+     * [target] picks WHICH scroll position gets written, mirroring how
+     * every other focus-aware AppAction in AppShortcuts.kt's execute()
+     * already resolves "which session/pane" (routing.isMultiPane /
+     * routing.splitPaneFocused) - this function can't make that call
+     * itself since it has no access to PhysicalKeyboardRouting, so the
+     * caller resolves it once and passes the answer down:
+     *  - Primary: reads/writes _uiState.scrollOffset against activeSessionId,
+     *    same as this function's original (pre-multi-target) behavior.
+     *  - Split: reads/writes splitScrollOffset against splitRuntimeId, same
+     *    shape as adjustSplitScrollOffset's own split-vs-primary split.
+     *  - Pane(runtimeId): the given multi-pane tile's own scrollOffset,
+     *    which this ViewModel doesn't own at all (see paneJumpHandlers' own
+     *    doc) - reached indirectly via whatever handler that tile
+     *    registered, a no-op if the tile isn't currently composed (handler
+     *    not registered) or has itself decided there's nowhere to jump.
+     */
+    sealed class JumpTarget {
+        object Primary : JumpTarget()
+        object Split : JumpTarget()
+        data class Pane(val runtimeId: String) : JumpTarget()
+    }
+
+    fun jumpToAdjacentPrompt(forward: Boolean, target: JumpTarget = JumpTarget.Primary) {
+        when (target) {
+            is JumpTarget.Primary -> {
+                val runtimeId = _uiState.value.activeSessionId ?: return
+                val session = liveSessions[runtimeId] ?: return
+                val newOffset = session.emulator.findAdjacentPromptMark(
+                    session.buffer, _uiState.value.scrollOffset, forward
+                ) ?: return
+                _uiState.value = _uiState.value.copy(scrollOffset = newOffset)
+            }
+            is JumpTarget.Split -> {
+                val runtimeId = _uiState.value.splitRuntimeId ?: return
+                val session = liveSessions[runtimeId] ?: return
+                val newOffset = session.emulator.findAdjacentPromptMark(
+                    session.buffer, _uiState.value.splitScrollOffset, forward
+                ) ?: return
+                _uiState.value = _uiState.value.copy(splitScrollOffset = newOffset)
+            }
+            is JumpTarget.Pane -> {
+                paneJumpHandlers[target.runtimeId]?.invoke(forward)
+            }
+        }
+    }
+
     // Carries the fractional part of adjustSplitScrollOffset's deltaLines
     // across calls - same reasoning as scrollFractionCarry above, just a
     // separate accumulator so a slow drag in one pane doesn't borrow
@@ -1361,6 +1828,19 @@ class MainViewModel(
         return next - current
     }
 
+    /** Forwards a real focus transition (see MainActivity.onWindowFocusChanged)
+     *  to EVERY live session, not just the active/focused one - a program
+     *  running in a backgrounded split/multi-pane tile that requested focus
+     *  reporting (DECSET 1004) still wants to know the whole window lost
+     *  focus, same as a real terminal emulator's own single OS-level window
+     *  would report to everything inside it. Each TerminalEmulator no-ops
+     *  this itself if that particular program never asked (see
+     *  TerminalEmulator.reportFocusChange's own doc), so this is safe to
+     *  call unconditionally on every session. */
+    fun broadcastFocusChange(focused: Boolean) {
+        liveSessions.values.forEach { it.emulator.reportFocusChange(focused) }
+    }
+
     /** True only while the active session's program has actually enabled
      *  mouse reporting (DECSET 1000/1002/1003) - lets the UI decide whether
      *  a touch on the terminal should become a mouse escape sequence or
@@ -1384,6 +1864,15 @@ class MainViewModel(
      *  or the running program won't recognize them at all. */
     fun activeSessionApplicationCursorKeys(): Boolean =
         liveSessions[_uiState.value.activeSessionId]?.emulator?.applicationCursorKeys == true
+
+    /** The active session's currently-active kitty keyboard protocol
+     *  progressive-enhancement flags (0 = protocol not engaged, plain
+     *  legacy key encoding) - see TerminalEmulator.kittyKeyboardFlags' own
+     *  doc for what each bit means. PhysicalKeyEvent/VirtualKeyBar read
+     *  this to decide whether (and how) to encode a keypress as a kitty
+     *  "CSI <code>[...] u" report instead of the legacy sequence. */
+    fun activeSessionKittyKeyboardFlags(): Int =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.kittyKeyboardFlags ?: 0
 
     fun sendMouseEvent(kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int = 0) {
         liveSessions[_uiState.value.activeSessionId]?.sendMouseEvent(kind, col, row, button)
@@ -1425,10 +1914,90 @@ class MainViewModel(
      */
     fun updateTerminalSize(newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         if (newColumns <= 0 || newRows <= 0) return
-        if (newColumns == columns && newRows == rows) return
+        // Previously this early-returned whenever newColumns/newRows
+        // matched the last-committed cols/rows, on the assumption that
+        // "same cell count -> nothing to resize". But cols/rows are cell
+        // COUNTS, not the actual pixel size - a pinch-zoom settling back to
+        // (or a Settings > Appearance > Text Size change landing on) a
+        // different font size that HAPPENS to floor-divide to the same
+        // integer column/row count as before (e.g. zooming from a size
+        // that gave exactly 80 cols to a smaller/larger one that still
+        // floors to 80) hit this early return and skipped session.resize()
+        // entirely - so emulator.cellHeightPx (used for Sixel/Kitty image
+        // row-span math) and, more visibly, the pty's own ioctl(TIOCSWINSZ)
+        // + SIGWINCH never fired for that change at all. A full-screen
+        // program already running (top, btop, htop) kept its existing
+        // redraw at the OLD pixel dimensions while the Canvas immediately
+        // painted every cell at the NEW (different) font size - text
+        // filling only part of its old footprint at the new metrics,
+        // leaving the "siyah boşluklar" gap around it, exactly the
+        // "zoom ile font size ayarı çakışıyor" symptom this now fixes by
+        // also comparing the actual pixel size against the last size a
+        // resize genuinely committed with, not just the cell count that
+        // happened to result from it. pixelWidth/pixelHeight of 0 (a caller
+        // that never wires pixel size in at all) keeps the old cols/rows-
+        // only comparison as a safe fallback rather than resizing on every
+        // single call.
+        val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
+            (pixelWidth != lastCommittedPixelWidth || pixelHeight != lastCommittedPixelHeight)
+        if (newColumns == columns && newRows == rows && !pixelSizeChanged) return
         columns = newColumns
         rows = newRows
-        liveSessions.values.forEach { it.resize(newColumns, newRows, pixelWidth, pixelHeight) }
+        if (pixelWidth > 0 && pixelHeight > 0) {
+            lastCommittedPixelWidth = pixelWidth
+            lastCommittedPixelHeight = pixelHeight
+        }
+        // Skip the split partner's own session here - it now measures its
+        // own (possibly different-width) Box and resizes itself through
+        // updateTerminalSizeFor (see that function's own doc + its
+        // SplitTerminalPane.kt call site's onResize doc for the full
+        // "why"). Before that per-runtime path existed, this forEach was
+        // the ONLY thing that ever resized the split partner's pty, always
+        // to THIS (primary pane's) width - correct only when splitRatio
+        // happened to be exactly 0.5 and both panes were coincidentally
+        // the same width. Leaving the split partner in this forEach now
+        // would race its own onResize commit: every primary-pane resize
+        // (rotation, IME open/close, divider drag) would immediately
+        // overwrite the split partner's just-computed correct size back to
+        // the primary's (wrong, for anything but a dead-center split)
+        // size, undoing updateTerminalSizeFor's own commit a moment later.
+        val splitRuntimeId = _uiState.value.splitRuntimeId
+        liveSessions.forEach { (runtimeId, session) ->
+            if (runtimeId != splitRuntimeId) {
+                session.resize(newColumns, newRows, pixelWidth, pixelHeight)
+            }
+        }
+        // Compensate scrollOffset/splitScrollOffset for whichever of the
+        // two resized sessions the user might currently be scrolled up
+        // into - see TerminalBuffer.consumePendingResizeScrollLines's own
+        // doc for why a resize (unlike ordinary PTY output) needs this at
+        // all: a shrink relocates on-screen content the user may already
+        // be looking at straight into scrollback out from under a
+        // scrollOffset that never otherwise changes, desyncing the view
+        // from the content it was pointing at (visible as a stray live
+        // line, a wall of blank rows, and old history reappearing
+        // elsewhere on screen - reported after simply tapping the
+        // terminal to open/close the keyboard while scrolled up). Reading
+        // this AFTER resize() above (which is where the counter gets
+        // incremented) and BEFORE bumpVersion() so TerminalView's own
+        // recomposition already sees the corrected scrollOffset on the
+        // same tick, rather than one tick showing the stale value.
+        activeBuffer()?.let { buf ->
+            val shift = buf.consumePendingResizeScrollLines()
+            if (shift != 0 && _uiState.value.scrollOffset != 0) {
+                val next = (_uiState.value.scrollOffset + shift).coerceIn(0, buf.maxScrollOffset)
+                _uiState.value = _uiState.value.copy(scrollOffset = next)
+            }
+        }
+        _uiState.value.splitRuntimeId?.let { splitId ->
+            bufferFor(splitId)?.let { splitBuffer ->
+                val shift = splitBuffer.consumePendingResizeScrollLines()
+                if (shift != 0 && _uiState.value.splitScrollOffset != 0) {
+                    val next = (_uiState.value.splitScrollOffset + shift).coerceIn(0, splitBuffer.maxScrollOffset)
+                    _uiState.value = _uiState.value.copy(splitScrollOffset = next)
+                }
+            }
+        }
         bumpVersion()
     }
 
@@ -1448,8 +2017,18 @@ class MainViewModel(
     fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
         if (newColumns <= 0 || newRows <= 0) return
         val current = paneColumnsRows[runtimeId]
-        if (current != null && current.first == newColumns && current.second == newRows) return
-        paneColumnsRows[runtimeId] = newColumns to newRows
+        // Same "cell count alone isn't enough" fix as updateTerminalSize's
+        // own doc explains - a pane's pinch-zoom or the global font-size
+        // slider can settle on a different pixel size that still floors to
+        // the same cols/rows this pane already had, which previously hit
+        // this early return and skipped resize() (and therefore the pty's
+        // SIGWINCH) entirely, leaving a running full-screen program in
+        // that tile drawing at its old pixel dimensions against the
+        // Canvas's new font size.
+        val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
+            (current == null || current.size < 4 || pixelWidth != current[2] || pixelHeight != current[3])
+        if (current != null && current[0] == newColumns && current[1] == newRows && !pixelSizeChanged) return
+        paneColumnsRows[runtimeId] = intArrayOf(newColumns, newRows, pixelWidth, pixelHeight)
         liveSessions[runtimeId]?.resize(newColumns, newRows, pixelWidth, pixelHeight)
         bumpVersion()
     }
@@ -1489,6 +2068,42 @@ class MainViewModel(
 
     private fun bumpVersion() {
         _uiState.value = _uiState.value.copy(bufferVersion = _uiState.value.bufferVersion + 1)
+    }
+
+    // Coalescing counterpart to bumpVersion() for onCursorMoved/onContentChanged
+    // only - see pendingVersionBump's own doc above for why those two (and only
+    // those two) need this. Called from the pty reader thread. If the last real
+    // flush was long enough ago, applies immediately (keeps normal sparse
+    // output/typing feeling exactly as instant as a direct bumpVersion() call
+    // always did) - otherwise schedules a single delayed flush and returns,
+    // relying on pendingVersionBump's compareAndSet to make every OTHER call
+    // arriving before that flush runs a no-op rather than queuing another one.
+    // A plain background Thread does the wait rather than a coroutine, since
+    // this must not depend on viewModelScope/Dispatchers.Main - it's invoked
+    // from a raw reader Thread that has no coroutine context of its own.
+    private fun bumpVersionThrottled() {
+        val now = System.nanoTime()
+        if (now - lastVersionBumpNanos >= versionBumpThrottleNanos) {
+            lastVersionBumpNanos = now
+            bumpVersion()
+            return
+        }
+        if (pendingVersionBump.compareAndSet(false, true)) {
+            Thread {
+                try {
+                    Thread.sleep(versionBumpThrottleNanos / 1_000_000L)
+                } catch (_: InterruptedException) {
+                    // Falls through and flushes anyway - a dropped final
+                    // frame here would be the exact tearing/stale-paint this
+                    // throttle exists to prevent, so an interrupt (e.g. app
+                    // shutdown mid-wait) still gets one last flush rather
+                    // than silently swallowing it.
+                }
+                lastVersionBumpNanos = System.nanoTime()
+                bumpVersion()
+                pendingVersionBump.set(false)
+            }.start()
+        }
     }
 
     override fun onCleared() {

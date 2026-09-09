@@ -26,6 +26,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,11 +39,146 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.dp
+import android.graphics.Bitmap
 import android.graphics.Paint
 import android.graphics.Typeface
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.WeakHashMap
+
+// Caches the decoded android.graphics.Bitmap for each TerminalBuffer.SixelImage
+// so drawTerminal (called on every recomposition/repaint - see bgPaint's own
+// doc for how often that is on a busy terminal) doesn't re-decode the same
+// pixel IntArray into a fresh Bitmap dozens of times a second for an image
+// that hasn't changed at all. Keyed by IDENTITY (WeakHashMap, default
+// equals/hashCode) rather than SixelImage's own structural data-class
+// equals - deliberately: TerminalEmulator.decodeAndPlaceSixel only ever
+// creates ONE SixelImage instance per placed image and never mutates or
+// recreates it afterwards (see PlacedImage's own doc - only `row` changes,
+// on the same instance), so identity IS the right notion of "same image"
+// here and skips comparing potentially large pixel arrays on every lookup.
+// Weak-keyed so an image dropped from TerminalBuffer.images (scrolled off,
+// cleared, alt-screen swap - see those call sites) lets its cached Bitmap
+// be GC'd too instead of leaking for the life of the process.
+private val sixelBitmapCache = WeakHashMap<TerminalBuffer.SixelImage, Bitmap>()
+
+private fun bitmapFor(image: TerminalBuffer.SixelImage): Bitmap =
+    sixelBitmapCache.getOrPut(image) {
+        Bitmap.createBitmap(image.pixels, image.width, image.height, Bitmap.Config.ARGB_8888)
+    }
+
+// Kitty counterpart of sixelBitmapCache - same identity-keyed, weak-
+// referenced caching rationale (TerminalEmulator only ever creates ONE
+// KittyImage instance per transmitted image id and never mutates its
+// pixels afterwards; re-transmitting under the same id via
+// storeKittyImage produces a genuinely NEW instance, which is exactly
+// what should invalidate the cached Bitmap here - identity equality
+// does that for free without an explicit invalidation call).
+private val kittyBitmapCache = WeakHashMap<TerminalBuffer.KittyImage, Bitmap>()
+
+private fun bitmapFor(image: TerminalBuffer.KittyImage): Bitmap =
+    kittyBitmapCache.getOrPut(image) {
+        Bitmap.createBitmap(image.pixels, image.width, image.height, Bitmap.Config.ARGB_8888)
+    }
+
+/** Per-(source-image-identity, tileRow, tileCol, gridCols, gridRows)
+ *  cache of the small sliced [Bitmap] a single Unicode-placeholder cell
+ *  (see [TerminalBuffer.Cell.kittyPlaceholder]'s own doc) paints. A
+ *  drawKittyPlaceholderTile call happens once per placeholder CELL per
+ *  repaint - for an image spanning many cells that's many small slices
+ *  of the same source bitmap every frame, so this avoids re-cropping
+ *  identical sub-rects repeatedly. Keyed on the outer map by the
+ *  source [TerminalBuffer.KittyImage] identity (same rationale as
+ *  [kittyBitmapCache]: currentKittyPixels returns a fresh KittyImage
+ *  per animation frame, so identity naturally invalidates stale tiles
+ *  when the displayed frame changes) via a WeakHashMap so tiles for a
+ *  frame that's no longer current/referenced can be GC'd; the inner
+ *  map is a plain HashMap keyed by the (tileRow, tileCol, cols, rows)
+ *  tuple since a grid's own tile count is always small. */
+private val kittyTileBitmapCache = WeakHashMap<TerminalBuffer.KittyImage, HashMap<List<Int>, Bitmap>>()
+
+/** Slices [source] into a [cols]x[rows] grid and returns the bitmap for
+ *  tile ([tileCol], [tileRow]), or null if that tile index falls
+ *  outside the declared grid (a stale/malformed placeholder reference)
+ *  or the source image has zero width/height. Each tile's pixel rect
+ *  is computed independently off integer division of the full
+ *  width/height by cols/rows - the same "last tile absorbs the
+ *  rounding remainder" approach as a real Kitty terminal, so a e.g.
+ *  10px-wide image sliced into 3 columns gives tiles of width
+ *  3,3,4 rather than crashing or leaving a 1px gap. */
+private fun kittyPlaceholderTileBitmap(
+    source: TerminalBuffer.KittyImage,
+    tileCol: Int,
+    tileRow: Int,
+    cols: Int,
+    rows: Int
+): Bitmap? {
+    if (tileCol !in 0 until cols || tileRow !in 0 until rows) return null
+    if (source.width <= 0 || source.height <= 0) return null
+    val perTileTable = kittyTileBitmapCache.getOrPut(source) { HashMap() }
+    val key = listOf(tileCol, tileRow, cols, rows)
+    perTileTable[key]?.let { return it }
+
+    val baseW = source.width / cols
+    val baseH = source.height / rows
+    if (baseW <= 0 || baseH <= 0) return null
+    val left = tileCol * baseW
+    val top = tileRow * baseH
+    val w = if (tileCol == cols - 1) source.width - left else baseW
+    val h = if (tileRow == rows - 1) source.height - top else baseH
+    if (w <= 0 || h <= 0) return null
+
+    val full = bitmapFor(source)
+    val tile = Bitmap.createBitmap(full, left, top, w, h)
+    perTileTable[key] = tile
+    return tile
+}
+
+/** Paints the on-screen tile for a single Unicode-placeholder [Cell]
+ *  (see [TerminalBuffer.Cell.kittyPlaceholder]'s own doc for how a
+ *  cell ends up tagged this way, and the call site above for why this
+ *  is checked before falling back to the raw glyph). Returns false -
+ *  telling the caller to fall back to drawing the placeholder's raw
+ *  glyph instead - whenever the reference has gone stale: the
+ *  (imageId, placementId) is no longer a registered virtual placement
+ *  (an a=d since this text was written), the underlying image itself
+ *  is gone, or the cell's tagged (tileRow, tileCol) falls outside the
+ *  grid the placement actually declared (e.g. text got copy/pasted or
+ *  the c=/r= grid shrank after the fact). [x]/[y] are the same
+ *  glyph-baseline coordinates the caller already computed for
+ *  drawText, so the destination rect is derived the same way as
+ *  everywhere else in this file: (x, y - charHeight) is the cell's
+ *  top-left corner. */
+private fun drawKittyPlaceholderTile(
+    canvas: androidx.compose.ui.graphics.drawscope.DrawScope,
+    buffer: TerminalBuffer,
+    ref: TerminalBuffer.KittyPlaceholderRef,
+    x: Float,
+    y: Float,
+    charWidth: Float,
+    charHeight: Float
+): Boolean {
+    val (cols, rows) = buffer.kittyVirtualPlacementGrid(ref.imageId, ref.placementId) ?: return false
+    val source = buffer.currentKittyPixels(ref.imageId) ?: return false
+    val tile = kittyPlaceholderTileBitmap(source, ref.tileCol, ref.tileRow, cols, rows) ?: return false
+    // DrawScope itself has no nativeCanvas - that's a property of the
+    // underlying androidx.compose.ui.graphics.Canvas, only reachable via
+    // drawIntoCanvas's own callback (same pattern the two other
+    // drawIntoCanvas call sites in this file already use to reach
+    // android.graphics.Canvas.drawBitmap/drawRect/drawText).
+    canvas.drawIntoCanvas { nativeCanvasHolder ->
+        nativeCanvasHolder.nativeCanvas.drawBitmap(
+            tile,
+            null,
+            android.graphics.RectF(x, y - charHeight, x + charWidth, y),
+            null
+        )
+    }
+    return true
+}
 
 /**
  * Replaces androidx.compose.foundation.text.selection.SelectionState now
@@ -289,6 +425,40 @@ class TerminalPalette(
         statusErrorColor != null && (index == 1 || index == 9) -> statusErrorColor
         statusWarningColor != null && (index == 3 || index == 11) -> statusWarningColor
         index in ansiColors.indices -> ansiColors[index]
+        // Truecolor marker (see TerminalEmulator.applySgr's 38;2/48;2
+        // handling): index has TRUECOLOR_MARKER set in its high bits and
+        // the R/G/B bytes packed into the low 24 bits. Programs using
+        // 24-bit SGR (bat, delta, neovim themes, modern ls/fzf themes)
+        // send colors nowhere near the 0-255 ANSI index range at all - this
+        // used to silently fall through to `else -> defaultForeground`
+        // below, which is why truecolor output always rendered as one flat
+        // color instead of the actual RGB the program asked for.
+        (index and TRUECOLOR_MARKER) == TRUECOLOR_MARKER ->
+            (0xFF shl 24) or (index and 0x00FFFFFF)
+        // Standard ANSI 256-color palette, indices 16-255 (the 16 base
+        // colors above only cover 0-15). 16-231 is the 6x6x6 color cube
+        // xterm defines; 232-255 is a 24-step grayscale ramp. Before this,
+        // any SGR 38;5;N/48;5;N with N >= 16 (i.e. almost the entire
+        // 256-color range - most themes/tools pick from the cube or the
+        // grayscale ramp, not the base 16) fell through to
+        // `else -> defaultForeground` below and rendered as one flat color
+        // regardless of which of the 240 possible colors was requested.
+        index in 16..231 -> {
+            val i = index - 16
+            val r = i / 36
+            val g = (i % 36) / 6
+            val b = i % 6
+            // xterm's cube uses 0 or 55+40*n per step (0,95,135,175,215,255),
+            // not a plain evenly-spaced 0-255 - matching that exactly (vs.
+            // a naive r*51) is what makes 256-color output match what the
+            // same escape sequence looks like in a real xterm.
+            fun step(n: Int) = if (n == 0) 0 else 55 + 40 * n
+            (0xFF shl 24) or (step(r) shl 16) or (step(g) shl 8) or step(b)
+        }
+        index in 232..255 -> {
+            val level = 8 + (index - 232) * 10
+            (0xFF shl 24) or (level shl 16) or (level shl 8) or level
+        }
         else -> defaultForeground
     }
 
@@ -302,6 +472,15 @@ class TerminalPalette(
         TerminalPalette(ansiColors, defaultForeground, defaultBackground, errorColor, warningColor)
 
     companion object {
+        // Marker bit distinguishing a packed truecolor RGB value (see
+        // resolve()'s truecolor branch and TerminalEmulator.applySgr's
+        // 38;2/48;2 handling) from a plain 0-255 ANSI palette index in the
+        // same Int-typed Cell.fg/bg field. Real ANSI indices only ever run
+        // 0-255, so any bit at or above 1 shl 24 is unambiguously never a
+        // valid index - safe to repurpose as "the low 24 bits are a packed
+        // RRGGBB value, not a palette lookup".
+        const val TRUECOLOR_MARKER = 1 shl 24
+
         /** A Nord-inspired default palette as a sane out-of-the-box theme. */
         fun nord(): TerminalPalette {
             val colors = intArrayOf(
@@ -426,6 +605,26 @@ class TerminalPalette(
     }
 }
 
+// OSC 8 hyperlinks come straight off the pty - meaning a hyperlink's URI
+// text can be whatever the running program (or, over ssh, a remote host;
+// or a `cat`ed file the user didn't write) chose to emit, with nothing
+// checking it before it reaches ACTION_VIEW. Restricting to schemes the
+// terminal actually intends to support closes off e.g. a malicious "OSC 8
+// ;; content://some.other.app/private/data ST" or an "intent:" payload
+// being tapped and handed straight to startActivity with no confirmation.
+// http(s)/file are handled with extra care just below this list's use;
+// mailto/tel/sms/geo/ftp/ssh/smb are common in real command-line output
+// (git commit trailers, contact export tools, location-tagged logs, ssh
+// config dumps, network share paths); ipfs/ipns cover distributed-web
+// content addresses tools like ipfs/kubo print for pinned content. Always
+// allowed regardless of the "Allow custom app schemes" setting below -
+// none of these can trigger an app-specific deep-linked action the way an
+// arbitrary custom scheme could.
+private val DEFAULT_ALLOWED_HYPERLINK_SCHEMES = setOf(
+    "http", "https", "mailto", "tel", "sms", "geo",
+    "ftp", "ssh", "smb", "file", "ipfs", "ipns"
+)
+
 @Composable
 fun TerminalView(
     buffer: TerminalBuffer,
@@ -464,15 +663,45 @@ fun TerminalView(
     // same blue as highlightColor's base hue but fully opaque (handles
     // need to stay visible/grabbable, unlike the translucent row fill).
     handleColor: Int = 0xFF7EC8FF.toInt(),
+    // Settings > Terminal > Behaviour > "Allow custom app schemes". Off
+    // (default): only DEFAULT_ALLOWED_HYPERLINK_SCHEMES are opened when a
+    // hyperlink is tapped (see that set's own doc) - anything else (a
+    // custom app deep link like "spotify:", "market:", "whatsapp:", or an
+    // "intent:" payload) is treated as a dead link. On: any scheme is
+    // handed to startActivity, restoring the old unrestricted behavior -
+    // an explicit opt-in since a tapped hyperlink's URI is untrusted
+    // program output, not something the user typed themselves.
+    allowCustomHyperlinkSchemes: Boolean = false,
     modifier: Modifier = Modifier,
     // Debug-only tag prefixed onto this instance's SelDebug/ToolbarDebug
     // logcat lines so a log spanning both the primary pane's TerminalView
     // and the split pane's TerminalView (both log under the same tags)
     // can actually be told apart. "primary" is MainActivity's default;
     // SplitTerminalPane passes "split" explicitly.
-    debugLabel: String = "primary"
+    debugLabel: String = "primary",
+    // True while the caller is mid pinch-to-zoom, i.e. rendering at a
+    // live/preview fontSizeSp that hasn't been committed to buffer.resize()
+    // yet (see MainActivity/SplitTerminalPane's own liveZoomSize doc: the
+    // real buffer/pty resize is throttled to at most once per ~150ms during
+    // an active pinch, but every pinch frame still re-renders immediately
+    // at the new live font size for a smooth preview). The glyph grid below
+    // handles that fine - it just draws buffer.rows/columns worth of cells
+    // at whatever charWidth/charHeight the live font size produces. The
+    // block cursor doesn't: its position is buffer.cursorRow/cursorCol (the
+    // OLD, not-yet-committed grid coordinates) multiplied by the NEW live
+    // charWidth/charHeight, which visibly detaches it from the actual
+    // character grid for the entire pinch gesture - a stray white block
+    // sitting wherever that stale row/col happens to land at the new scale,
+    // only snapping back to the real cursor position once the throttled
+    // commit finally fires. That's the "zoom edince imleç beyaz kalıyor,
+    // yeri değişiyor" bug. Simplest correct fix: just don't draw the block
+    // cursor for the handful of frames where its coordinates are known to
+    // be stale - it reappears the instant the commit lands and bufferVersion
+    // bumps this composable's recomposition.
+    suppressCursor: Boolean = false
 ) {
     val density = LocalDensity.current
+    val context = LocalContext.current
     val viewConfiguration = LocalViewConfiguration.current
     // Same px math drawTerminal uses below (sp -> px via density * fontScale,
     // then Paint's own font metrics) computed once here too, so handle
@@ -492,7 +721,140 @@ fun TerminalView(
         measuringPaint.measureText("M") to measuringPaint.fontSpacing
     }
 
+    // New PTY output (scrollUp() pushing lines into scrollback) shifts
+    // what every row/scrollOffset pair addresses just as much as the user
+    // dragging scrollOffset does - but nothing about it touches
+    // scrollOffset itself, so none of the shiftRows()/recomputeFrom() call
+    // sites in MainActivity (all gated on scrollOffset changing) ever see
+    // it. A selection left active while a flooding command keeps printing
+    // - or simply a long selection that takes a while to drag out and
+    // lift - could silently go stale and copy the wrong (or, once the
+    // exact scrollback lines it pointed into got evicted, blank) rows.
+    // Runs once per content-change tick (bufferVersion), consuming
+    // whatever scrolled since the last tick:
+    // - mid-drag (draggingHandle), TerminalView's own gesture loop already
+    //   calls recomputeFrom every frame against the CURRENT scrollOffset,
+    //   so compensating here too would double-shift; just drop the count
+    //   without acting, same as scrollOffset-driven shiftRows callers skip
+    //   when applied == 0.
+    // - idle with an active selection, shift anchor/focus to keep pointing
+    //   at the same buffer content and recompute, exactly like the
+    //   user-driven edge-auto-scroll path does for a scrollOffset change.
+    LaunchedEffect(bufferVersion) {
+        val scrolled = buffer.consumePendingScrollLines()
+        val columnsChanged = buffer.consumePendingColumnsChanged()
+        if (columnsChanged && selectionState.active && !selectionState.draggingHandle) {
+            // A resize that changed the column count invalidates
+            // anchorCol/focusCol outright (see
+            // TerminalBuffer.consumePendingColumnsChanged's doc) - there's
+            // no row shift that fixes a selection whose column bounds no
+            // longer mean the same thing, so drop it instead of trying to
+            // shiftRows() it like a pure scroll. This also covers the
+            // rowOffset/growOffset case below for the same tick: no point
+            // shiftRows()-ing a selection this same resize is about to
+            // clear anyway.
+            selectionState.clear()
+        } else if (scrolled != 0 && selectionState.active && !selectionState.draggingHandle) {
+            // scrollUp() moves live content UP by `scrolled` lines while
+            // scrollOffset itself stays put - the same net effect on what
+            // a fixed (row, scrollOffset) pair addresses as the user
+            // DECREASING scrollOffset by that many lines would have (see
+            // TerminalBuffer.lineAt's doc: sliding the window toward the
+            // live screen). shiftRows' sign convention matches
+            // adjustScrollOffset's returned delta (positive = scrollOffset
+            // increased), so this is the negated line count, not +scrolled.
+            // The same delta also carries a pinch-zoom resize's row shift
+            // (rowOffset - growOffset, folded into pendingScrollLines by
+            // resize() itself) alongside any scrollUp()-driven lines from
+            // this same tick, so a resize's row-only shift (column count
+            // unchanged) gets shiftRows()-compensated exactly like normal
+            // PTY-output scrolling instead of losing the selection.
+            selectionState.shiftRows(-scrolled)
+            selectionState.recomputeFrom(buffer, scrollOffset)
+        }
+    }
+
     Box(modifier = modifier) {
+        // Watchdog for the suppressCursor param: the caller (MainActivity/
+        // SplitTerminalPane/MultiPaneContainer) is only ever supposed to
+        // hold this true for the brief window between a resize/zoom/drag
+        // starting and its own debounced commit landing (~120-150ms by
+        // every caller's own doc) - it's a "the grid is mid-transition,
+        // don't paint a cursor at coordinates that might not match it yet"
+        // signal, never meant to be a durable "hide the cursor" switch.
+        // But suppressCursor is driven entirely by caller-side state
+        // (pendingResize/liveZoomSize/isDraggingSplit flags, each flipped
+        // back to false by that caller's own commit path) that this
+        // composable has no visibility into and no way to verify - if any
+        // one of those call sites' own reset ever fails to run (a
+        // cancelled coroutine, a skipped branch, a future caller bug),
+        // suppressCursor stays wedged true with nothing on this side ever
+        // clearing it, silently hiding the cursor forever until something
+        // else (unrelated) happens to flip the underlying flag back. A
+        // renderer-side self-heal - the actual fix here - means a caller
+        // bug degrades to "the cursor blinks back after a fraction of a
+        // second longer than usual" instead of "gone until the user
+        // stumbles onto whatever unrelated action clears it", without
+        // this composable needing to know anything about WHY suppression
+        // was requested.
+        var suppressCursorTimedOut by remember { mutableStateOf(false) }
+        LaunchedEffect(suppressCursor) {
+            if (suppressCursor) {
+                // Comfortably longer than the longest legitimate
+                // suppression window any caller documents (MainActivity's
+                // resize debounce: 120ms + delay; MultiPaneContainer's
+                // manual-resize throttle: 32ms steps; a pinch's
+                // zoomCommitJob: 150ms) - long enough that a real, still-
+                // in-progress transition never trips it, short enough that
+                // a wedged flag only costs a brief extra delay before the
+                // cursor reappears on its own instead of staying hidden
+                // indefinitely.
+                delay(500)
+                suppressCursorTimedOut = true
+            } else {
+                suppressCursorTimedOut = false
+            }
+        }
+        val effectiveSuppressCursor = suppressCursor && !suppressCursorTimedOut
+        // Drives SGR 5/25 (blink) text - a real attribute cells carry (see
+        // TerminalBuffer.Cell.blink / TerminalEmulator's curBlink), not
+        // something drawTerminal can express with a static Paint flag the
+        // way bold/italic/underline are. 530ms on/off matches the
+        // conventional terminal blink rate (xterm/VTE both default close
+        // to this) - toggling a single shared phase here rather than a
+        // per-cell timer means every blinking cell on screen (there can be
+        // many, e.g. a whole `tput blink`-styled status line) flips in
+        // lockstep off one Compose recomposition instead of each cell
+        // drifting out of sync with its own clock.
+        var blinkPhaseOn by remember { mutableStateOf(true) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(530)
+                blinkPhaseOn = !blinkPhaseOn
+            }
+        }
+        // Drives Kitty a=f/a=a animated images (see
+        // TerminalBuffer.advanceKittyAnimations' own doc) the same way
+        // blinkPhaseOn above drives SGR 5 blink: a dedicated ticking
+        // LaunchedEffect rather than hooking into bufferVersion, since an
+        // animated image needs to keep advancing frames even while the
+        // program driving the terminal is sitting idle and producing no
+        // new output/bufferVersion bumps at all. 33ms (~30fps) is fine-
+        // grained enough that advanceKittyAnimations' own per-frame gapMs
+        // math (arbitrary millisecond values from the transmitting
+        // client) lands on the right frame within a tick or two rather
+        // than visibly stepping; it only actually triggers a recompose
+        // (via animTick) on ticks where advanceKittyAnimations reports a
+        // frame genuinely changed, so a terminal with no animated images
+        // at all (the common case) pays this loop's cost but never
+        // recomposes from it.
+        var animTick by remember { mutableStateOf(0) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                delay(33)
+                if (buffer.advanceKittyAnimations(33)) animTick++
+            }
+        }
         // bufferVersion is bumped by the caller's ViewModel on every
         // TerminalEmulator.Listener callback (cursor move / content change).
         // Reading it here (even though drawTerminal reads straight from
@@ -531,9 +893,52 @@ fun TerminalView(
         // selectedTexts of size 3 at indices 0/1/2, which this used to
         // read directly as rows 0/1/2 instead of offsetting by startRow.
         val range = if (selectionState.active) selectionState.normalized() else null
-        val selectedRows = selectedTexts.withIndex()
-            .filter { (_, text) -> text.isNotEmpty() }
-            .mapTo(HashSet()) { (index, _) -> (range?.startRow ?: 0) + index }
+        // Per-row [fromCol, toColExclusive) span actually selected on that
+        // row - NOT a whole-row flag. Mirrors recomputeFrom's own column
+        // math (fromCol is startCol only on the first row, 0 on every row
+        // after; toColExclusive is endCol+1 only on the last row, the full
+        // line length on every row before it) so the highlight painted
+        // below covers exactly the characters recomputeFrom put in
+        // selectedTexts/what Copy would actually grab - not the previous
+        // whole-row-regardless-of-column rect, which painted every row
+        // touched by the selection edge-to-edge (blank trailing space
+        // included) even though only part of that row - often just a
+        // single word - was actually selected. That's what read as
+        // "seçmediğim yer de seçili görünüyor": the highlight was telling
+        // the truth about which ROWS were touched, but not about which
+        // COLUMNS within them actually were.
+        val selectedColumnRanges = if (range != null) {
+            selectedTexts.withIndex()
+                .filter { (_, text) -> text.isNotEmpty() }
+                .associate { (index, text) ->
+                    val row = range.startRow + index
+                    val fromCol = if (row == range.startRow) range.startCol else 0
+                    // text here is recomputeFrom's ALREADY-TRIMMED substring
+                    // for this row (line.substring(fromCol, toColExclusive)),
+                    // not the row's full text - so its length alone is only
+                    // the right toColExclusive when fromCol is 0. On the
+                    // selection's start row, fromCol is startCol (non-zero
+                    // whenever the selection doesn't begin at column 0), so
+                    // text.length there is line.length - fromCol, not
+                    // line.length - using it bare left the highlight ending
+                    // `fromCol` columns short of where the actual selected
+                    // (and copyable) text ends on that row. Every row AFTER
+                    // the first has fromCol == 0, where fromCol + text.length
+                    // and text.length happen to be the same number - which
+                    // is exactly why this only ever showed up as a gap on
+                    // the FIRST row of a multi-row selection (colored
+                    // backgrounds - ls output, prompts, grep matches -
+                    // made the missing tail visible; plain text on the
+                    // default background just looked like ordinary
+                    // unhighlighted blank space, which is what read as
+                    // "renkli kısımlar bazen tam seçmiyor, boşluklar
+                    // oluşuyor").
+                    val toColExclusive = if (row == range.endRow) (range.endCol + 1) else (fromCol + text.length)
+                    row to (fromCol until toColExclusive)
+                }
+        } else {
+            emptyMap()
+        }
 
         // The gesture block below is long-lived (its pointerInput key list
         // deliberately does NOT include scrollOffset - restarting mid-drag
@@ -588,6 +993,61 @@ fun TerminalView(
                         val (row, col) = cellOf(x, y)
                         val lastCol = buffer.lastNonBlankColumn(row, latestScrollOffset.value)
                         return if (lastCol != null && col > lastCol) row to lastCol else row to col
+                    }
+
+                    // Word-select-on-double-tap. `lastTapUp*` remembers the
+                    // position/time of the most recent short (non-long-press,
+                    // non-handle-grab) tap-UP across `awaitEachGesture`
+                    // iterations of this SAME pointerInput instance, so the
+                    // very next down can be recognized as its pair. Reset to
+                    // "no recent tap" (nanos = 0) once consumed as either half
+                    // of a double-tap, so a third quick tap doesn't chain into
+                    // treating taps 2+3 as another pair.
+                    var lastTapUpNanos = 0L
+                    var lastTapUpX = 0f
+                    var lastTapUpY = 0f
+                    // Deliberately narrow: letters/digits/underscore. Matches
+                    // what most users mean by "a word" (a flag like -rf or a
+                    // path segment stays a separate word each side of the
+                    // punctuation) - this seeds the initial double-tap
+                    // selection only, dragging a handle afterward can still
+                    // extend it across punctuation/the rest of the line, so
+                    // narrow-by-default here doesn't block selecting more.
+                    fun isWordChar(c: Char): Boolean = c.isLetterOrDigit() || c == '_'
+                    // Argument/flag punctuation that commonly sits directly
+                    // against a word char with no space between - "-rf",
+                    // "--force", "/etc/passwd", "a.txt", "user@host". A
+                    // double-tap landing exactly on one of these used to
+                    // return null from wordRangeAt (isWordChar(line[col])
+                    // false), which fell all the way through to the plain
+                    // long-press path below and started a brand-new
+                    // degenerate one-cell selection instead - that's what
+                    // read as "hep tüm seçme modu aktif oluyor" (double-tap
+                    // silently degrading into the whole-line/long-press
+                    // selection behavior) whenever the tap happened to land
+                    // on the dash of a flag or a slash in a path rather than
+                    // a letter. Treated as its own word-like run here -
+                    // adjacent characters from this SAME set extend the
+                    // selection, same as isWordChar's letters/digits/
+                    // underscore run does - rather than merging with
+                    // isWordChar (which would make "-rf" and "foo" one word
+                    // if they ever sat next to each other) or being left to
+                    // fail outright.
+                    fun isArgPunctChar(c: Char): Boolean = c in "-./_@"
+                    fun wordRangeAt(row: Int, col: Int): Pair<Int, Int>? {
+                        val line = buffer.rowPlainText(row, latestScrollOffset.value)
+                        if (col !in line.indices) return null
+                        val tapped = line[col]
+                        val matches: (Char) -> Boolean = when {
+                            isWordChar(tapped) -> ::isWordChar
+                            isArgPunctChar(tapped) -> ::isArgPunctChar
+                            else -> return null
+                        }
+                        var start = col
+                        while (start > 0 && matches(line[start - 1])) start--
+                        var end = col
+                        while (end < line.length - 1 && matches(line[end + 1])) end++
+                        return start to end
                     }
 
                     awaitEachGesture {
@@ -759,6 +1219,64 @@ fun TerminalView(
                             return@awaitEachGesture
                         }
 
+                        // Double-tap-to-select-word: this down landed close
+                        // in time+space to the previous short tap's lift (set
+                        // at the bottom of the `aborted` branch below) and
+                        // over a word character - select that whole word
+                        // immediately (anchor at its start, focus at its
+                        // end) and drop straight into the same drag-extend
+                        // loop long-press-confirmed selections use below, so
+                        // the user can still drag a handle afterward to grow
+                        // the selection across the rest of the line/argument
+                        // ("satırın tamamını da seçsin ama kelime seçmek te
+                        // mümkün olsun"). Only considered when there's no
+                        // existing selection to protect, same as the
+                        // long-press path just below - existingRange came
+                        // back null here already (grabbedStart/grabbedEnd
+                        // both false with existingRange non-null would have
+                        // returned above).
+                        val (tapRow, tapCol) = snappedCellOf(down.position.x, down.position.y)
+                        val isDoubleTap = existingRange == null && lastTapUpNanos != 0L &&
+                            (System.nanoTime() - lastTapUpNanos) < viewConfiguration.doubleTapTimeoutMillis * 1_000_000L &&
+                            kotlin.math.abs(down.position.x - lastTapUpX) < charWidthPx * 2f &&
+                            kotlin.math.abs(down.position.y - lastTapUpY) < charHeightPx * 2f
+                        val wordRange = if (isDoubleTap) wordRangeAt(tapRow, tapCol) else null
+                        if (wordRange != null) {
+                            lastTapUpNanos = 0L
+                            down.consume()
+                            val (wordStart, wordEnd) = wordRange
+                            selectionState.startAt(tapRow, wordStart)
+                            selectionState.updateFocusAt(tapRow, wordEnd)
+                            selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                            // Same dead-zone as the long-press drag loop below
+                            // (see its own doc) - a double-tap word-select is
+                            // often the smallest possible selection, so it's
+                            // the case most visibly affected by finger wobble
+                            // flipping the focus cell right after selection.
+                            var pastDeadZone = false
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                change.consume()
+                                if (!change.pressed) {
+                                    selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                    break
+                                }
+                                if (!pastDeadZone) {
+                                    val dx = change.position.x - down.position.x
+                                    val dy = change.position.y - down.position.y
+                                    if (kotlin.math.sqrt(dx * dx + dy * dy) <= viewConfiguration.touchSlop) {
+                                        continue
+                                    }
+                                    pastDeadZone = true
+                                }
+                                val (row, col) = cellOf(change.position.x, change.position.y)
+                                selectionState.updateFocusAt(row, col)
+                                selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                            }
+                            return@awaitEachGesture
+                        }
+
                         // Not on a handle: wait out the long-press
                         // timeout, watching for movement/lift/a second
                         // finger exactly like MainActivity's own
@@ -859,6 +1377,148 @@ fun TerminalView(
                             }
                         }
                         if (aborted) {
+                            // OSC 8 hyperlink: a short (non-movement) tap on
+                            // a cell carrying a link opens it like a
+                            // hyperlink tap anywhere else on Android - a
+                            // plain ACTION_VIEW Intent, so the SYSTEM picks
+                            // whichever installed app actually handles that
+                            // URL/mime type (a browser for http(s), a PDF
+                            // viewer for a file:// .pdf, the package
+                            // installer for an .apk link, etc.) rather than
+                            // this emulator hardcoding one specific target -
+                            // exactly the classic-Android-hyperlink behavior
+                            // asked for. lineAt (not cellAt) so this also
+                            // works on a link sitting in scrollback, not
+                            // just the live screen. Checked first, before
+                            // the selection-dismiss/double-tap bookkeeping
+                            // below, so tapping a link doesn't ALSO clear an
+                            // unrelated active selection or arm a double-tap
+                            // word-select on the next tap; consumed so the
+                            // gesture ends here instead of falling through
+                            // to MainActivity's tap-to-toggle-keyboard
+                            // handler - there's nothing to type into once
+                            // you've switched away to a browser/viewer.
+                            if (!abortedByMovement) {
+                                val (tapRow, tapCol) = cellOf(down.position.x, down.position.y)
+                                val link = buffer.lineAt(tapRow, tapCol, latestScrollOffset.value).hyperlink
+                                if (link != null) {
+                                    try {
+                                        val uri = android.net.Uri.parse(link)
+                                        if (uri.scheme?.lowercase() !in DEFAULT_ALLOWED_HYPERLINK_SCHEMES && !allowCustomHyperlinkSchemes) {
+                                            // Not a scheme this emulator
+                                            // opens by default (see
+                                            // DEFAULT_ALLOWED_HYPERLINK_SCHEMES's
+                                            // doc) and "Allow custom app
+                                            // schemes" isn't turned on -
+                                            // treat exactly like a dead
+                                            // link rather than handing an
+                                            // untrusted, program-chosen URI
+                                            // straight to startActivity.
+                                            down.consume()
+                                            return@awaitEachGesture
+                                        }
+                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW)
+                                        if (uri.scheme.equals("file", ignoreCase = true) && uri.path != null) {
+                                            // A raw file:// Uri handed to
+                                            // another app's Intent throws
+                                            // FileUriExposedException on
+                                            // Android 7.0+ (this app targets
+                                            // 37) - an uncaught
+                                            // RuntimeException, not an
+                                            // ActivityNotFoundException,
+                                            // that used to crash the whole
+                                            // app instead of just failing
+                                            // the link (TerminatorApp now
+                                            // disables that death penalty
+                                            // via disableDeathOnFileUriExposure,
+                                            // needed below for directories -
+                                            // see that branch). For regular
+                                            // files, re-expose the path as a
+                                            // content:// Uri via FileProvider
+                                            // instead, which is both safe to
+                                            // share and actually openable by
+                                            // the receiving app (a PDF
+                                            // viewer, image viewer, etc.).
+                                            val file = java.io.File(uri.path!!)
+                                            if (!file.exists()) {
+                                                // Dead link - the path the
+                                                // hyperlink points at is
+                                                // gone (deleted, moved, or
+                                                // was never real to begin
+                                                // with). FileProvider itself
+                                                // wouldn't have caught this
+                                                // - it only validates the
+                                                // path is under a declared
+                                                // root, not that the file is
+                                                // actually there - so without
+                                                // this check tapping it would
+                                                // still launch a viewer app
+                                                // just to show a "file not
+                                                // found" error there instead
+                                                // of here. Same as any other
+                                                // dead hyperlink: do nothing.
+                                                down.consume()
+                                                return@awaitEachGesture
+                                            }
+                                            if (file.isDirectory) {
+                                                // A content:// Uri from
+                                                // FileProvider only exposes
+                                                // a single readable stream -
+                                                // file managers can't browse
+                                                // into it as a folder, so a
+                                                // link to a directory
+                                                // (`ls --hyperlink` on a
+                                                // folder, cd targets, etc.)
+                                                // silently did nothing when
+                                                // tapped even though it
+                                                // wasn't a dead link. File
+                                                // managers instead look for
+                                                // the raw file:// path typed
+                                                // "resource/folder" to open
+                                                // a folder browser - so use
+                                                // that shape here instead of
+                                                // going through FileProvider.
+                                                // Safe from the
+                                                // FileUriExposedException
+                                                // that used to crash this
+                                                // (see TerminatorApp's
+                                                // disableDeathOnFileUriExposure
+                                                // call).
+                                                intent.setDataAndType(uri, "resource/folder")
+                                            } else {
+                                                val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                                                    context,
+                                                    "${context.packageName}.fileprovider",
+                                                    file
+                                                )
+                                                val extension = android.webkit.MimeTypeMap.getFileExtensionFromUrl(file.name)
+                                                val mimeType = android.webkit.MimeTypeMap.getSingleton()
+                                                    .getMimeTypeFromExtension(extension) ?: "*/*"
+                                                intent.setDataAndType(contentUri, mimeType)
+                                            }
+                                            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        } else {
+                                            intent.data = uri
+                                        }
+                                        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        // No app on the device handles this
+                                        // link, the path doesn't exist, or
+                                        // the system otherwise refused the
+                                        // Intent (ActivityNotFoundException,
+                                        // FileUriExposedException,
+                                        // SecurityException, a malformed
+                                        // link causing IllegalArgumentException,
+                                        // etc.) - nothing to do, same as any
+                                        // other dead hyperlink. This should
+                                        // never crash the app over a tap on
+                                        // terminal text.
+                                    }
+                                    down.consume()
+                                    return@awaitEachGesture
+                                }
+                            }
                             // A short tap (lifted before the long-press
                             // timeout, and not on either handle - the
                             // grabbedStart/grabbedEnd check above already
@@ -888,6 +1548,20 @@ fun TerminalView(
                             // own doc above.
                             if (selectionState.active && !abortedByMovement) {
                                 selectionState.clear()
+                            }
+                            // Remember this short tap's lift so the NEXT
+                            // down, if it lands close enough in time/space
+                            // (checked above, at the top of the next
+                            // awaitEachGesture iteration), gets recognized
+                            // as the second half of a double-tap and
+                            // word-selects instead of starting another
+                            // long-press wait. Only for a genuine short tap,
+                            // not a movement-abort (that's a scroll/pan
+                            // starting, not a tap at all).
+                            if (!abortedByMovement) {
+                                lastTapUpNanos = System.nanoTime()
+                                lastTapUpX = down.position.x
+                                lastTapUpY = down.position.y
                             }
                             return@awaitEachGesture
                         }
@@ -920,6 +1594,34 @@ fun TerminalView(
                         selectionState.startAt(startRow, startCol)
                         selectionState.recomputeFrom(buffer, latestScrollOffset.value)
 
+                        // A character cell is often only 20-30px wide/tall on
+                        // a phone screen - well inside the amount a finger
+                        // naturally wobbles while just resting in place, with
+                        // no actual intent to drag. Reacting to every raw
+                        // pixel here (as this used to) meant that wobble
+                        // alone could flip `col`/`row` across a cell boundary
+                        // and move the focus cell right after a selection was
+                        // created, which read as a small (single-word or
+                        // shorter) selection visibly jittering/growing by a
+                        // cell on its own the moment the long-press
+                        // confirmed - "selection... fazla oynuyor" especially
+                        // noticeable on short selections where a one-cell
+                        // wobble is a large fraction of the whole thing.
+                        // touchSlop is already the platform's own answer to
+                        // "how much movement counts as intentional" (used
+                        // above to decide whether the long-press itself gets
+                        // cancelled) - gating focus updates behind that same
+                        // threshold, measured from the down point, means the
+                        // focus only ever moves once the finger has genuinely
+                        // left the start point rather than on every sub-pixel
+                        // tremor. Only gates the FIRST move away from the
+                        // start cell; once the finger has moved past the
+                        // threshold once, every subsequent frame updates
+                        // normally (checked via a flag, not by re-measuring
+                        // from `down` every time, since the user may then
+                        // legitimately drag back near the start column - that
+                        // should still track, not get stuck ungated again).
+                        var pastDeadZone = false
                         while (true) {
                             val event = awaitPointerEvent()
                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
@@ -927,6 +1629,14 @@ fun TerminalView(
                             if (!change.pressed) {
                                 selectionState.recomputeFrom(buffer, latestScrollOffset.value)
                                 break
+                            }
+                            if (!pastDeadZone) {
+                                val dx = change.position.x - down.position.x
+                                val dy = change.position.y - down.position.y
+                                if (kotlin.math.sqrt(dx * dx + dy * dy) <= viewConfiguration.touchSlop) {
+                                    continue
+                                }
+                                pastDeadZone = true
                             }
                             val (row, col) = cellOf(change.position.x, change.position.y)
                             selectionState.updateFocusAt(row, col)
@@ -937,7 +1647,9 @@ fun TerminalView(
         ) {
             @Suppress("UNUSED_EXPRESSION")
             bufferVersion
-            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedRows, highlightColor)
+            @Suppress("UNUSED_EXPRESSION")
+            animTick
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedColumnRanges, highlightColor, effectiveSuppressCursor, blinkPhaseOn)
             // Custom selection handles - two small teardrop markers at the
             // normalized start/end of the active selection, drawn directly
             // against the same charWidthPx/charHeightPx grid the gesture
@@ -974,8 +1686,17 @@ private fun DrawScope.drawTerminal(
     fontSizeSp: Float,
     backgroundAlpha: Float = 1f,
     scrollOffset: Int = 0,
-    selectedRows: Set<Int> = emptySet(),
-    highlightColor: Int = 0x407EC8FF.toInt()
+    selectedColumnRanges: Map<Int, IntRange> = emptyMap(),
+    highlightColor: Int = 0x407EC8FF.toInt(),
+    // See TerminalView's own suppressCursor doc - true while buffer.cursorRow/
+    // cursorCol are known stale relative to the live (not-yet-committed)
+    // charWidth/charHeight this exact draw call is about to compute below.
+    suppressCursor: Boolean = false,
+    // Shared blink phase from TerminalView's own 530ms ticker - a cell with
+    // blink=true (SGR 5) only actually paints its glyph while this is true,
+    // same on/off rhythm every blinking cell on screen shares (see
+    // blinkPhaseOn's own doc for why it's one shared clock, not per-cell).
+    blinkPhaseOn: Boolean = true
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -999,6 +1720,18 @@ private fun DrawScope.drawTerminal(
     val bgPaint = Paint()
     val charWidth = paint.measureText("M")
     val charHeight = paint.fontSpacing
+    // Reused for the manually-drawn decoration lines (overline, and
+    // underline/undercurl whenever a custom SGR 58 color or the curly
+    // shape means Paint's own built-in isUnderlineText can't be used - see
+    // its own call site below) - same "one Paint, not one per cell" reuse
+    // rationale as bgPaint above. STROKE style (rather than bgPaint's
+    // implicit FILL) is what makes strokeWidth actually control the drawn
+    // line's thickness for drawLine/drawPath calls.
+    val decorPaint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = (charHeight * 0.08f).coerceAtLeast(1.5f)
+    }
 
     drawRect(color = Color(palette.defaultBackground).copy(alpha = backgroundAlpha.coerceIn(0f, 1f)), size = size)
 
@@ -1007,29 +1740,51 @@ private fun DrawScope.drawTerminal(
     // overlay, which drew its own highlight - but that highlight came
     // from Compose's default text-selection color, not the app's
     // Material palette, and didn't reliably cover blank/whitespace
-    // columns). Drawn here, under the glyph loop below, as one full-width
-    // rect per row in `selectedRows` - every row SelectionContainer
-    // reports as carrying selected text gets its ENTIRE width painted,
-    // text and whitespace alike (see TerminalView's highlightColor doc:
-    // this is deliberately whole-row, not per-character). Must happen
-    // before the glyph/cursor drawing loop so the highlight sits behind
-    // the text instead of covering it.
-    if (selectedRows.isNotEmpty()) {
+    // columns). Drawn here, under the glyph loop below, as one rect PER
+    // SELECTED COLUMN SPAN in `selectedColumnRanges` - only the actual
+    // [fromCol, toColExclusive) run TerminalView's caller computed for
+    // that row (recomputeFrom's own column math, mirrored there) gets
+    // painted, not the row's entire width. This used to paint every row
+    // touched by the selection edge-to-edge regardless of which columns
+    // were actually selected on it - correct for the FULL interior rows
+    // of a multi-row selection (those genuinely are selected end to end),
+    // but wrong for the first/last row of the selection, where only part
+    // of the row (often just the one word actually long-pressed/dragged
+    // over) was selected - the rest of that row's width got the same
+    // highlight anyway, which is what read as "seçmediğim yer de seçili
+    // görünüyor". Must happen before the glyph/cursor drawing loop so the
+    // highlight sits behind the text instead of covering it.
+    if (selectedColumnRanges.isNotEmpty()) {
         val hlPaint = Paint().apply { color = highlightColor }
         val rowCharHeight = Paint().apply {
             typeface = fontFamily
             textSize = fontSizeSp * density * fontScale
         }.fontSpacing
-        val rowWidth = size.width
         drawIntoCanvas { hlCanvas ->
-            for (row in selectedRows) {
+            for ((row, colRange) in selectedColumnRanges) {
                 if (row !in 0 until buffer.rows) continue
+                if (colRange.isEmpty()) continue
                 val top = row * rowCharHeight
-                hlCanvas.nativeCanvas.drawRect(0f, top, rowWidth, top + rowCharHeight, hlPaint)
+                val left = colRange.first * charWidth
+                // colRange.last is inclusive (IntRange) - +1 to get the
+                // exclusive right edge in px, same "up to but not
+                // including" convention recomputeFrom's own toColExclusive
+                // uses.
+                val right = (colRange.last + 1) * charWidth
+                hlCanvas.nativeCanvas.drawRect(left, top, right, top + rowCharHeight, hlPaint)
             }
         }
     }
 
+    // DECSCNM (Reverse Video) - see TerminalBuffer.reverseVideoMode's own
+    // doc for why this is a raw unsynchronized read taken once here,
+    // rather than per-cell inside the loop below: it's XORed against each
+    // cell's own SGR-7 `inverse` flag (screen-wide swap ON TOP OF, not
+    // instead of, whatever per-cell inverse video a program already set -
+    // matching real xterm/VTE, where the two are independent and both
+    // apply), so every one of the four `cell.inverse` reads below becomes
+    // `cell.inverse xor reverseVideo` instead.
+    val reverseVideo = buffer.reverseVideoMode
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {
             for (col in 0 until buffer.columns) {
@@ -1037,7 +1792,35 @@ private fun DrawScope.drawTerminal(
                 val x = col * charWidth
                 val y = (row + 1) * charHeight
 
-                val fg = if (cell.inverse) palette.resolve(cell.bg) else palette.resolve(cell.fg)
+                var fg = if (cell.inverse xor reverseVideo) palette.resolve(cell.bg) else palette.resolve(cell.fg)
+                if (cell.dim) {
+                    // Standard terminal treatment of SGR 2: blend the
+                    // resolved foreground 50% toward the background rather
+                    // than toward a fixed gray, so dim text stays legible
+                    // (and on-theme) against light AND dark backgrounds
+                    // alike, same approach xterm/VTE use.
+                    val bgForBlend = if (cell.inverse xor reverseVideo) palette.resolve(cell.fg) else palette.resolve(cell.bg)
+                    val a = ((android.graphics.Color.alpha(fg) + android.graphics.Color.alpha(bgForBlend)) / 2)
+                    val r = ((android.graphics.Color.red(fg) + android.graphics.Color.red(bgForBlend)) / 2)
+                    val g = ((android.graphics.Color.green(fg) + android.graphics.Color.green(bgForBlend)) / 2)
+                    val b = ((android.graphics.Color.blue(fg) + android.graphics.Color.blue(bgForBlend)) / 2)
+                    fg = android.graphics.Color.argb(a, r, g, b)
+                }
+                if (cell.conceal) {
+                    // SGR 8: hide the glyph by painting it (and, since
+                    // paint.color also drives isUnderlineText/
+                    // isStrikeThruText below, any decoration line too) the
+                    // same color as the cell's own actual background -
+                    // matching xterm/VTE's own conceal behavior of making
+                    // the text visually disappear rather than skipping the
+                    // draw call outright (which would misreport as an
+                    // empty cell to anything measuring layout). Recomputed
+                    // independently of the `dim` blend above rather than
+                    // reusing bgForBlend (only in scope inside that `if`)
+                    // since conceal and dim can't both meaningfully apply -
+                    // conceal wins by running after.
+                    fg = if (cell.inverse xor reverseVideo) palette.resolve(cell.fg) else palette.resolve(cell.bg)
+                }
                 // Compare the RAW ansi index, not the resolved color. Index 0
                 // ("default black") is deliberately resolved to a lighter
                 // slate for readable black-on-black TEXT, but that same
@@ -1046,27 +1829,288 @@ private fun DrawScope.drawTerminal(
                 // entire screen, since that's what any program gets after a
                 // plain SGR reset) gets covered in a visible blue-gray slab
                 // instead of blending into the true-black canvas fill below.
-                val bgIndex = if (cell.inverse) cell.fg else cell.bg
-                if (bgIndex != TerminalBuffer.DEFAULT_BACKGROUND) {
+                val bgIndex = if (cell.inverse xor reverseVideo) cell.fg else cell.bg
+                // A wide-continuation cell's own background is never drawn
+                // separately - see the `cell.wide` branch below, which
+                // already paints ITS background stretched across both this
+                // column and the wide cell's own, so painting it again here
+                // would just be redundant (same color, same rect, drawn
+                // twice) rather than actually wrong - skipped purely to
+                // avoid the wasted draw call.
+                if (bgIndex != TerminalBuffer.DEFAULT_BACKGROUND && !cell.isWideContinuation) {
                     val bg = palette.resolve(bgIndex)
                     bgPaint.color = bg
-                    canvas.nativeCanvas.drawRect(x, y - charHeight, x + charWidth, y, bgPaint)
+                    // Wide cells (CJK/fullwidth/emoji - see
+                    // TerminalBuffer.Cell.wide's own doc) reserve a real
+                    // second column via a following isWideContinuation
+                    // cell, so painting only `charWidth` here would leave
+                    // that reserved column showing the DEFAULT_BACKGROUND
+                    // canvas fill instead of this cell's actual background -
+                    // visible as a one-column-wide "notch" of the wrong
+                    // color immediately after every colored-background wide
+                    // glyph. Stretching this same rect across both columns
+                    // is the direct fix; the continuation cell's own
+                    // (skipped, see above) background draw would have
+                    // painted the identical color into the identical pixels
+                    // anyway, so this isn't double-covering anything new.
+                    val bgRight = if (cell.wide) x + charWidth * 2 else x + charWidth
+                    canvas.nativeCanvas.drawRect(x, y - charHeight, bgRight, y, bgPaint)
                 }
+
 
                 paint.color = fg
                 paint.isFakeBoldText = cell.bold
-                paint.isUnderlineText = cell.underline
+                // Paint's own isUnderlineText always draws a plain straight
+                // line in the TEXT's own color - it can't do the wavy
+                // undercurl shape, nor an underline color independent of
+                // the glyph color (SGR 58). Whenever either applies, this
+                // is left off here and drawn by hand instead (below, after
+                // drawText) so the built-in decoration doesn't paint a
+                // second, wrong-shaped/wrong-colored line underneath it.
+                val hasCustomUnderline = cell.underline && (cell.underlineCurly || cell.underlineColor != null)
+                paint.isUnderlineText = cell.underline && !hasCustomUnderline
+                paint.isStrikeThruText = cell.strikethrough
                 paint.textSkewX = if (cell.italic) -0.25f else 0f
 
                 // A plain space draws nothing visible - skipping the
                 // drawText call for it (the common case: blank lines,
                 // cleared regions, right-padding after short output) cuts
                 // a meaningful fraction of the ~1920 drawText calls a full
-                // 80x24 redraw would otherwise make. Underlined spaces
-                // still need to draw (the underline itself is visible).
-                if (cell.text != " " || cell.underline) {
+                // 80x24 redraw would otherwise make. Underlined/struck
+                // spaces still need to draw (the line itself is visible
+                // even with no glyph). A blinking cell (cell.blink) simply
+                // skips its own drawText call entirely during the "off"
+                // half of blinkPhaseOn - background/underline/strikethrough
+                // rects, which aren't gated by this condition, keep
+                // painting normally, so only the glyph itself blinks, same
+                // as a real terminal.
+                if (cell.blink && !blinkPhaseOn) {
+                    // glyph hidden this phase - nothing to draw
+                } else if (cell.isWideContinuation) {
+                    // Reserved second half of a wide glyph (see
+                    // TerminalBuffer.Cell.isWideContinuation's own doc) -
+                    // always text=" " with nothing of its own to draw; the
+                    // actual glyph was already painted by the wide cell one
+                    // column to the left, and this cell's background was
+                    // already covered by that same wide cell's stretched-
+                    // across-two-columns background rect above. Drawing
+                    // its own (blank) text here would do nothing visible
+                    // anyway, but skipping it explicitly avoids paying for
+                    // a drawText call on every single wide-glyph's trailing
+                    // column across a full redraw.
+                } else if (cell.kittyPlaceholder != null) {
+                    // Kitty Unicode-placeholder cell (see
+                    // TerminalBuffer.Cell.kittyPlaceholder's own doc) -
+                    // painted here, INSTEAD of the placeholder glyph
+                    // itself (which is a PUA codepoint with no sensible
+                    // visual glyph anyway), by slicing the referenced
+                    // image into a grid per its registered virtual-
+                    // placement c=/r= dimensions and drawing just the
+                    // (tileRow, tileCol) tile this cell was tagged with.
+                    // Falls through to drawing the raw glyph (below,
+                    // same as any other character) only if the
+                    // placement/image reference turns out stale (an
+                    // a=d since this text was written, or a tile index
+                    // outside the registered grid) - see
+                    // drawKittyPlaceholderTile's own doc.
+                    val drew = drawKittyPlaceholderTile(this@drawTerminal, buffer, cell.kittyPlaceholder!!, x, y, charWidth, charHeight)
+                    if (!drew && (cell.text != " " || cell.underline || cell.strikethrough)) {
+                        canvas.nativeCanvas.drawText(cell.text, x, y, paint)
+                    }
+                } else if (cell.text != " " || cell.underline || cell.strikethrough) {
                     canvas.nativeCanvas.drawText(cell.text, x, y, paint)
                 }
+
+                // Manually-drawn decorations Android's Paint can't express
+                // as a flag: overline (no isOverlineText equivalent exists
+                // at all) and any underline that needs the curly/undercurl
+                // shape or its own independent color (see hasCustomUnderline
+                // above). Skipped for a wide glyph's reserved right-hand
+                // continuation column (its own decoration was already drawn
+                // stretched across both columns by the wide cell itself,
+                // one iteration ago - same "don't double-paint" reasoning
+                // as the background-rect skip above) and during the "off"
+                // half of a blinking cell's cycle, matching how the glyph's
+                // own drawText call is skipped in that phase just above.
+                if (!cell.isWideContinuation && !(cell.blink && !blinkPhaseOn)) {
+                    val decorWidth = if (cell.wide) charWidth * 2 else charWidth
+                    if (cell.overline) {
+                        decorPaint.color = fg
+                        val overlineY = y - charHeight + decorPaint.strokeWidth
+                        canvas.nativeCanvas.drawLine(x, overlineY, x + decorWidth, overlineY, decorPaint)
+                    }
+                    if (hasCustomUnderline) {
+                        decorPaint.color = cell.underlineColor?.let { palette.resolve(it) } ?: fg
+                        val underlineY = y + charHeight * 0.06f
+                        if (cell.underlineCurly) {
+                            // Wavy "undercurl" line: a handful of short
+                            // up/down segments approximating a sine wave
+                            // across the cell's width, matching the spell-
+                            // check-squiggle convention kitty/VS Code/
+                            // iTerm2 use for SGR 4:3. Segment count scales
+                            // with width so a wide (CJK/emoji) cell gets a
+                            // proportionally longer squiggle instead of the
+                            // same fixed ripple stretched thin across it.
+                            val segments = (decorWidth / (charHeight * 0.5f)).toInt().coerceAtLeast(2)
+                            val segWidth = decorWidth / segments
+                            val amplitude = charHeight * 0.05f
+                            val path = android.graphics.Path()
+                            path.moveTo(x, underlineY)
+                            for (s in 0 until segments) {
+                                val segX = x + segWidth * (s + 1)
+                                val segY = if (s % 2 == 0) underlineY + amplitude else underlineY - amplitude
+                                path.lineTo(segX, segY)
+                            }
+                            canvas.nativeCanvas.drawPath(path, decorPaint)
+                        } else {
+                            canvas.nativeCanvas.drawLine(x, underlineY, x + decorWidth, underlineY, decorPaint)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Placed Sixel images (see TerminalBuffer.PlacedImage's own doc) -
+        // painted after the glyph loop above so an image visually covers
+        // whatever text/background was in its footprint, same as a real
+        // terminal's Sixel output does, and before the cursor block below
+        // so the cursor still shows up on top of an image if it happens to
+        // land there. PlacedImage.row is a LIVE-grid row index (see
+        // placedImages()'s own doc) - once scrollOffset > 0, the visible
+        // row a given live-grid row paints at shifts DOWN by however many
+        // scrollback lines are currently showing above it, exactly the
+        // same translation TerminalBuffer.lineAt applies per-cell for
+        // text (scrollbackRowsShown = scrollOffset clamped to how much
+        // scrollback actually exists). Previously this skipped drawing
+        // images entirely for any scrollOffset != 0 at all - correct only
+        // for an image that had ALREADY scrolled off the live grid, but
+        // also hid one that's still fully anchored within it (rows 0..
+        // buffer.rows-1) just because the user scrolled up a little to
+        // see scrollback ABOVE it. A tall image spanning most of the
+        // screen made this trivial to hit with a single scroll gesture -
+        // "fotograf scroll etmek olmuyor" was this guard blanking the
+        // image out the instant scrollOffset left zero, not a real
+        // rendering limitation.
+        run {
+            val scrollbackRowsShown = scrollOffset.coerceAtMost(buffer.maxScrollOffset)
+            for (placed in buffer.placedImages()) {
+                val visibleRow = placed.row + scrollbackRowsShown
+                if (visibleRow !in 0 until buffer.rows) continue
+                val bitmap = bitmapFor(placed.image)
+                val left = placed.col * charWidth
+                val top = visibleRow * charHeight
+                // Sixel pixels have their own native resolution, generally
+                // NOT a clean multiple of one cell's charWidth/charHeight -
+                // scaling the source rect to exactly the image's own pixel
+                // size while destination-sizing it in cell units is what
+                // drawBitmap(src, dst, paint) does natively, avoiding a
+                // separate manual bitmap-scaling step.
+                val destWidthCells = (bitmap.width / charWidth).let {
+                    if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
+                }.coerceAtMost(buffer.columns - placed.col).coerceAtLeast(1)
+                val destHeightPx = bitmap.height.toFloat()
+                canvas.nativeCanvas.drawBitmap(
+                    bitmap,
+                    null,
+                    android.graphics.RectF(left, top, left + destWidthCells * charWidth, top + destHeightPx),
+                    null
+                )
+            }
+        }
+
+        // Placed Kitty images (see TerminalBuffer.KittyPlacement's own doc) -
+        // same post-glyph/pre-cursor paint order and live-grid-row-index
+        // shift as the Sixel loop just above (see its own doc for why this
+        // now shifts by scrollbackRowsShown instead of skipping entirely
+        // once scrollOffset != 0), but sorted by z-index first: unlike
+        // Sixel (which has no z-index concept and paints in whatever order
+        // placedImages() happens to return), Kitty placements with a
+        // negative z sit BELOW the text glyph layer and positive/zero z sit
+        // ABOVE it - since this loop runs entirely after the glyph loop
+        // already finished, only the relative order AMONG kitty placements
+        // themselves is actually controllable here (a negative-z image
+        // still paints after, hence visually "on top of", cell text that
+        // was already drawn - a known simplification; see kittyPlacements()
+        // itself for why TerminalBuffer punts this same interleaving
+        // decision to this call site). Sorting ascending at least keeps
+        // higher z-index placements layered correctly relative to EACH
+        // OTHER when several overlap.
+        run {
+            val scrollbackRowsShown = scrollOffset.coerceAtMost(buffer.maxScrollOffset)
+            for (placed in buffer.kittyPlacements().sortedBy { it.z }) {
+                val visibleRow = placed.row + scrollbackRowsShown
+                if (visibleRow !in 0 until buffer.rows) continue
+                val bitmap = bitmapFor(placed.image)
+
+                // Source rectangle (spec's x,y,w,h crop - see
+                // TerminalBuffer.KittyPlacement's own doc): srcW/srcH
+                // of 0 is the class's own "unspecified, use the whole
+                // image" sentinel, so only a genuinely non-zero
+                // width/height crops the source rect at all. Clamped
+                // against the bitmap's own bounds so a malformed/out-
+                // of-range crop (e.g. a client requesting a rect
+                // partially outside the image) degrades to whatever
+                // portion is actually valid rather than crashing
+                // drawBitmap with an invalid src Rect.
+                val srcLeft = placed.srcX.coerceIn(0, bitmap.width)
+                val srcTop = placed.srcY.coerceIn(0, bitmap.height)
+                val srcRight = if (placed.srcW > 0) (srcLeft + placed.srcW).coerceAtMost(bitmap.width) else bitmap.width
+                val srcBottom = if (placed.srcH > 0) (srcTop + placed.srcH).coerceAtMost(bitmap.height) else bitmap.height
+                val srcRect = android.graphics.Rect(srcLeft, srcTop, srcRight.coerceAtLeast(srcLeft + 1), srcBottom.coerceAtLeast(srcTop + 1))
+                val croppedW = srcRect.width()
+                val croppedH = srcRect.height()
+
+                // Destination top-left: the anchor cell's own pixel
+                // corner, shifted by the X,Y cell-offset keys (clamped
+                // to stay within one cell's width/height, per spec's
+                // "the offsets must be smaller than the size of the
+                // cell"). top uses visibleRow (not placed.row), so the
+                // whole placement moves down on screen along with the
+                // rest of the viewport while scrolled.
+                val left = placed.col * charWidth + placed.cellOffsetX.coerceIn(0, charWidth.toInt() - 1)
+                val top = visibleRow * charHeight + placed.cellOffsetY.coerceIn(0, charHeight.toInt() - 1)
+
+                // Destination size: c=/r= (displayCols/displayRows)
+                // request an EXACT on-screen size in whole cells that
+                // the (cropped) source gets scaled to fit, scaling
+                // disproportionately if only one axis was actually
+                // requested is avoided by falling back to the natural
+                // pixel size on whichever axis wasn't specified (0),
+                // matching the spec's own "the other one is computed
+                // based on the source image aspect ratio" - approximated
+                // here via the cropped rect's own aspect ratio rather
+                // than a further explicit computation, since scaling
+                // the unspecified axis by the SAME ratio as the
+                // specified one already preserves aspect ratio exactly.
+                val destWidthPx: Float
+                val destHeightPx: Float
+                if (placed.displayCols > 0 && placed.displayRows > 0) {
+                    destWidthPx = placed.displayCols * charWidth
+                    destHeightPx = placed.displayRows * charHeight
+                } else if (placed.displayCols > 0) {
+                    destWidthPx = placed.displayCols * charWidth
+                    destHeightPx = croppedH * (destWidthPx / croppedW.coerceAtLeast(1))
+                } else if (placed.displayRows > 0) {
+                    destHeightPx = placed.displayRows * charHeight
+                    destWidthPx = croppedW * (destHeightPx / croppedH.coerceAtLeast(1))
+                } else {
+                    // Natural size, clipped to the available columns to
+                    // the right of the anchor the same way this loop
+                    // always has (a wide image shouldn't paint past the
+                    // right edge of the grid).
+                    val destWidthCells = (croppedW / charWidth).let {
+                        if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
+                    }.coerceAtMost(buffer.columns - placed.col).coerceAtLeast(1)
+                    destWidthPx = destWidthCells * charWidth
+                    destHeightPx = croppedH.toFloat()
+                }
+
+                canvas.nativeCanvas.drawBitmap(
+                    bitmap,
+                    srcRect,
+                    android.graphics.RectF(left, top, left + destWidthPx, top + destHeightPx),
+                    null
+                )
             }
         }
 
@@ -1077,15 +2121,55 @@ private fun DrawScope.drawTerminal(
         // (scrollOffset > 0) the cursor's actual row/col don't correspond
         // to what's currently being displayed, so drawing it would just
         // put a stray white block over unrelated scrollback text.
-        if (scrollOffset == 0 && buffer.cursorVisible && buffer.cursorRow in 0 until buffer.rows && buffer.cursorCol in 0 until buffer.columns) {
-            val cursorX = buffer.cursorCol * charWidth
-            val cursorY = (buffer.cursorRow + 1) * charHeight
+        //
+        // Reads buffer.cursorSnapshot() - a single locked read of
+        // cursorRow/cursorCol/rows/columns/cursorVisible together - rather
+        // than five separate unsynchronized field accesses (buffer.cursorRow,
+        // buffer.rows, buffer.cursorCol, buffer.columns, buffer.cursorVisible
+        // one at a time, as this used to). See cursorSnapshot's own doc for
+        // why that used to be a real cross-thread race: the PTY reader
+        // thread (moving the cursor on every escape sequence) and a resize()
+        // call from the main thread (keyboard open/close, rotation, pane
+        // resize) each individually lock their own writes, but reading the
+        // four numbers back one at a time with no lock of its own could
+        // still observe a torn mix of pre- and post-resize values - a stray
+        // white block landing outside the real grid or on the wrong,
+        // just-shifted row, exactly the "beyaz imleç uçuyor, siyah
+        // boşluklar beliriyor" symptom that showed up specifically when
+        // tapping the terminal (which focuses the hidden field and opens
+        // the keyboard - i.e. triggers a resize) while the shell was also
+        // actively producing output.
+        val cursor = buffer.cursorSnapshot()
+        if (!suppressCursor && scrollOffset == 0 && cursor.visible && cursor.row in 0 until cursor.rows && cursor.col in 0 until cursor.columns) {
+            val cursorX = cursor.col * charWidth
+            val cursorY = (cursor.row + 1) * charHeight
             bgPaint.color = android.graphics.Color.WHITE
-            canvas.nativeCanvas.drawRect(cursorX, cursorY - charHeight, cursorX + charWidth, cursorY, bgPaint)
-            val cursorCell = buffer.cellAt(buffer.cursorRow, buffer.cursorCol)
-            paint.color = android.graphics.Color.BLACK
-            paint.isFakeBoldText = cursorCell.bold
-            canvas.nativeCanvas.drawText(cursorCell.text, cursorX, cursorY, paint)
+            // DECSCUSR shape (see TerminalEmulator.CursorStyle's own doc).
+            // BLOCK keeps the original full-cell treatment: solid rect with
+            // the glyph redrawn inverted on top, since a translucent glyph
+            // over a solid block would be unreadable either way. UNDERLINE/
+            // BAR are the "just a caret, don't obscure what's underneath"
+            // styles real terminals use for them (vim/nvim's insert-mode
+            // thin bar being the common case) - the glyph the main draw
+            // loop above already painted for this cell is left alone, and
+            // only a thin strip is drawn on top of it.
+            when (cursor.style) {
+                TerminalEmulator.CursorStyle.BLOCK -> {
+                    canvas.nativeCanvas.drawRect(cursorX, cursorY - charHeight, cursorX + charWidth, cursorY, bgPaint)
+                    val cursorCell = buffer.cellAt(cursor.row, cursor.col)
+                    paint.color = android.graphics.Color.BLACK
+                    paint.isFakeBoldText = cursorCell.bold
+                    canvas.nativeCanvas.drawText(cursorCell.text, cursorX, cursorY, paint)
+                }
+                TerminalEmulator.CursorStyle.UNDERLINE -> {
+                    val thickness = (charHeight * 0.12f).coerceAtLeast(2f)
+                    canvas.nativeCanvas.drawRect(cursorX, cursorY - thickness, cursorX + charWidth, cursorY, bgPaint)
+                }
+                TerminalEmulator.CursorStyle.BAR -> {
+                    val thickness = (charWidth * 0.15f).coerceAtLeast(2f)
+                    canvas.nativeCanvas.drawRect(cursorX, cursorY - charHeight, cursorX + thickness, cursorY, bgPaint)
+                }
+            }
         }
     }
 }

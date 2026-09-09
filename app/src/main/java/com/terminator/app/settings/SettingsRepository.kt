@@ -161,6 +161,20 @@ object SettingsKeys {
     // was no way to have one without the other. Independent of VIRTUAL_KEYS
     // and defaults to true so existing keymap users see no behavior change.
     val KEYMAPPER_ENABLED = booleanPreferencesKey("keymapper_enabled")
+    // Local, client-side override for physical-keyboard key-repeat, fully
+    // separate from DECARM's own protocol state (TerminalEmulator's
+    // autoRepeatMode, toggled by a program via "CSI ?8 h/l"). On
+    // (default): repeat KeyEvents from a real hardware/Bluetooth keyboard
+    // (event.repeatCount > 0, see PhysicalKeyEvent.isFromPhysicalKeyboard)
+    // are written to the PTY same as any other key, matching every other
+    // real terminal's default. Off: MainActivity.dispatchKeyEvent drops
+    // those repeat events before they ever reach the PTY - a purely local
+    // input-filtering decision that always wins over whatever a running
+    // program has set DECARM to, since it's about whether this app
+    // chooses to forward an event it already received, not about
+    // reporting the protocol's own state (DECRQM still truthfully answers
+    // with the program's own CSI ?8h/l regardless of this setting).
+    val PHYSICAL_KEY_REPEAT_ENABLED = booleanPreferencesKey("physical_key_repeat_enabled")
     val INPUT_MODE = stringPreferencesKey("input_mode")
     val SECCOMP_ENABLED = booleanPreferencesKey("seccomp_enabled")
     val KEYMAPS = stringPreferencesKey("keymaps_json")
@@ -174,14 +188,17 @@ object SettingsKeys {
     val APP_SHORTCUTS = stringPreferencesKey("app_shortcuts_json")
 
     // Terminal compatibility - which TERM value child processes see.
-    // "xterm-256color" (default) gives full color/feature support. It used
-    // to need a device-provided terminfo entry to be fully recognized by
-    // ncurses apps; the app now bundles its own compiled entry (see
-    // TerminatorApp.extractBundledTerminfo / TerminalSession's TERMINFO env
-    // var) so this works even on devices with no terminfo db at all.
-    // "vt100"/"ansi" remain available since ncurses ships hardcoded
-    // fallback definitions for those very common names too.
-    val TERM_TYPE = stringPreferencesKey("term_type") // "xterm-256color" | "vt100" | "ansi"
+    // "NONE" (default) means don't inject a TERM env var at all - see
+    // TerminalSession.buildEnvironment's own doc for why that's different
+    // from literally setting "TERM=NONE". "xterm-256color" gives full
+    // color/feature support; the app bundles its own compiled terminfo
+    // entry for it (see TerminatorApp.extractBundledTerminfo /
+    // TerminalSession's TERMINFO env var) so it works even on devices with
+    // no terminfo db of their own. See KeyboardSettingsScreen's
+    // TERM_TYPE_OPTIONS for the full picker list this key's value comes
+    // from - NONE, xterm, xterm-color, xterm-256color, screen,
+    // screen-256color, tmux-256color, xterm-kitty, tmux, vt220, vt100, ANSI.
+    val TERM_TYPE = stringPreferencesKey("term_type")
 
     // Terminal > Behaviour
     // When true: `clear` (CSI 2J + cursor-home) also discards the entire
@@ -189,6 +206,42 @@ object SettingsKeys {
     // When false (default): `clear` just moves existing content off-screen
     // the way a normal terminal does - you can still scroll up to see it.
     val CLEAR_ALWAYS_PTY = booleanPreferencesKey("clear_always_pty")
+
+    // Terminal > Behaviour > "Allow custom app schemes". Tapping an OSC 8
+    // hyperlink hands its URI to ACTION_VIEW - but that URI is untrusted
+    // program output (whatever the running command, or a remote ssh host,
+    // chose to print), not something the user typed. Off (default): only
+    // TerminalView's DEFAULT_ALLOWED_HYPERLINK_SCHEMES (http/https/mailto/
+    // tel/sms/geo/ftp/ssh/smb/file/ipfs/ipns) are actually opened; anything
+    // else (a custom app deep link like "spotify:", "market:", or an
+    // "intent:" payload) is silently ignored, same as a dead link. On:
+    // every scheme is allowed through, restoring the fully unrestricted
+    // behavior this had before scheme filtering existed.
+    val ALLOW_CUSTOM_HYPERLINK_SCHEMES = booleanPreferencesKey("allow_custom_hyperlink_schemes")
+
+    // Settings > Terminal Behaviour > Allow OSC 52 clipboard reads. Off
+    // (default): a program sending "OSC 52 ; c ; ?" to read the system
+    // clipboard back through the pty is silently ignored, same as today -
+    // see TerminalEmulator.Listener.onClipboardGet's own doc for why this
+    // is a real info-leak surface (any command in this shell, a remote ssh
+    // session, or another tmux pane could otherwise exfiltrate clipboard
+    // contents). On: the actual system clipboard is read, base64-encoded,
+    // and written back as "OSC 52 ; c ; <base64> ST" - same explicit
+    // opt-in posture as xterm's own allowWindowOps.
+    val ALLOW_OSC52_CLIPBOARD_READ = booleanPreferencesKey("allow_osc52_clipboard_read")
+
+    // Settings > Notifications > OSC 9/777. Off (default): a program's
+    // "OSC 9 ; <msg> ST" / "OSC 777 ; notify ; <title> ; <body> ST" request
+    // is parsed by the emulator (see TerminalEmulator.Listener.
+    // onNotification's own doc) but never actually surfaced as a real
+    // system notification - same silent-no-op-until-opted-in posture as
+    // ALLOW_OSC52_CLIPBOARD_READ just above, since this is also "untrusted
+    // program output gets to trigger a real OS-level side effect" territory
+    // (a remote ssh session or a compromised/malicious script in this
+    // shell could otherwise spam notifications). On: MainViewModel posts a
+    // real notification via NotificationCompat for every request that
+    // arrives.
+    val OSC_NOTIFICATIONS_ENABLED = booleanPreferencesKey("osc_notifications_enabled")
 }
 
 /**
