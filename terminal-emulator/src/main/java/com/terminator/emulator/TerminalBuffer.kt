@@ -1727,10 +1727,35 @@ class TerminalBuffer(
         // into scrollback is only however many rows overflow PAST the
         // cursor's own row once the viewport shrinks - if the cursor
         // already fits inside newRows, nothing needs to move at all.
-        val rowOffset = if (altGrid == null && newRows < rows) {
+        //
+        // This anchoring is NOT restricted to altGrid == null. It used to
+        // be (rowOffset was hardcoded to 0 whenever an alt-screen app -
+        // vim/tmux/htop/nano - was active), on the theory that alt-screen
+        // content isn't supposed to reach scrollback so there was nothing
+        // to compute here. That reasoning only covers the scrollback-push
+        // branch below (still correctly gated to altGrid == null) - it
+        // doesn't justify skipping the row-window anchor itself. A shrink
+        // while an alt-screen app is running still needs SOME rowOffset,
+        // or resized()/resizedPlain() below always keep row 0 pinned and
+        // top-truncate the grid, leaving cursorRow (unmoved, since
+        // rowOffset stayed 0) pointing at whatever now-wrong row happens
+        // to sit there - a misplaced cursor plus blank rows where real
+        // alt-screen content used to be - for the entire window between
+        // this resize() call and whenever the child process's SIGWINCH-
+        // triggered redraw actually lands (TerminalSession.resize's
+        // deferIoctl throttles that signal well behind the live per-frame
+        // buffer.resize() calls during an ongoing pinch, specifically to
+        // avoid the SIGWINCH-storm bug documented there, so this window
+        // is not instantaneous). That's the "cursor yanlış yerde kalıyor
+        // / siyah boş alan oluşuyor... bazı uygulamalar devreye girdikten
+        // sonra" bug: it only showed up once an alt-screen app was
+        // running, because that was exactly the condition that forced
+        // rowOffset to 0 instead of tracking the cursor like the primary
+        // screen already did.
+        val rowOffset = if (newRows < rows) {
             (cursorRow + 1 - newRows).coerceAtLeast(0)
         } else 0
-        if (rowOffset > 0) {
+        if (rowOffset > 0 && altGrid == null) {
             // Only worth remembering in scrollback if at least one of the
             // departing rows actually has real content. Android settles
             // layout in (at least) two passes - an early one before
@@ -1906,8 +1931,25 @@ class TerminalBuffer(
         // user only sees it again once they quit back out, by which point
         // a naive truncate would already have thrown it away with no way
         // to notice or recover it.
-        fun resizedPlain(g: Array<Array<Cell>>): Array<Array<Cell>> = Array(newRows) { r ->
-            val srcRow = r + rowOffset
+        //
+        // Deliberately its own offset, NOT the outer rowOffset. rowOffset
+        // above is now (see that val's own doc) anchored to `cursorRow` -
+        // while altGrid != null that's the ALT screen's cursor, which has
+        // nothing to do with where the primary screen's cursor was sitting
+        // when enterAlternateScreen() saved it. Reusing rowOffset here
+        // would top-truncate the dormant primary screen (and shift
+        // savedCursorRow below) by an amount computed from a completely
+        // unrelated cursor position - correct by coincidence at best,
+        // wrong the rest of the time, and only ever latent (never
+        // visible) until the user actually exits back out of the alt-
+        // screen app to see the primary screen again. savedRowOffset
+        // mirrors rowOffset's own cursor-anchored math exactly, just
+        // against savedCursorRow instead of cursorRow.
+        val savedRowOffset = if (savedGrid != null && newRows < rows) {
+            (savedCursorRow + 1 - newRows).coerceAtLeast(0)
+        } else 0
+        fun resizedPlain(g: Array<Array<Cell>>, offset: Int): Array<Array<Cell>> = Array(newRows) { r ->
+            val srcRow = r + offset
             if (srcRow < rows) {
                 val src = g[srcRow]
                 val width = maxOf(newColumns, src.size)
@@ -1916,7 +1958,7 @@ class TerminalBuffer(
                 Array(newColumns) { Cell() }
             }
         }
-        savedGrid = savedGrid?.let { resizedPlain(it) }
+        savedGrid = savedGrid?.let { resizedPlain(it, savedRowOffset) }
         columns = newColumns
         rows = newRows
         // Row-only resize (columnsChanged == false, see its own doc up top):
@@ -1947,8 +1989,13 @@ class TerminalBuffer(
         // rediscover this adjustment.
         cursorRow = (cursorRow + totalTopPadding - rowOffset).coerceIn(0, rows - 1)
         cursorCol = cursorCol.coerceIn(0, columns - 1)
-        if (rowOffset > 0) {
-            savedCursorRow = (savedCursorRow - rowOffset).coerceIn(0, rows - 1)
+        // savedRowOffset, not rowOffset - see that val's own doc just
+        // above: savedCursorRow tracks the PRIMARY screen's cursor, which
+        // moved (if at all) by however much savedGrid's own truncation
+        // just shifted it, not by whatever the currently-active alt
+        // screen's cursor happened to shift by.
+        if (savedRowOffset > 0) {
+            savedCursorRow = (savedCursorRow - savedRowOffset).coerceIn(0, rows - 1)
         }
         // Same "content moved under a fixed (row, scrollOffset) pair"
         // situation consumePendingScrollLines()'s doc describes for
