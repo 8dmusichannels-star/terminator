@@ -1,37 +1,55 @@
-Terminator is a Terminal emulator, offering comprehensive terminal emulator support with multi-session support you can directly customize and control. Its main purpose is a terminal emulation suitable for daily use. The main difference from other Terminator apps is only in the interface area — embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot/proot environment; that infrastructure is left to the users. Supports Android.
+Terminator is a terminal emulator with multi-session support you can directly customize and control. Its main purpose is terminal emulation that can only be read by the user, suitable for daily use on Android. It does not offer a ready-made chroot/proot environment — the terminal tool infrastructure and other setup is left to you.
 
-<b>Features</b>
-
-Material user interface, supporting all color mappings in its own color interface.
-
-AMOLED black support and dynamic color material support in the terminal. If you want to keep it simple, just enter the RGB color code — custom CSS terminal color support is also offered. Comes with color palettes including default, solarized dark, gruvbox dark, dracula, nord, but you can configure the palettes yourself. Termcolor support is also offered.
-
-Multi-session support: create multiple sessions, choose default or favorite. There is support for file-based session or command-arg session. In session command-arg, you directly specify the executable to be built. If using root, you can activate the root session without /system/bin/su, specify the login path and directory path that creates the startup directory, and start the terminal through the session set as default. The file-based method works the same way: specify the shell script file name and path, specify the directory to be created, and run it with the login path while activating the root session. But if you specify a chroot or proot-like environment as an argument, the starting directory may not work — only valid for arguments that support an entry path. There is a purge setting in "clear," determining whether old data in the pty buffer is actually cleared. The validity of chroot in proot-like environments is variable.
-
-Resizing terminal size based on text size, terminal width, or temporary session zoom is supported. Alpha is supported with terminal background and background blur. Font support includes monospace, sans, mono, serif, and embedded fonts, plus custom TTF/OTF fonts — pinch-to-zoom can be toggled on or off (on by default).
-
-Ringtone support included; choose a custom or default notification sound.
-
-Hide or show the status bar and title bar. Horizontal orientation mode is supported. Export the terminal session as a .txt file and determine whether the save button appears in the bar. The split-screen visibility toggle turns on/off buttons enabling split-screen and float-screen switching. "Broadcast to all panes" lets you enter text or commands into more than one session at once, across split-screen and float-screen. "Clear session" behavior is managed with a toggle, hiding the button when off but clearing all sessions when on.
-
-Soft keyboard (tap to open/close terminal) and virtual key (keybar) are supported. Login modes include:
-
+<b>Appearance</b>
 <ul>
-<li><b>Default</b> — compatible with all IMEs, including CJK input, solid terminal</li>
-<li><b>Semantically correct</b> — may break some IMEs</li>
-<li><b>Old workaround</b> — fixes Samsung keyboard echo, could break Gboard</li>
-<li><b>CJK input</b> — supported, but default is recommended</li>
+<li>Material UI with full color mapping, implemented in its own color interface</li>
+<li>AMOLED black and dynamic (Material You) color support</li>
+<li>Custom RGB codes and custom CSS terminal colors for a simple/plain look</li>
+<li>Built-in themes: default, Solarized Dark, Gruvbox Dark, Dracula, Nord — palettes are configurable yourself, with Termcolor and CSS color support</li>
+<li>See the Terminator-themes repo (github.com/8dmusichannels-star/terminator-themes) for example custom themes/palettes</li>
 </ul>
 
-3 terminal types are supported:
-
+<b>Sessions</b>
 <ul>
-<li><b>xterm-256color</b> — recommended</li>
-<li><b>VT100</b> — color support is limited and won't work even without a terminfo entry</li>
-<li><b>ANSI</b> — color support, but compatible with DOS</li>
+<li>Multi-session support: create multiple sessions, set a default/favorite</li>
+<li>File-based or command-argument sessions — in command-arg sessions you specify the executable to run, in file-based sessions the shell script name/path</li>
+<li>Both support a login path, startup directory, and direct root session activation (without calling /system/bin/su)</li>
+<li>Note: if you pass a chroot/proot-like environment as an argument, the starting directory may not work — only valid for arguments that support an entry path. Chroot validity in root/proot-like environments is variable</li>
+<li>Purge-on-clear setting: controls whether old data left in the terminal's PTY buffer is actually wiped</li>
 </ul>
 
-Control whether soft keyboard, virtual keybar, and keymapper appear, each with its own toggle.
+<b>Terminal features</b>
+<ul>
+<li>Hyperlinks: only whitelisted formats open by default; custom app schemes can be allowed via session settings, at your own risk</li>
+<li>OSC 32 clipboard read support for the clipboard/terminal</li>
+<li>SRM and local echo — note: with an IME, double characters/typing risk can occur, similar to a physical keyboard</li>
+<li>Kitty terminal protocol (all protocols) and Kitty terminal emulation</li>
+<li>Sixel image rendering, with iTerm2 inline image support</li>
+<li>OSC 777 and OSC 9 notifications: with phone notifications enabled, the terminal (or your own notification-based app) can notify you</li>
+<li>Custom or default notification sound</li>
+<li>Export the session as .txt, with an option to show/hide the save button</li>
+</ul>
 
-Keyboard shortcuts and keymapper support let you assign or map virtual keyboard actions from a physical keyboard. Seccomp support is available to resolve "operation not permitted" errors, and there are more features.
+<b>Display, resizing and layout</b>
+<ul>
+<li>Resize by text size, terminal width, or temporary session zoom; pinch-to-zoom toggle (on by default)</li>
+<li>Alpha/transparency with background support and background blur</li>
+<li>Fonts: monospace, sans, serif embedded, plus custom TTF/OTF fonts</li>
+<li>Show/hide status bar and title bar; horizontal orientation supported</li>
+<li>Split screen and floating screen, with a toggle to show/hide their switch buttons</li>
+<li>Broadcast-to-all-panes toggle: sends typed text/commands to every open split/float session at once</li>
+<li>Clear-all-sessions toggle: off hides the clear button on session close; on clears all sessions</li>
+<li>Physical keyboard and mouse support</li>
+</ul>
 
+<b>Keyboard</b>
+<ul>
+<li>Soft keyboard (tap to open/close) and virtual keybar, independently toggleable, plus toggleable shortcut/keymapper buttons to map physical keys to the virtual keyboard</li>
+<li>Login/IME modes: default (all IMEs, incl. solid CJK button), semantically correct (may break some IMEs), old workaround for Samsung keyboard echo (may break Gboard), CJK input (default recommended)</li>
+<li>Seccomp support resolves operation-disallowed errors</li>
+</ul>
+
+<b>Supported TERM types</b>
+NONE ($TERM left unset), xterm, xterm-color, xterm-256color (recommended, full support for vim/htop/nano etc.), screen, screen-256color, tmux, tmux-256color, xterm-kitty, vt220, vt100 (minimal, near-universal), ANSI (basic, no 256-color).
+
+Terminator leaves shell tools/environment setup up to you, giving deep control over appearance, sessions, and keyboard behavior.
