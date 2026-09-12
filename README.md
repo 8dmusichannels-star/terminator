@@ -28,7 +28,7 @@ As for keyboards, both a soft keyboard (tap to open/close the terminal) and a vi
 - **Old workaround** — fixes Samsung keyboard echo; could break Gboard
 - **CJK input** — supported, but default is recommended
 
-3 types of terminal types are supported:
+12 types of terminal types are supported:
 
 - **NONE** — don't set `$TERM` at all; whatever the shell/exec environment already provides is left as-is
 - **xterm** — base xterm entry, no 256-color extension
