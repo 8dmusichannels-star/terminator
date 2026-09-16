@@ -798,18 +798,61 @@ fun TerminalView(
         // this composable needing to know anything about WHY suppression
         // was requested.
         var suppressCursorTimedOut by remember { mutableStateOf(false) }
-        LaunchedEffect(suppressCursor) {
+        // Watchdog for suppressCursor: the caller (MainActivity/
+        // SplitTerminalPane/MultiPaneContainer) is only ever supposed to
+        // hold this true for the brief window between a resize/zoom/drag
+        // starting and its own debounced commit landing (~120-150ms by
+        // every caller's own doc) - it's a "the grid is mid-transition,
+        // don't paint a cursor at coordinates that might not match it yet"
+        // signal, never meant to be a durable "hide the cursor" switch.
+        // But suppressCursor is driven entirely by caller-side state
+        // (isPinchZooming/isManuallyResizing/isDraggingSplit, each flipped
+        // back to false only once by that caller's own commit path, at
+        // the END of the whole gesture - not per tick) that this
+        // composable has no visibility into and no way to verify - if any
+        // one of those call sites' own reset ever fails to run (a
+        // cancelled coroutine, a skipped branch, a future caller bug),
+        // suppressCursor stays wedged true with nothing on this side ever
+        // clearing it, silently hiding the cursor forever until something
+        // else (unrelated) happens to flip the underlying flag back. A
+        // renderer-side self-heal - the actual fix here - means a caller
+        // bug degrades to "the cursor blinks back after a bit longer than
+        // usual" instead of "gone until the user stumbles onto whatever
+        // unrelated action clears it", without this composable needing to
+        // know anything about WHY suppression was requested.
+        //
+        // The timeout itself was originally a flat one-shot delay (500ms,
+        // then 4000ms) started once when suppressCursor first flips true -
+        // but isPinchZooming/isManuallyResizing stay true for the
+        // gesture's FULL duration regardless of how long that is
+        // (deliberately - see those flags' own docs; they exist
+        // specifically so a mid-gesture tick doesn't flicker the cursor
+        // back on), so ANY flat cap is just a bigger version of the same
+        // bug: a slow, genuinely continuous pinch the user holds and
+        // wiggles for longer than whatever the cap happens to be still
+        // trips this watchdog WHILE the gesture is legitimately in
+        // progress, forcing the cursor back on mid-transition - exactly
+        // the "Enter basmış gibi aşağı düşme" jump suppression exists to
+        // prevent, now caused by the watchdog meant to be its safety net.
+        // No fixed number is actually safe here: a careful/slow zoom can
+        // run for many seconds.
+        //
+        // Fix: key this on fontSizeSp too, not just suppressCursor.
+        // fontSizeSp carries the live font size (effectiveTextSize /
+        // liveZoomSize from every caller's own pinch branch - see
+        // MainActivity's liveZoomSize doc), which changes on EVERY real
+        // pinch frame. Restarting the delay each time it changes means
+        // the 1200ms clock only ever actually reaches zero once 1.2s has
+        // passed with NO real pinch activity at all - i.e. only once the
+        // gesture has genuinely stalled or the caller's own reset failed
+        // to run. A real, continuous multi-second pinch keeps resetting
+        // this clock every frame and never trips it, however long it
+        // runs; a genuinely wedged flag still self-heals within ~1.2s of
+        // going stale, same safety net as before - just measured from
+        // the last real tick instead of from gesture start.
+        LaunchedEffect(suppressCursor, fontSizeSp) {
             if (suppressCursor) {
-                // Comfortably longer than the longest legitimate
-                // suppression window any caller documents (MainActivity's
-                // resize debounce: 120ms + delay; MultiPaneContainer's
-                // manual-resize throttle: 32ms steps; a pinch's
-                // zoomCommitJob: 150ms) - long enough that a real, still-
-                // in-progress transition never trips it, short enough that
-                // a wedged flag only costs a brief extra delay before the
-                // cursor reappears on its own instead of staying hidden
-                // indefinitely.
-                delay(500)
+                delay(1200)
                 suppressCursorTimedOut = true
             } else {
                 suppressCursorTimedOut = false

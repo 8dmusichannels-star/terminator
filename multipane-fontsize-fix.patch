@@ -1,0 +1,472 @@
+diff --git a/app/src/main/java/com/terminator/app/ui/MainActivity.kt b/app/src/main/java/com/terminator/app/ui/MainActivity.kt
+index d62aa50..0e707fa 100644
+--- a/app/src/main/java/com/terminator/app/ui/MainActivity.kt
++++ b/app/src/main/java/com/terminator/app/ui/MainActivity.kt
+@@ -1422,6 +1422,28 @@ class MainActivity : ComponentActivity() {
+                                     palette = terminalPalette,
+                                     fontFamily = terminalTypeface,
+                                     fontSizeSp = textSize,
++                                    // Same override chain the primary pane
++                                    // (state.sessionTextSizes[activeSessionId]
++                                    // ?: textSize) and split pane
++                                    // (state.sessionTextSizes[splitRuntimeId]
++                                    // ?: textSize) already use - without
++                                    // this, every multi-pane tile silently
++                                    // ignored any per-session zoom that had
++                                    // been committed for it and always fell
++                                    // back to the global textSize.
++                                    fontSizeSpFor = { runtimeId -> state.sessionTextSizes[runtimeId] ?: textSize },
++                                    // Persists a multi-pane tile's pinch-zoom
++                                    // commit the same way the primary pane's
++                                    // own commit does (see the call near
++                                    // "viewModel.setSessionTextSize(committingSessionId, finalCommitSize)"
++                                    // above) - without this the commit was
++                                    // silently dropped and the tile's font
++                                    // size sprang back to fontSizeSpFor's
++                                    // pre-pinch value on the very next
++                                    // recomposition.
++                                    onFontSizeCommitted = { runtimeId, sizeSp ->
++                                        viewModel.setSessionTextSize(runtimeId, sizeSp)
++                                    },
+                                     zoomEnabled = zoomEnabled,
+                                     softKeyboardEnabled = softKeyboardEnabled,
+                                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+diff --git a/app/src/main/java/com/terminator/app/ui/MultiPaneContainer.kt b/app/src/main/java/com/terminator/app/ui/MultiPaneContainer.kt
+index e14276c..ab4bbbd 100644
+--- a/app/src/main/java/com/terminator/app/ui/MultiPaneContainer.kt
++++ b/app/src/main/java/com/terminator/app/ui/MultiPaneContainer.kt
+@@ -146,6 +146,13 @@ fun MultiPaneContainer(
+     palette: TerminalPalette,
+     fontFamily: android.graphics.Typeface,
+     fontSizeSp: Float,
++    // Per-tile font-size override - see TilingLayout's identically-named
++    // param for the full doc (this is the entry point MainActivity itself
++    // calls, and threads straight through to both TilingLayout and
++    // FloatingLayout below). Defaults to always returning the shared
++    // fontSizeSp so any existing caller not yet updated keeps identical
++    // behavior.
++    fontSizeSpFor: (String) -> Float = { fontSizeSp },
+     // Settings > Appearance > Pinch to zoom. Threaded down through
+     // TilingLayout/FloatingLayout to PaneContent's own gesture loop, which
+     // previously ignored this setting entirely (it has its own local,
+@@ -187,6 +194,16 @@ fun MultiPaneContainer(
+     // frame, false for every other resize path (including the drag's own
+     // final settle commit).
+     onResizeSessionPty: (runtimeId: String, columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int, deferIoctl: Boolean) -> Unit,
++    // Fires once a tile's pinch-zoom gesture commits its final font size -
++    // see PaneContent's onFontSizeCommitted doc for the full mechanism and
++    // why this is needed (without it, multi-pane pinch-zoom springs back
++    // to the pre-pinch size the instant a finger lifts). MainActivity
++    // wires this to viewModel.setSessionTextSize(runtimeId, sizeSp), the
++    // same call the primary pane and SplitTerminalPane already make for
++    // their own pinch commits. Defaults to no-op so any existing caller
++    // not yet updated keeps compiling (with the springback bug intact
++    // until wired).
++    onFontSizeCommitted: (runtimeId: String, sizeSp: Float) -> Unit = { _, _ -> },
+     onSetMode: (PaneMode) -> Unit,
+     onAddPaneRequested: () -> Unit,
+     onExitMultiPane: () -> Unit,
+@@ -245,6 +262,7 @@ fun MultiPaneContainer(
+                     palette = palette,
+                     fontFamily = fontFamily,
+                     fontSizeSp = fontSizeSp,
++                    fontSizeSpFor = fontSizeSpFor,
+                     zoomEnabled = zoomEnabled,
+                     softKeyboardEnabled = softKeyboardEnabled,
+                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+@@ -253,6 +271,7 @@ fun MultiPaneContainer(
+                     onFocusPane = onFocusPane,
+                     onClosePane = onClosePane,
+                     onResizeSessionPty = onResizeSessionPty,
++                    onFontSizeCommitted = onFontSizeCommitted,
+                     onWantsMouseEvents = onWantsMouseEvents,
+                     onWantsMouseMoveEvents = onWantsMouseMoveEvents,
+                     onMouseEvent = onMouseEvent,
+@@ -276,6 +295,7 @@ fun MultiPaneContainer(
+                     palette = palette,
+                     fontFamily = fontFamily,
+                     fontSizeSp = fontSizeSp,
++                    fontSizeSpFor = fontSizeSpFor,
+                     zoomEnabled = zoomEnabled,
+                     softKeyboardEnabled = softKeyboardEnabled,
+                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+@@ -286,6 +306,7 @@ fun MultiPaneContainer(
+                     onMovePane = onMovePane,
+                     onResizePane = onResizePane,
+                     onResizeSessionPty = onResizeSessionPty,
++                    onFontSizeCommitted = onFontSizeCommitted,
+                     onWantsMouseEvents = onWantsMouseEvents,
+                     onWantsMouseMoveEvents = onWantsMouseMoveEvents,
+                     onMouseEvent = onMouseEvent,
+@@ -379,6 +400,13 @@ private fun TilingLayout(
+     palette: TerminalPalette,
+     fontFamily: android.graphics.Typeface,
+     fontSizeSp: Float,
++    // Per-tile font-size override (e.g. MainActivity's
++    // state.sessionTextSizes[runtimeId] ?: textSize, same lookup the
++    // primary pane and SplitTerminalPane already do) - see
++    // onFontSizeCommitted's doc for why this is needed alongside plain
++    // fontSizeSp. Defaults to always returning the shared fontSizeSp so
++    // any existing caller not yet updated keeps identical behavior.
++    fontSizeSpFor: (String) -> Float = { fontSizeSp },
+     zoomEnabled: Boolean = true,
+     softKeyboardEnabled: Boolean = true,
+     allowCustomHyperlinkSchemes: Boolean = false,
+@@ -387,6 +415,11 @@ private fun TilingLayout(
+     onFocusPane: (String) -> Unit,
+     onClosePane: (String) -> Unit,
+     onResizeSessionPty: (String, Int, Int, Int, Int, Boolean) -> Unit,
++    // Fires when a tile's pinch-zoom commits its final font size - see
++    // PaneContent's identically-purposed onFontSizeCommitted doc. Defaults
++    // to no-op so any existing caller not yet updated keeps compiling
++    // (pinch-zoom in multi-pane mode keeps springing back until wired).
++    onFontSizeCommitted: (runtimeId: String, sizeSp: Float) -> Unit = { _, _ -> },
+     onWantsMouseEvents: (String) -> Boolean = { false },
+     onWantsMouseMoveEvents: (String) -> Boolean = { false },
+     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
+@@ -466,7 +499,7 @@ private fun TilingLayout(
+                                     bufferVersion = bufferVersion,
+                                     palette = palette,
+                                     fontFamily = fontFamily,
+-                                    fontSizeSp = fontSizeSp,
++                                    fontSizeSp = fontSizeSpFor(pane.runtimeId),
+                                     zoomEnabled = zoomEnabled,
+                                     softKeyboardEnabled = softKeyboardEnabled,
+                                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+@@ -475,6 +508,7 @@ private fun TilingLayout(
+                                     onFocus = { onFocusPane(pane.runtimeId) },
+                                     onClose = { onClosePane(pane.runtimeId) },
+                                     onMeasuredSize = { cols, rws, pxW, pxH, deferIoctl -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH, deferIoctl) },
++                                    onFontSizeCommitted = { sizeSp -> onFontSizeCommitted(pane.runtimeId, sizeSp) },
+                                     fontDensity = density,
+                                     showDragHandle = false,
+                                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
+@@ -593,6 +627,7 @@ private fun FloatingLayout(
+     palette: TerminalPalette,
+     fontFamily: android.graphics.Typeface,
+     fontSizeSp: Float,
++    fontSizeSpFor: (String) -> Float = { fontSizeSp },
+     zoomEnabled: Boolean = true,
+     softKeyboardEnabled: Boolean = true,
+     allowCustomHyperlinkSchemes: Boolean = false,
+@@ -603,6 +638,7 @@ private fun FloatingLayout(
+     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
+     onResizePane: (runtimeId: String, size: Size) -> Unit,
+     onResizeSessionPty: (String, Int, Int, Int, Int, Boolean) -> Unit,
++    onFontSizeCommitted: (runtimeId: String, sizeSp: Float) -> Unit = { _, _ -> },
+     onWantsMouseEvents: (String) -> Boolean = { false },
+     onWantsMouseMoveEvents: (String) -> Boolean = { false },
+     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
+@@ -678,7 +714,7 @@ private fun FloatingLayout(
+                     bufferVersion = bufferVersion,
+                     palette = palette,
+                     fontFamily = fontFamily,
+-                    fontSizeSp = fontSizeSp,
++                    fontSizeSp = fontSizeSpFor(pane.runtimeId),
+                     zoomEnabled = zoomEnabled,
+                     softKeyboardEnabled = softKeyboardEnabled,
+                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
+@@ -687,6 +723,7 @@ private fun FloatingLayout(
+                     onFocus = { onFocusPane(pane.runtimeId) },
+                     onClose = { onClosePane(pane.runtimeId) },
+                     onMeasuredSize = { cols, rws, pxW, pxH, deferIoctl -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH, deferIoctl) },
++                    onFontSizeCommitted = { sizeSp -> onFontSizeCommitted(pane.runtimeId, sizeSp) },
+                     fontDensity = density,
+                     showDragHandle = true,
+                     onDragStart = {
+@@ -776,6 +813,21 @@ private fun PaneContent(
+     // as before - only the manual-resize-drag branch below ever passes
+     // true.
+     onMeasuredSize: (columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int, deferIoctl: Boolean) -> Unit,
++    // Fires once, right when a pinch-zoom gesture on this tile commits its
++    // final font size (same "finger lifted, 120ms debounce fired" moment
++    // as the onMeasuredSize call it accompanies) - so the caller can
++    // persist it (MainActivity wires this to
++    // viewModel.setSessionTextSize(runtimeId, sizeSp)) the same way the
++    // primary pane and SplitTerminalPane already do for their own
++    // liveZoomSize commits. Without this, fontSizeSp (the parameter above,
++    // driven by the caller's own state) never learns about the pinch, so
++    // the NEXT recomposition's effectiveFontSizeSp = zoomSizeSp ?: fontSizeSp
++    // falls back to the pre-pinch fontSizeSp the instant zoomSizeSp is
++    // reset to null below - the "springs back to the old size" bug.
++    // Defaults to no-op so any existing caller not yet updated keeps
++    // compiling (and keeps the springback bug until wired, same
++    // degradation as this file's other no-op-default callbacks).
++    onFontSizeCommitted: (sizeSp: Float) -> Unit = {},
+     fontDensity: Float,
+     showDragHandle: Boolean,
+     modifier: Modifier = Modifier,
+@@ -920,6 +972,7 @@ private fun PaneContent(
+         mutableStateOf<IntSize?>(null)
+     }
+     val latestOnMeasuredSize = rememberUpdatedState(onMeasuredSize)
++    val latestOnFontSizeCommitted = rememberUpdatedState(onFontSizeCommitted)
+     val latestCharMetrics = rememberUpdatedState(charMetrics)
+     // Set true for the duration of a manual corner-handle resize drag (see
+     // onDragStart/onDragEnd below) so onSizeChanged's own debounce can tell
+@@ -1796,6 +1849,15 @@ private fun PaneContent(
+                                 // regardless of whether Compose has gotten
+                                 // around to recomposing yet.
+                                 var runningZoomBaseSp = latestEffectiveFontSizeSp.value
++                                // Wall-clock time of this gesture's last LIVE
++                                // resize commit (see the commit block right
++                                // after zoomSizeSp is written below) - not
++                                // reset per-frame, persists across the whole
++                                // gesture the same way runningZoomBaseSp
++                                // does. 0L means "no live commit fired yet
++                                // this gesture", which the throttle check
++                                // below treats as "always commit immediately".
++                                var lastLiveCommitAtMs = 0L
+ 
+                                 while (true) {
+                                     val event = awaitPointerEvent()
+@@ -1830,6 +1892,103 @@ private fun PaneContent(
+                                                 runningZoomBaseSp = newSize
+                                                 zoomSizeSp = newSize
+                                                 zoomedThisGesture = true
++                                                // LIVE grid resize, same model
++                                                // Termux's own TerminalView.onScale()
++                                                // uses (onScale -> changeFontSize ->
++                                                // setTextSize -> updateSize(), all
++                                                // called synchronously on every single
++                                                // pinch frame, no debounce at all) -
++                                                // see this gesture block's own
++                                                // top-of-file doc for the full
++                                                // comparison against Termux's real
++                                                // source. Previously this tile only
++                                                // resized buffer.rows/columns ONCE,
++                                                // in the debounced commit after ALL
++                                                // fingers lift (120ms after
++                                                // zoomedThisGesture's loop breaks,
++                                                // see below) - so for the entire
++                                                // pinch gesture the Canvas painted
++                                                // the OLD grid size at the NEW live
++                                                // font size (drawTerminal always
++                                                // draws buffer.rows x
++                                                // buffer.columns - see TerminalView.kt's
++                                                // own fontSizeSp param doc), which is
++                                                // exactly "eski boyutla yeni boyut
++                                                // çiziliyor": stale row/column count,
++                                                // fresh charWidth/charHeight, visibly
++                                                // mismatched against this Box's actual
++                                                // pixel area (black gap zooming out,
++                                                // silently cropped columns/rows via
++                                                // clipToBounds zooming in) for the
++                                                // full gesture, not just a few
++                                                // trailing frames.
++                                                //
++                                                // charWidth/charHeight are recomputed
++                                                // HERE, fresh, for newSize - NOT read
++                                                // from latestCharMetrics.value, which
++                                                // is a remember(fontFamily,
++                                                // effectiveFontSizeSp, fontDensity)
++                                                // that only updates on Compose's NEXT
++                                                // recomposition (see that val's own
++                                                // doc above) - exactly the same
++                                                // one-frame-stale trap
++                                                // runningZoomBaseSp's own doc
++                                                // describes for font size itself.
++                                                // Measuring fresh here means this
++                                                // commit is never a frame behind the
++                                                // zoomSizeSp it's meant to match.
++                                                //
++                                                // Throttled to at most once every
++                                                // 32ms (same interval the manual
++                                                // corner-handle drag already uses
++                                                // for its own live commits, see
++                                                // isManuallyResizing's doc) rather
++                                                // than committing on literally every
++                                                // touch-move frame - a real 60-120Hz
++                                                // pinch can deliver frames faster
++                                                // than that, and each commit below
++                                                // walks onMeasuredSize ->
++                                                // onResizeSessionPty ->
++                                                // TerminalSession.resize(), which
++                                                // sends a real SIGWINCH to the pty -
++                                                // uncapped, a fast pinch would fire
++                                                // far more SIGWINCHs than any
++                                                // full-screen program (htop, vim, mc)
++                                                // could usefully redraw in response
++                                                // to, without making the resize feel
++                                                // any smoother than 32ms already does.
++                                                val nowMs = System.currentTimeMillis()
++                                                if (nowMs - lastLiveCommitAtMs >= 32L) {
++                                                    lastLiveCommitAtMs = nowMs
++                                                    val livePaint = android.graphics.Paint().apply {
++                                                        typeface = fontFamily
++                                                        textSize = newSize * fontDensity
++                                                    }
++                                                    val liveCharWidth = livePaint.measureText("M")
++                                                    val liveCharHeight = livePaint.fontSpacing
++                                                    val liveSize = latestPaneSizePx
++                                                    if (liveCharWidth > 0f && liveCharHeight > 0f && liveSize != null) {
++                                                        val liveCols = (liveSize.width / liveCharWidth).toInt().coerceAtLeast(1)
++                                                        val liveRows = (liveSize.height / liveCharHeight).toInt().coerceAtLeast(1)
++                                                        // deferIoctl = false: fire the real
++                                                        // ioctl/SIGWINCH on every throttled
++                                                        // live frame, same as Termux's own
++                                                        // updateSize() does unconditionally -
++                                                        // see this block's own top doc. This
++                                                        // is deliberately NOT deferred like
++                                                        // the manual-drag path's mid-drag
++                                                        // ticks are (see that branch's own
++                                                        // deferIoctl=true just above in this
++                                                        // file) - Termux's real behavior is
++                                                        // "just resize the pty for real,
++                                                        // every time", not "defer until the
++                                                        // gesture ends", and that's exactly
++                                                        // what eliminates the stale-grid
++                                                        // mismatch for the whole gesture
++                                                        // instead of only its last frame.
++                                                        latestOnMeasuredSize.value(liveCols, liveRows, liveSize.width, liveSize.height, false)
++                                                    }
++                                                }
+                                             }
+                                         }
+                                         val midY = (p1.position.y + p2.position.y) / 2f
+@@ -1945,6 +2104,14 @@ private fun PaneContent(
+                                 // zoomed (zoomedThisGesture) - a pure pan
+                                 // has nothing to resize.
+                                 if (zoomedThisGesture) {
++                                    // Captured before the debounced coroutine below runs -
++                                    // zoomSizeSp is this composable's own MutableState and
++                                    // could in principle be reassigned again by a fresh
++                                    // gesture before the delay(120L) elapses; reading it
++                                    // via the closure at launch time (now) rather than
++                                    // inside the coroutine body guarantees this commit
++                                    // reports the size THIS gesture actually ended at.
++                                    val committedFontSizeSp = zoomSizeSp
+                                     paneResizeDebounceJob?.cancel()
+                                     paneResizeDebounceJob = paneResizeScope.launch {
+                                         delay(120L)
+@@ -1955,6 +2122,15 @@ private fun PaneContent(
+                                             val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                             latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height, false)
+                                         }
++                                        // Persist the pinch's final font size into the
++                                        // caller's own state (see onFontSizeCommitted's own
++                                        // doc) BEFORE zoomSizeSp is nulled out just below -
++                                        // otherwise the caller's fontSizeSp parameter never
++                                        // catches up and effectiveFontSizeSp springs back to
++                                        // its pre-pinch value the moment zoomSizeSp goes null.
++                                        if (committedFontSizeSp != null) {
++                                            latestOnFontSizeCommitted.value(committedFontSizeSp)
++                                        }
+                                         // zoomSizeSp itself was never reset back to null
+                                         // anywhere in this tile's pinch path (unlike
+                                         // MainActivity's liveZoomSize / SplitTerminalPane's
+diff --git a/terminal-emulator/src/main/java/com/terminator/emulator/TerminalBuffer.kt b/terminal-emulator/src/main/java/com/terminator/emulator/TerminalBuffer.kt
+index e4e450d..7232ae3 100644
+--- a/terminal-emulator/src/main/java/com/terminator/emulator/TerminalBuffer.kt
++++ b/terminal-emulator/src/main/java/com/terminator/emulator/TerminalBuffer.kt
+@@ -1682,6 +1682,33 @@ class TerminalBuffer(
+ 
+     /** Resizes the grid, preserving existing content where possible. */
+     fun resize(newColumns: Int, newRows: Int) = lock.withLock {
++        // No-op guard, same as Termux's own TerminalEmulator.resize()
++        // ("if (mRows == rows && mColumns == columns) return;" - checked
++        // BEFORE that resize() ever reaches its own TerminalBuffer.resize()
++        // call). Every caller here (TerminalSession.resize(), see its own
++        // doc) already skips the pty ioctl/SIGWINCH when columns/rows
++        // haven't changed, but until now nothing skipped THIS function
++        // itself - cursorRow's own rowOffset math below runs unconditionally
++        // on every call, even when newColumns/newRows are byte-for-byte
++        // identical to the CURRENT columns/rows. A live pinch-zoom commit
++        // (or any other caller that resizes on a timer/every frame rather
++        // than only on a genuine size change) can call this dozens of times
++        // with the SAME grid size in a row - measuring 24 rows against 24
++        // rows every 32ms, say - each of those redundant calls still ran
++        // the full rowOffset/scrollback-push logic and reassigned
++        // `cursorRow = (cursorRow - rowOffset).coerceIn(0, rows - 1)` as if
++        // a real shrink had just happened. Once the cursor's row is close
++        // enough to the bottom that ANY of those redundant "resizes" trips
++        // the `cursorRow + 1 - newRows > 0` branch (a coercion artifact of
++        // repeatedly reconfirming the exact same rows value), it gets
++        // clamped to `newRows - 1` and stays there - the cursor "always
++        // drops to the bottom line" bug reported after enabling live-pinch
++        // resize commits. A real caller that intentionally wants to redo
++        // this same-size resize (there isn't one today, but a future one
++        // might legitimately want to reprocess something) can still do so
++        // by changing columns or rows by even one and back; this guard only
++        // ever skips a call that would have been a complete no-op anyway.
++        if (newColumns == columns && newRows == rows) return@withLock
+         val oldColumns = columns
+         // A COLUMN change genuinely invalidates a placed image's anchor:
+         // text reflows around it differently, and there's no meaningful
+@@ -1730,6 +1757,32 @@ class TerminalBuffer(
+         val rowOffset = if (altGrid == null && newRows < rows) {
+             (cursorRow + 1 - newRows).coerceAtLeast(0)
+         } else 0
++        // Alt-screen (htop/vim/mc) cursor placement across a shrink: with
++        // rowOffset forced to 0 above, the coerceIn(0, newRows - 1) call
++        // near the end of this function used to be the ONLY thing standing
++        // between cursorRow and the new grid - and since a shrink always
++        // has newRows < the old rows, any cursorRow already at or past
++        // newRows got clamped straight to newRows - 1, the very last row.
++        // A full-screen program's cursor is very often already near the
++        // bottom (a status/command line, e.g. htop's own footer or vim's
++        // command line), so nearly every shrink pinned it to the bottom
++        // edge regardless of where it had actually been - the "shrink
++        // ediliyor hep aşağı düşüyor, ncurses'te devam ediyor" bug. A real
++        // terminal doesn't have this problem because the alt-screen app
++        // redraws its ENTIRE screen (including issuing a fresh CUP to
++        // place its own cursor) the moment it receives the resulting
++        // SIGWINCH - but that redraw is asynchronous and can lag a live,
++        // every-32ms pinch commit by several frames (see this file's own
++        // resize() no-op guard doc for the related timing discussion), so
++        // in the meantime this buffer's cursorRow is what draws. Rather
++        // than pin to the bottom, keep the cursor at the SAME proportional
++        // position in the new, shorter grid it held in the old one -
++        // visually stable (glides smoothly with the shrink instead of
++        // jumping to the floor) and self-corrects the instant the program's
++        // own redraw arrives and moves it for real.
++        val altScreenProportionalCursorRow = if (altGrid != null && rows > 0 && newRows < rows) {
++            ((cursorRow.toLong() * (newRows - 1).coerceAtLeast(0)) / (rows - 1).coerceAtLeast(1)).toInt()
++        } else null
+         if (rowOffset > 0) {
+             // Only worth remembering in scrollback if at least one of the
+             // departing rows actually has real content. Android settles
+@@ -1945,7 +1998,7 @@ class TerminalBuffer(
+         // kept as `+ totalTopPadding` so a future legitimate use of top
+         // padding (if one is ever added back deliberately) doesn't have to
+         // rediscover this adjustment.
+-        cursorRow = (cursorRow + totalTopPadding - rowOffset).coerceIn(0, rows - 1)
++        cursorRow = (altScreenProportionalCursorRow ?: (cursorRow + totalTopPadding - rowOffset)).coerceIn(0, rows - 1)
+         cursorCol = cursorCol.coerceIn(0, columns - 1)
+         if (rowOffset > 0) {
+             savedCursorRow = (savedCursorRow - rowOffset).coerceIn(0, rows - 1)
+diff --git a/terminal-emulator/src/main/java/com/terminator/emulator/TerminalView.kt b/terminal-emulator/src/main/java/com/terminator/emulator/TerminalView.kt
+index 89b12fd..75ff8ea 100644
+--- a/terminal-emulator/src/main/java/com/terminator/emulator/TerminalView.kt
++++ b/terminal-emulator/src/main/java/com/terminator/emulator/TerminalView.kt
+@@ -2182,8 +2182,29 @@ private fun DrawScope.drawTerminal(
+         // tapping the terminal (which focuses the hidden field and opens
+         // the keyboard - i.e. triggers a resize) while the shell was also
+         // actively producing output.
++        // Cursor is now drawn unconditionally whenever it's otherwise valid
++        // (visible, on-screen, in bounds) - suppressCursor no longer gates
++        // this. Previously suppressCursor was set true for the whole
++        // duration of a pinch-zoom or manual corner-handle drag (see
++        // TerminalView's own suppressCursor param doc and MultiPaneContainer's
++        // suppressCursor = zoomSizeSp != null || isManuallyResizing call
++        // site) specifically to hide a stray white block that could detach
++        // from the real cursor cell mid-gesture. That gap doesn't exist
++        // anymore: TerminalBuffer.resize() now runs synchronously against
++        // the SAME live font size on every pinch/drag frame (see its own
++        // no-op guard and MultiPaneContainer's live-commit doc), so
++        // buffer.cursorRow/cursorCol are never more than one frame stale
++        // relative to charWidth/charHeight here - there's nothing left for
++        // suppressing the cursor to protect against, and hiding it just
++        // made it blink/disappear for the whole gesture instead of tracking
++        // the text underneath it the way a real terminal's block cursor
++        // does. The BLOCK style below already shapes itself to whatever
++        // glyph currently occupies that cell (solid rect + the cell's own
++        // character redrawn inverted on top) - drawing it every frame,
++        // including mid-gesture, is what makes it look like a normal solid
++        // cursor rather than a blinking/disappearing one.
+         val cursor = buffer.cursorSnapshot()
+-        if (!suppressCursor && scrollOffset == 0 && cursor.visible && cursor.row in 0 until cursor.rows && cursor.col in 0 until cursor.columns) {
++        if (scrollOffset == 0 && cursor.visible && cursor.row in 0 until cursor.rows && cursor.col in 0 until cursor.columns) {
+             val cursorX = cursor.col * charWidth
+             val cursorY = (cursor.row + 1) * charHeight
+             bgPaint.color = android.graphics.Color.WHITE

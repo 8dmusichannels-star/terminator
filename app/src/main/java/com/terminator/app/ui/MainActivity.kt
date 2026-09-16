@@ -1017,11 +1017,25 @@ class MainActivity : ComponentActivity() {
                             // rest of the screen) is only touched once, when the gesture
                             // ends, via the commit block in the pointerInput below.
                             var liveZoomSize by remember(activeSessionId) { mutableStateOf<Float?>(null) }
+                            // True for the ENTIRE duration of an active pinch gesture -
+                            // from the first frame that actually zooms until fingers lift
+                            // and the final commit below runs. liveZoomSize itself is now
+                            // set once per mid-pinch frame and left alone (no per-tick
+                            // buffer/pty commit touches it anymore - see the pinch block's
+                            // own doc), so both stay true/non-null together for the whole
+                            // gesture; isPinchZooming still exists as its own flag because
+                            // TerminalView (below) needs a stable, composable-scope boolean
+                            // for suppressCursor rather than reading liveZoomSize != null
+                            // directly (declared here, not the gesture loop's local
+                            // zoomedThisGesture, precisely so TerminalView's suppressCursor
+                            // param can read it).
+                            var isPinchZooming by remember(activeSessionId) { mutableStateOf(false) }
                             var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
                             // Nanos of the last time a pinch actually committed a real
-                            // buffer/pty resize (not just liveZoomSize's visual preview) -
-                            // see the throttleElapsed check where zoomCommitJob is
-                            // (re)launched below for why this exists.
+                            // buffer/pty resize - only ever written now by the single
+                            // final, post-lift-off commit (see the zoomedThisGesture
+                            // block below); nothing mid-gesture reads or writes this
+                            // anymore since mid-pinch ticks no longer commit anything.
                             var lastZoomCommitNanos by remember { mutableStateOf(0L) }
 
                             val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
@@ -1358,8 +1372,21 @@ class MainActivity : ComponentActivity() {
                             // while a pinch is actively live (liveZoomSize != null) so this
                             // doesn't fight that gesture's own throttled commit; the pinch
                             // path already keeps the grid in sync for its own duration.
+                            // isPinchZooming (not just liveZoomSize == null) guards this: the
+                            // final pinch commit coroutine (see the zoomedThisGesture block
+                            // below) nulls liveZoomSize out partway through its own single
+                            // resize+anchor pass, before it's done - checking liveZoomSize
+                            // alone let THIS effect refire mid-way through that coroutine and
+                            // run a second, independent applyResize() concurrently with it,
+                            // racing the same buffer/pty resize and scroll re-anchor against
+                            // each other for the same gesture (this is what kept the cursor
+                            // drifting/the grid mis-sizing even after the mid-pinch throttle
+                            // fix - two uncoordinated writers, not one). isPinchZooming only
+                            // flips back to false as the very LAST step of that coroutine, so
+                            // gating on it here means this effect simply no-ops for the whole
+                            // duration of that pass instead of racing it.
                             LaunchedEffect(effectiveTextSize) {
-                                if (hasSizedOnce && liveZoomSize == null) {
+                                if (hasSizedOnce && liveZoomSize == null && !isPinchZooming) {
                                     applyResize()
                                 }
                             }
@@ -1395,6 +1422,28 @@ class MainActivity : ComponentActivity() {
                                     palette = terminalPalette,
                                     fontFamily = terminalTypeface,
                                     fontSizeSp = textSize,
+                                    // Same override chain the primary pane
+                                    // (state.sessionTextSizes[activeSessionId]
+                                    // ?: textSize) and split pane
+                                    // (state.sessionTextSizes[splitRuntimeId]
+                                    // ?: textSize) already use - without
+                                    // this, every multi-pane tile silently
+                                    // ignored any per-session zoom that had
+                                    // been committed for it and always fell
+                                    // back to the global textSize.
+                                    fontSizeSpFor = { runtimeId -> state.sessionTextSizes[runtimeId] ?: textSize },
+                                    // Persists a multi-pane tile's pinch-zoom
+                                    // commit the same way the primary pane's
+                                    // own commit does (see the call near
+                                    // "viewModel.setSessionTextSize(committingSessionId, finalCommitSize)"
+                                    // above) - without this the commit was
+                                    // silently dropped and the tile's font
+                                    // size sprang back to fontSizeSpFor's
+                                    // pre-pinch value on the very next
+                                    // recomposition.
+                                    onFontSizeCommitted = { runtimeId, sizeSp ->
+                                        viewModel.setSessionTextSize(runtimeId, sizeSp)
+                                    },
                                     zoomEnabled = zoomEnabled,
                                     softKeyboardEnabled = softKeyboardEnabled,
                                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -1461,7 +1510,7 @@ class MainActivity : ComponentActivity() {
                                     onClosePane = { runtimeId -> viewModel.removePane(runtimeId) },
                                     onMovePane = { runtimeId, offset -> viewModel.movePane(runtimeId, offset) },
                                     onResizePane = { runtimeId, size -> viewModel.resizePane(runtimeId, size) },
-                                    onResizeSessionPty = { runtimeId, cols, rws, pxW, pxH -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws, pxW, pxH) },
+                                    onResizeSessionPty = { runtimeId, cols, rws, pxW, pxH, deferIoctl -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws, pxW, pxH, deferIoctl) },
                                     onSetMode = { mode -> viewModel.setPaneMode(mode) },
                                     onAddPaneRequested = {
                                         // Same "don't pop up an empty list"
@@ -1731,6 +1780,48 @@ class MainActivity : ComponentActivity() {
                                             }
                                             latestTerminalSize = size
                                             hasSizedOnce = true
+                                            // While the split divider is actively being
+                                            // dragged, commit every real size change
+                                            // IMMEDIATELY (deferIoctl=true, same pattern as
+                                            // MultiPaneContainer's isManuallyResizing) instead
+                                            // of going through the 120ms debounce below.
+                                            // isDraggingSplit was already wired into
+                                            // suppressCursor (see its own doc above) on the
+                                            // assumption dragging behaved like a floating
+                                            // pane's corner-drag, but nothing actually made it
+                                            // behave that way here - a divider drag fires a
+                                            // genuine size delta on essentially every frame
+                                            // the finger moves, so sizeActuallyChanged was true
+                                            // on nearly every callback, which meant the branch
+                                            // below (sizeActuallyChanged || resizeDebounceJob
+                                            // == null) kept being true and endlessly
+                                            // cancelling + restarting the SAME 120ms timer -
+                                            // for as long as the drag kept producing new
+                                            // deltas, that timer could never once run
+                                            // uninterrupted for a full 120ms, so applyResize()
+                                            // never fired until the finger actually stopped
+                                            // moving. The grid stayed pinned at its pre-drag
+                                            // column/row count the whole time the divider was
+                                            // visibly sliding - "boyutlanma cok fazla ileri
+                                            // geri itilince yeniden boyutlanmiyor". Committing
+                                            // on every tick while isDraggingSplit is true (like
+                                            // MultiPaneContainer already does for its own
+                                            // corner-handle drag) keeps buffer.rows/columns
+                                            // matched to the Box's real pixel size throughout
+                                            // the whole drag instead of only once it settles;
+                                            // onDragEnd below fires the one final, non-deferred
+                                            // commit once the drag actually ends.
+                                            if (isDraggingSplit) {
+                                                resizeDebounceJob?.cancel()
+                                                val (charWidth, charHeight) = charMetrics
+                                                if (charWidth > 0f && charHeight > 0f) {
+                                                    val cols = (size.width / charWidth).toInt().coerceAtLeast(1)
+                                                    val rws = (size.height / charHeight).toInt().coerceAtLeast(1)
+                                                    viewModel.updateTerminalSize(cols, rws, size.width, size.height, deferIoctl = true)
+                                                    pendingResize = false
+                                                }
+                                                return@onSizeChanged
+                                            }
                                             // Only reset the debounce timer when the size genuinely
                                             // changed. Compose can re-invoke onSizeChanged with the
                                             // SAME size repeatedly while the IME animation is still
@@ -1913,6 +2004,58 @@ class MainActivity : ComponentActivity() {
                                         .pointerInput(activeSessionId, softKeyboardEnabled) {
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
+                                                // Reset per-gesture: tracks whether THIS gesture
+                                                // (from this down to the matching lift-off) ever
+                                                // actually ran the pinch branch below, independent
+                                                // of liveZoomSize's own null/non-null state -
+                                                // liveZoomSize gets set back to null by every
+                                                // throttled mid-pinch commit (see its own
+                                                // zoomCommitJob launch below), not just at gesture
+                                                // end, so "liveZoomSize != null" at lift-off could
+                                                // already be false even though a pinch genuinely
+                                                // happened - e.g. fingers lift right as/after a
+                                                // 150ms-throttled tick's coroutine already nulled
+                                                // it back out. Using liveZoomSize itself as "did a
+                                                // pinch happen" is exactly what silently skipped
+                                                // the final non-deferred commit below in that race,
+                                                // leaving the pty's window size stuck at whatever
+                                                // it was before the gesture (the "ekran hala dörtte
+                                                // bir kalıyor" symptom) even after the ViewModel-
+                                                // level deferredSettling fix, since that fix only
+                                                // helps once updateTerminalSize is actually called
+                                                // - it does nothing if the call itself gets skipped
+                                                // entirely.
+                                                var zoomedThisGesture = false
+                                                // Running zoom base for this gesture, read/
+                                                // written ONLY as a local var inside the pinch
+                                                // branch below - NOT via latestEffectiveTextSize
+                                                // mid-pinch. rememberUpdatedState's .value only
+                                                // updates on the NEXT recomposition, which
+                                                // Compose schedules asynchronously - not
+                                                // guaranteed to land before this same
+                                                // pointerInput coroutine's next pinch frame
+                                                // resumes. A fast continuous pinch delivers
+                                                // several raw pointer-move frames back to back
+                                                // well within a single recomposition pass, so
+                                                // each of those frames kept reading the SAME
+                                                // stale latestEffectiveTextSize.value and
+                                                // multiplying its own zoom ratio against that
+                                                // same stale base instead of compounding against
+                                                // the previous frame's own liveZoomSize write -
+                                                // a burst like that overshoots, then the instant
+                                                // Compose recomposes and latestEffectiveTextSize
+                                                // .value finally catches up, the next frame's
+                                                // zoom lands against the now-correct base and the
+                                                // size snaps hard back - exactly the "zoom
+                                                // yaparken geri tepiyor" bounce. Left as -1f
+                                                // (uninitialized sentinel) until the pinch branch
+                                                // actually runs for the first time this gesture,
+                                                // since only then do we know a pinch is even
+                                                // happening - seeded at that point from
+                                                // latestEffectiveTextSize.value (a single,
+                                                // one-time read, safe since nothing in this
+                                                // gesture has written liveZoomSize yet).
+                                                var runningZoomBaseSp = -1f
                                                 // New touch landing: abort any in-flight fling from
                                                 // a previous release and start tracking velocity
                                                 // fresh for this gesture - same moment Termux calls
@@ -2301,150 +2444,58 @@ class MainActivity : ComponentActivity() {
                                                                     // below ~4f since glyphs become
                                                                     // unmeasurable/illegible past that
                                                                     // on most device densities.
-                                                                    val newSize = (latestEffectiveTextSize.value * zoom)
-                                                                        .coerceIn(4f, 40f)
-                                                                    // Anchor the pinch to the midpoint between
-                                                                    // the two fingers, not to row 0 / the top
-                                                                    // of the viewport. Without this, resizing
-                                                                    // the grid (below) always keeps row 0
-                                                                    // pinned and grows/shrinks everything
-                                                                    // downward from there - so content under
-                                                                    // the fingers visibly drifted upward out
-                                                                    // from under them as soon as the finger
-                                                                    // midpoint wasn't already at the very top
-                                                                    // of the screen (the common case). Convert
-                                                                    // the midpoint's CURRENT pixel-y into a
-                                                                    // row using the OLD charHeight, so we know
-                                                                    // which row the fingers are actually over
-                                                                    // before anything changes size.
-                                                                    //
-                                                                    // latestCharMetrics.value, NOT the plain
-                                                                    // charMetrics local - this is the actual
-                                                                    // root cause of "zoom yaparken/tıklarken
-                                                                    // imleç yukarı kayıyor": this whole pinch
-                                                                    // handler runs inside the SAME long-lived
-                                                                    // pointerInput(activeSessionId) coroutine
-                                                                    // as the drag-to-scroll branch above (see
-                                                                    // its own doc) - it is launched ONCE for
-                                                                    // the session and never restarts just
-                                                                    // because fontSizeSp/charMetrics changed,
-                                                                    // so the plain `charMetrics` val it closed
-                                                                    // over was frozen at whatever size was
-                                                                    // active the FIRST time this coroutine
-                                                                    // started (e.g. before the user ever
-                                                                    // zoomed, or tapped to reopen the
-                                                                    // keyboard and re-triggered composition).
-                                                                    // Every subsequent pinch anchored itself
-                                                                    // against that same stale oldCharHeight
-                                                                    // instead of the size the previous pinch
-                                                                    // actually committed to - since a pinch
-                                                                    // IN also shrinks oldCharHeight relative
-                                                                    // to the true previous size, midY /
-                                                                    // oldCharHeight computed anchorRow too
-                                                                    // large, so the anchorDelta correction
-                                                                    // below under-compensated and the whole
-                                                                    // grid (cursor included) crept upward a
-                                                                    // little more on every zoom gesture,
-                                                                    // compounding across repeated
-                                                                    // zooms/session lifetime rather than
-                                                                    // settling back to the finger's actual
-                                                                    // midpoint. suppressCursor only hides the
-                                                                    // cursor WHILE a pinch is in flight; it
-                                                                    // never touches this anchor math, which
-                                                                    // is what kept misplacing it once the
-                                                                    // cursor reappeared post-commit.
-                                                                    val (_, oldCharHeight) = latestCharMetrics.value
-                                                                    val midY = (p1.position.y + p2.position.y) / 2f
-                                                                    val anchorRow = if (oldCharHeight > 0f) (midY / oldCharHeight).toInt() else 0
-                                                                    liveZoomSize = newSize
-                                                                    zoomCommitJob?.cancel()
-                                                                    // Previously this ALWAYS waited out a
-                                                                    // fresh 150ms debounce, cancelled and
-                                                                    // restarted on every single pinch frame -
-                                                                    // during a slow, continuous pinch (fingers
-                                                                    // still moving, a new delta arriving every
-                                                                    // frame) that timer never once reached
-                                                                    // zero until the gesture actually paused
-                                                                    // or ended, so the real buffer/pty resize
-                                                                    // (below) never fired for the ENTIRE
-                                                                    // gesture - only liveZoomSize's font size
-                                                                    // changed while buffer.rows/columns stayed
-                                                                    // exactly what they were before the pinch
-                                                                    // started. Since TerminalView draws that
-                                                                    // fixed grid at the ever-shrinking live
-                                                                    // font size, zooming OUT left a growing
-                                                                    // unfilled (near-black background) strip
-                                                                    // on the right/bottom the whole time you
-                                                                    // were still pinching - "zoom ile terminal
-                                                                    // ekranı şekillenmiyor, siyah boşluklar
-                                                                    // oluşuyor". Throttling to a real commit
-                                                                    // at most every 150ms DURING an ongoing
-                                                                    // gesture (skipping the wait below once
-                                                                    // that long has actually elapsed since the
-                                                                    // last real commit) keeps the buffer
-                                                                    // roughly in sync with the live font size
-                                                                    // throughout the pinch instead of only
-                                                                    // once at the very end - the trailing
-                                                                    // debounced commit (delay(150) below,
-                                                                    // still cancelled/restarted every frame)
-                                                                    // is what guarantees the exact final size
-                                                                    // once the gesture actually settles.
-                                                                    val throttleElapsed = System.nanoTime() - lastZoomCommitNanos >= 150_000_000L
-                                                                    zoomCommitJob = coroutineScope.launch {
-                                                                        if (!throttleElapsed) delay(150)
-                                                                        lastZoomCommitNanos = System.nanoTime()
-                                                                        viewModel.setSessionTextSize(activeSessionId, newSize)
-                                                                        liveZoomSize = null
-                                                                        // sessionTextSize (the state
-                                                                        // read at the top of this
-                                                                        // composable) won't reflect
-                                                                        // the value just committed
-                                                                        // above until the next
-                                                                        // recomposition, so
-                                                                        // applyResize() here would
-                                                                        // still see zoomActive as
-                                                                        // false on a *first* pinch.
-                                                                        // Recompute charMetrics
-                                                                        // against newSize directly
-                                                                        // instead of relying on that
-                                                                        // stale closure.
-                                                                        val metricsPaint = android.graphics.Paint().apply {
-                                                                            typeface = terminalTypeface
-                                                                            this.textSize = newSize * density * fontScale
-                                                                        }
-                                                                        val charWidth = metricsPaint.measureText("M")
-                                                                        val newCharHeight = metricsPaint.fontSpacing
-                                                                        val finalSize = latestTerminalSize
-                                                                        if (charWidth > 0f && newCharHeight > 0f && finalSize != null) {
-                                                                            val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
-                                                                            val rws = (finalSize.height / newCharHeight).toInt().coerceAtLeast(1)
-                                                                            viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
-                                                                            // Re-anchor: the row the fingers were
-                                                                            // over (anchorRow, in OLD char-height
-                                                                            // units) should land at the same pixel
-                                                                            // midY again, now measured in the NEW
-                                                                            // char-height. The gap between where
-                                                                            // that row naturally falls post-resize
-                                                                            // and where it needs to be is what
-                                                                            // scrollOffset makes up - same unit
-                                                                            // (whole lines) adjustScrollOffset
-                                                                            // already expects.
-                                                                            val desiredRowAtMidY = (midY / newCharHeight)
-                                                                            val anchorDelta = (desiredRowAtMidY - anchorRow)
-                                                                            if (kotlin.math.abs(anchorDelta) >= 1f) {
-                                                                                viewModel.adjustScrollOffset(-anchorDelta)
-                                                                                // Pinch-zoom's re-anchor only runs
-                                                                                // from the !selectionActive branch
-                                                                                // of the two-finger gesture above,
-                                                                                // so there's normally nothing to
-                                                                                // preserve here - clear defensively
-                                                                                // in case a stray/degenerate
-                                                                                // selection is still around, same
-                                                                                // as free drag-to-pan below.
-                                                                                selectionState.clear()
-                                                                            }
-                                                                        }
+                                                                    // Compounds against runningZoomBaseSp
+                                                                    // (this gesture's own local var,
+                                                                    // seeded on first use below), NOT
+                                                                    // latestEffectiveTextSize.value directly
+                                                                    // - see that var's own doc above for why
+                                                                    // reading Compose state back mid-pinch
+                                                                    // raced recomposition and caused the
+                                                                    // bounce-back.
+                                                                    if (runningZoomBaseSp < 0f) {
+                                                                        runningZoomBaseSp = latestEffectiveTextSize.value
                                                                     }
+                                                                    val newSize = (runningZoomBaseSp * zoom)
+                                                                        .coerceIn(4f, 40f)
+                                                                    runningZoomBaseSp = newSize
+                                                                    // liveZoomSize is the ENTIRE mid-gesture
+                                                                    // story now: it's read with zero throttle
+                                                                    // on every single frame via
+                                                                    // effectiveTextSize (see that val's own
+                                                                    // doc) to draw a pure visual/canvas scale
+                                                                    // of the existing grid - no buffer mutation,
+                                                                    // no grid reshape, no scroll-offset change.
+                                                                    //
+                                                                    // This used to ALSO throttle-commit a REAL
+                                                                    // updateTerminalSize()/adjustScrollOffset()
+                                                                    // call roughly every 150ms while still
+                                                                    // pinching (deferIoctl=stillPinching skipped
+                                                                    // just the ioctl, but still ran
+                                                                    // buffer.resize() - which reshapes the grid,
+                                                                    // see TerminalSession.resize's own doc - and
+                                                                    // the anchor's adjustScrollOffset(-anchorDelta)
+                                                                    // EVERY tick). adjustScrollOffset is a real,
+                                                                    // cumulative mutation - firing it several
+                                                                    // times a second for the whole gesture, each
+                                                                    // call compounding on the last, is exactly
+                                                                    // what read as the cursor/screen creeping
+                                                                    // down during a pinch as if Enter were being
+                                                                    // pressed repeatedly ("zoom yaparken cursor
+                                                                    // durmadan asagi kayiyor").
+                                                                    //
+                                                                    // Now nothing here commits anything: no
+                                                                    // buffer resize, no scroll mutation, no
+                                                                    // per-tick coroutine, no throttle to reason
+                                                                    // about. The real resize - buffer.resize(),
+                                                                    // the ioctl, AND the anchor correction -
+                                                                    // happens exactly once, with no artificial
+                                                                    // delay, from the dedicated final-commit
+                                                                    // block below once fingers actually lift
+                                                                    // (the zoomedThisGesture block) - so there
+                                                                    // is nothing left to compound or race here.
+                                                                    liveZoomSize = newSize
+                                                                    zoomedThisGesture = true
+                                                                    isPinchZooming = true
                                                                 }
                                                             }
                                                         }
@@ -2512,6 +2563,100 @@ class MainActivity : ComponentActivity() {
                                                             primary.consume()
                                                         }
                                                         lastPos = primary.position
+                                                    }
+                                                }
+
+                                                // Fingers just dropped below 2 (or the gesture
+                                                // otherwise ended). Mid-pinch ticks no longer
+                                                // commit anything at all (see the pinch branch's
+                                                // own doc) - this is the ONE place the whole
+                                                // gesture's real work happens: buffer.resize(),
+                                                // the ioctl/SIGWINCH, and the scroll re-anchor,
+                                                // all in a single pass, with no throttle/delay.
+                                                // Without this, none of that ever fires, leaving
+                                                // the pty's idea of the window size (and the
+                                                // on-screen scroll position) permanently out of
+                                                // sync with what was actually pinched to, until
+                                                // some unrelated resize (rotation, IME) happens to
+                                                // trigger applyResize() later. Mirrors the
+                                                // identical post-loop fix in
+                                                // SplitTerminalPane.kt's runSplitPinchZoom - see
+                                                // its own doc. Gated on zoomedThisGesture (see its
+                                                // own doc above), NOT liveZoomSize != null - a
+                                                // plain drag/long-press/tap never sets
+                                                // zoomedThisGesture, so this stays a no-op for
+                                                // those.
+                                                // Termux-style commit: pinch-zoom only ever
+                                                // changed the FONT SIZE live (liveZoomSize,
+                                                // above) - it never touched the buffer/pty or
+                                                // scrollOffset while fingers were down, exactly
+                                                // like Termux's own onScale() (ScaleGestureDetector)
+                                                // only ever calls setTextSize()/invalidate()
+                                                // mid-gesture. Termux's TerminalView never runs
+                                                // any scroll-anchor correction at all, in
+                                                // onScale() OR onScaleEnd() - a resize (there,
+                                                // same as here) only changes how many rows/
+                                                // columns FIT on screen; it does not relocate
+                                                // what scrollOffset itself points at, so nothing
+                                                // needs to compensate scrollOffset for a resize.
+                                                // This codebase's own resize path already keeps
+                                                // that invariant too (TerminalBuffer.resize()
+                                                // does not touch scrollOffset - only the
+                                                // separate rowOffset/pendingResizeScrollLines
+                                                // machinery upstream does, whenever the grid
+                                                // shrinks and the caller chooses to read it) -
+                                                // so simply never reading
+                                                // consumePendingResizeScrollLines() from this
+                                                // pinch commit, and never running a second,
+                                                // independent midpoint-anchor correction on top
+                                                // of it, is what actually reproduces Termux's
+                                                // architecture here: one resize call, nothing
+                                                // else touches scroll position. This replaces
+                                                // the old pinchAnchorRow/pinchAnchorMidY/
+                                                // anchorDelta scroll-correction entirely (it was
+                                                // fighting the OTHER resize-driven correction in
+                                                // MainViewModel.updateTerminalSize for the exact
+                                                // same event - two independent "keep the view
+                                                // pointing at the same content" corrections
+                                                // stacking on one resize - which is what read as
+                                                // an extra unwanted scroll/"Enter" jump right as
+                                                // fingers lifted).
+                                                val committingSessionId = activeSessionId
+                                                if (zoomedThisGesture && committingSessionId != null) {
+                                                    zoomCommitJob?.cancel()
+                                                    zoomCommitJob = coroutineScope.launch {
+                                                        val finalCommitSize = liveZoomSize ?: latestEffectiveTextSize.value
+                                                        lastZoomCommitNanos = System.nanoTime()
+                                                        viewModel.setSessionTextSize(committingSessionId, finalCommitSize)
+                                                        val metricsPaint = android.graphics.Paint().apply {
+                                                            typeface = terminalTypeface
+                                                            this.textSize = finalCommitSize * density * fontScale
+                                                        }
+                                                        val charWidth = metricsPaint.measureText("M")
+                                                        val newCharHeight = metricsPaint.fontSpacing
+                                                        val finalSize = latestTerminalSize
+                                                        if (charWidth > 0f && newCharHeight > 0f && finalSize != null) {
+                                                            val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
+                                                            val rws = (finalSize.height / newCharHeight).toInt().coerceAtLeast(1)
+                                                            // false: this is the one, final,
+                                                            // post-lift-off commit for the whole
+                                                            // gesture - see TerminalSession.resize's
+                                                            // deferIoctl doc. Nothing else runs
+                                                            // after this - no anchor correction,
+                                                            // no scrollOffset read/write - same as
+                                                            // Termux's own onScaleEnd().
+                                                            viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height, deferIoctl = false)
+                                                        }
+                                                        // liveZoomSize cleared only after the real
+                                                        // buffer/pty resize above has landed - see
+                                                        // the ordering note further below on why
+                                                        // this can't happen any earlier.
+                                                        liveZoomSize = null
+                                                        // Only now, after the real resize has
+                                                        // landed, is it safe to let the cursor
+                                                        // show again - see isPinchZooming's own
+                                                        // doc above.
+                                                        isPinchZooming = false
                                                     }
                                                 }
 
@@ -2659,7 +2804,7 @@ class MainActivity : ComponentActivity() {
                                             // with both: cursor now stays visible through
                                             // keyboard open/close here too, same as split and
                                             // floating already did.
-                                            suppressCursor = liveZoomSize != null || isDraggingSplit,
+                                            suppressCursor = isPinchZooming || isDraggingSplit,
                                             bufferVersion = state.bufferVersion,
                                             // Only let the terminal's own background go
                                             // translucent when there's actually a wallpaper
@@ -3229,7 +3374,21 @@ class MainActivity : ComponentActivity() {
                                                 viewModel.setSplitRatio(state.splitRatio + deltaRatio)
                                             }
                                         },
-                                        onDragEnd = { isDraggingSplit = false }
+                                        onDragEnd = {
+                                            isDraggingSplit = false
+                                            // Final, non-deferred commit for the whole drag -
+                                            // same reasoning as MultiPaneContainer's own
+                                            // corner-handle onDragEnd: every tick during the
+                                            // drag above passed deferIoctl=true, so the pty
+                                            // never actually got notified (SIGWINCH) of any of
+                                            // them. Without this, the last few pixels of the
+                                            // drag - or the very last tick if the finger lifts
+                                            // right as it lands - could leave the pty's window
+                                            // size silently out of sync with what's on screen
+                                            // until some unrelated future resize catches it up.
+                                            resizeDebounceJob?.cancel()
+                                            applyResize()
+                                        }
                                     )
                                     SplitTerminalPane(
                                         modifier = Modifier
@@ -3474,8 +3633,8 @@ class MainActivity : ComponentActivity() {
                                         // buffer sized for the PRIMARY pane's width instead
                                         // of its own, which is what showed up as garbled/
                                         // clipped content confined to this pane specifically.
-                                        onResize = { cols, rows, pixelWidth, pixelHeight ->
-                                            viewModel.updateTerminalSizeFor(splitRuntimeId, cols, rows, pixelWidth, pixelHeight)
+                                        onResize = { cols, rows, pixelWidth, pixelHeight, deferIoctl ->
+                                            viewModel.updateTerminalSizeFor(splitRuntimeId, cols, rows, pixelWidth, pixelHeight, deferIoctl)
                                         }
                                     )
                                 }

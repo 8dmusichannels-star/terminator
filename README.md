@@ -4,11 +4,6 @@
 
 Terminator is a terminal emulator. It offers comprehensive terminal emulator support with multi-session support that you can directly customize and control. Its main purpose is a terminal emulation that can only be read by the user and is suitable for daily use. Its main difference from other terminal emulators is mostly in the interface area — it comes with embedded terminal colors and a completely compact interface. It does not offer a ready-made chroot/proot environment; setting up the terminal tool infrastructure and other work is left to the user. Its terminal environment and terminal user interface are modern. Supports Android.
 
-# Introduction and documentation
-
-[![Terminator Introduction and documentation Videos](https://img.youtube.com/vi/yHeOcjiUhXA/maxresdefault.jpg)](https://youtu.be/yHeOcjiUhXA)
-
-
 ## Features
 
 It comes with a Material user interface, supports all color mappings, and implements the terminal in its own color interface.
@@ -33,7 +28,7 @@ As for keyboards, both a soft keyboard (tap to open/close the terminal) and a vi
 - **Old workaround** — fixes Samsung keyboard echo; could break Gboard
 - **CJK input** — supported, but default is recommended
 
-12 types of terminal types are supported:
+3 types of terminal types are supported:
 
 - **NONE** — don't set `$TERM` at all; whatever the shell/exec environment already provides is left as-is
 - **xterm** — base xterm entry, no 256-color extension

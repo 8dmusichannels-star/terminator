@@ -313,6 +313,14 @@ class MainViewModel(
     // launch, before the first real layout pass).
     private var lastCommittedPixelWidth = 0
     private var lastCommittedPixelHeight = 0
+    // Tracks whether the LAST call to updateTerminalSize actually notified
+    // the pty (deferIoctl=false) or only resized the buffer/canvas
+    // (deferIoctl=true) - see the deferIoctl check in updateTerminalSize
+    // below for why this needs its own flag rather than being inferred
+    // from columns/rows/pixel size alone. Starts true (nothing has been
+    // deferred yet) so the very first call, before any pinch/drag has run,
+    // behaves exactly as it always did.
+    private var lastResizeWasDeferred = false
 
     // Persists/restores each session's last floating-mode pane geometry -
     // see PaneGeometryStore's own doc and PaneState's doc for why this is
@@ -327,6 +335,11 @@ class MainViewModel(
     // was last committed with - see updateTerminalSizeFor's own doc for
     // why cols/rows alone aren't enough to detect "nothing to resize".
     private val paneColumnsRows = mutableMapOf<String, IntArray>()
+    // Per-runtimeId version of lastResizeWasDeferred above - see its own
+    // doc. Each multi-pane tile drags/resizes independently, so this can't
+    // be a single shared flag the way paneColumnsRows itself isn't shared
+    // across tiles.
+    private val paneLastResizeWasDeferred = mutableMapOf<String, Boolean>()
 
     init {
         viewModelScope.launch {
@@ -1024,6 +1037,7 @@ class MainViewModel(
         liveSessions.remove(runtimeId)?.kill()
         liveEntries.remove(runtimeId)
         paneColumnsRows.remove(runtimeId)
+        paneLastResizeWasDeferred.remove(runtimeId)
         val wasPaned = _uiState.value.panes.any { it.runtimeId == runtimeId }
         _uiState.value = _uiState.value.copy(
             runningSessions = _uiState.value.runningSessions.filterNot { it.runtimeId == runtimeId },
@@ -1070,6 +1084,7 @@ class MainViewModel(
             liveSessions.remove(id)?.kill()
             liveEntries.remove(id)
             paneColumnsRows.remove(id)
+            paneLastResizeWasDeferred.remove(id)
         }
 
         _uiState.value = _uiState.value.copy(
@@ -1464,6 +1479,7 @@ class MainViewModel(
         liveSessions.remove(runtimeId)?.kill()
         liveEntries.remove(runtimeId)
         paneColumnsRows.remove(runtimeId)
+        paneLastResizeWasDeferred.remove(runtimeId)
         val state = _uiState.value
         val remaining = state.panes.filterNot { it.runtimeId == runtimeId }
         val nextFocused = if (state.focusedPaneRuntimeId == runtimeId) {
@@ -1928,7 +1944,7 @@ class MainViewModel(
      * keeps them legible when the IME or the virtual key bar covers part of
      * the screen and shrinks the visible terminal area.
      */
-    fun updateTerminalSize(newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    fun updateTerminalSize(newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
         if (newColumns <= 0 || newRows <= 0) return
         // Previously this early-returned whenever newColumns/newRows
         // matched the last-committed cols/rows, on the assumption that
@@ -1956,7 +1972,21 @@ class MainViewModel(
         // single call.
         val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
             (pixelWidth != lastCommittedPixelWidth || pixelHeight != lastCommittedPixelHeight)
-        if (newColumns == columns && newRows == rows && !pixelSizeChanged) return
+        // A pending deferred resize (mid-pinch, ioctl skipped) followed by
+        // this call finally settling with deferIoctl=false must NOT be
+        // treated as "nothing changed" just because cols/rows/pixel size
+        // already match what the deferred ticks silently wrote - none of
+        // those ticks ever actually reached the pty. Without this,
+        // returning early here left session.resize() (and therefore the
+        // real ioctl(TIOCSWINSZ)/SIGWINCH) never called at all once a
+        // pinch/drag settled back onto a size it had already reported
+        // while deferred - the on-screen buffer/canvas were already
+        // correct (deferred ticks resize those), but the pty itself (and
+        // anything reading its window size, e.g. top/COLUMNS) stayed
+        // pinned to whatever it was before the gesture started.
+        val deferredSettling = lastResizeWasDeferred && !deferIoctl
+        if (newColumns == columns && newRows == rows && !pixelSizeChanged && !deferredSettling) return
+        lastResizeWasDeferred = deferIoctl
         columns = newColumns
         rows = newRows
         if (pixelWidth > 0 && pixelHeight > 0) {
@@ -1980,7 +2010,7 @@ class MainViewModel(
         val splitRuntimeId = _uiState.value.splitRuntimeId
         liveSessions.forEach { (runtimeId, session) ->
             if (runtimeId != splitRuntimeId) {
-                session.resize(newColumns, newRows, pixelWidth, pixelHeight)
+                session.resize(newColumns, newRows, pixelWidth, pixelHeight, deferIoctl)
             }
         }
         // Compensate scrollOffset/splitScrollOffset for whichever of the
@@ -2030,7 +2060,7 @@ class MainViewModel(
      * to the now-single active session on its next measured layout pass,
      * same as it always has.
      */
-    fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0) {
+    fun updateTerminalSizeFor(runtimeId: String, newColumns: Int, newRows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
         if (newColumns <= 0 || newRows <= 0) return
         val current = paneColumnsRows[runtimeId]
         // Same "cell count alone isn't enough" fix as updateTerminalSize's
@@ -2043,9 +2073,18 @@ class MainViewModel(
         // Canvas's new font size.
         val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
             (current == null || current.size < 4 || pixelWidth != current[2] || pixelHeight != current[3])
-        if (current != null && current[0] == newColumns && current[1] == newRows && !pixelSizeChanged) return
+        // Same deferred-settling exception as updateTerminalSize's own doc
+        // explains - a manual corner-drag on a floating pane defers every
+        // mid-drag tick's ioctl, and the final settle commit (deferIoctl=
+        // false) must still reach session.resize() even when it lands on
+        // cols/rows/pixel size a deferred tick already silently recorded,
+        // or that tile's pty never actually gets notified of the drag at
+        // all.
+        val deferredSettling = paneLastResizeWasDeferred[runtimeId] == true && !deferIoctl
+        if (current != null && current[0] == newColumns && current[1] == newRows && !pixelSizeChanged && !deferredSettling) return
+        paneLastResizeWasDeferred[runtimeId] = deferIoctl
         paneColumnsRows[runtimeId] = intArrayOf(newColumns, newRows, pixelWidth, pixelHeight)
-        liveSessions[runtimeId]?.resize(newColumns, newRows, pixelWidth, pixelHeight)
+        liveSessions[runtimeId]?.resize(newColumns, newRows, pixelWidth, pixelHeight, deferIoctl)
         bumpVersion()
     }
 

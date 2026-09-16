@@ -567,21 +567,44 @@ class TerminalSession(
      * ncurses builds) need these to be non-zero to lay out correctly;
      * everything else ignores them.
      *
-     * [deferIoctl]: true means "still mid-gesture" - buffer.resize() (and
-     * the whole onBufferResized()/cellHeightPx follow-up) still runs, so
-     * the visible grid and drawn font size stay in sync frame-to-frame
-     * (this is what keeps a continuous pinch-zoom from showing a growing
-     * black gap - see MainActivity's applyResize/zoomCommitJob docs), but
-     * the actual ioctl(TIOCSWINSZ) call - and the SIGWINCH it raises in
-     * whatever's running - is skipped. A pinch that changes columns/rows
-     * on nearly every ~150ms throttled tick was previously raising
-     * SIGWINCH that same number of times per second for the ENTIRE
-     * gesture; ncurses full-screen apps (btop chief among them) redraw
-     * their whole screen from scratch on every SIGWINCH, so a several-
-     * second pinch fired several dozen full btop redraws back to back -
-     * "zoom bug'ı tum screenlerde ... btop gibi uygulamalar glitch
-     * oluyor" was this SIGWINCH storm, not a rendering bug in btop
-     * itself or in this app's own grid math (both already correct).
+     * [deferIoctl]: true means "still mid-gesture". This used to also mean
+     * "still run buffer.resize() every tick" (only the ioctl/SIGWINCH was
+     * skipped) - that was wrong and is the ACTUAL cause of vim/nano/htop
+     * corruption during a pinch ("vim'e rastgele karakter basılmış gibi",
+     * nano bozulması, htop bozuk çıktı), not the SIGWINCH storm the old
+     * version of this doc blamed. buffer.resize() is not cosmetic: it
+     * mutates cursorRow, pushes rows into scrollback, remaps the grid -
+     * i.e. it changes what (row, col) a cell actually lands on. A
+     * full-screen program like vim draws by sending ABSOLUTE cursor-
+     * position escapes (e.g. "move to row 12 col 40") for whatever size
+     * IT last learned via SIGWINCH/ioctl(TIOCGWINSZ) - which, precisely
+     * because deferIoctl skips the ioctl mid-gesture, stays frozen at the
+     * pre-pinch size for the program's entire duration. If buffer.resize()
+     * ALSO kept running every ~150ms tick underneath it, the two sides
+     * disagree about the grid's shape for the whole gesture: vim keeps
+     * addressing cell (12, 40) against its own frozen 80x24 idea of the
+     * screen while the buffer underneath has already reshaped itself to
+     * 76x22 (or whatever that tick's size is) - so that same escape lands
+     * on a genuinely different cell than vim intended, on every single
+     * tick. That misplacement is exactly what read as stray characters
+     * appearing in vim, nano's display tearing, and htop's output
+     * scrambling - not a rendering bug in any of those programs, and not
+     * SIGWINCH frequency either.
+     *
+     * So now, while deferred, buffer.resize()/onBufferResized() are
+     * skipped entirely - the grid's actual shape does not change - and
+     * only cellHeightPx (pure display metric, doesn't move any cell) is
+     * updated so the drawn glyph size stays in sync frame-to-frame. This
+     * does mean a live pinch preview no longer reflows the live grid on
+     * every tick; MainActivity's caller is expected to draw the
+     * intermediate zoom visually (scaling the existing canvas) rather
+     * than relying on the buffer itself changing shape mid-gesture - see
+     * its own liveZoomSize/applyResize docs. The real grid resize, like
+     * the real ioctl, now happens exactly once, on the final deferIoctl =
+     * false call once fingers lift, at which point vim's own SIGWINCH-
+     * triggered redraw and the buffer's new shape land together instead
+     * of racing each other for the gesture's whole duration.
+     *
      * lastAppliedColumns/Rows is intentionally left UNCHANGED while
      * deferred, so the final post-gesture resize() call (deferIoctl =
      * false, from the pinch's own trailing commit or any other caller)
@@ -590,9 +613,17 @@ class TerminalSession(
      * once for the whole gesture.
      */
     fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
-        buffer.resize(columns, rows)
+        // See this function's own doc: buffer.resize() actually reshapes
+        // the grid (cursor row, scrollback, cell mapping), so it must stay
+        // in lockstep with the ioctl/SIGWINCH that tells the running
+        // program the SAME new shape - never run ahead of it mid-gesture.
+        if (!deferIoctl) {
+            buffer.resize(columns, rows)
+            if (::emulator.isInitialized) {
+                emulator.onBufferResized()
+            }
+        }
         if (::emulator.isInitialized) {
-            emulator.onBufferResized()
             // Keeps emulator.cellHeightPx (used only to size a natural-size
             // Sixel/Kitty image's cursor-advance in rows - see its own doc)
             // in sync with the view's real layout. rows > 0 guard avoids a
@@ -601,6 +632,8 @@ class TerminalSession(
             // never wires pixel size in at all) leaves cellHeightPx at 0,
             // which imageRowSpan already treats as "unknown, use the old
             // single-line fallback" - so this is never worse than before.
+            // Runs regardless of deferIoctl - this is a pure display metric,
+            // not a grid mutation, so it's safe (and desired) every tick.
             if (pixelHeight > 0 && rows > 0) {
                 emulator.cellHeightPx = pixelHeight / rows
             }

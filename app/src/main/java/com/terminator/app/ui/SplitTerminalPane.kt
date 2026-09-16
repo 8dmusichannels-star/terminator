@@ -105,7 +105,18 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
     latestFontSize: androidx.compose.runtime.State<Float>,
     coroutineScope: kotlinx.coroutines.CoroutineScope,
     onLiveZoom: (Float?) -> Unit,
-    onCommitZoom: ((Float) -> Unit)?,
+    // Separate from onLiveZoom on purpose - onLiveZoom(null) still has to
+    // fire on every throttled mid-pinch commit (see the call site below)
+    // because effectivePaneFontSize genuinely needs to drop back to the
+    // committed value between ticks; it does NOT mean the pinch itself
+    // ended. suppressCursor needs a signal that stays true for the WHOLE
+    // gesture (first pinch frame through actual finger lift-off),
+    // independent of that per-tick nulling - same fix as MainActivity's
+    // own isPinchZooming flag, applied here via a caller-owned callback
+    // instead of a caller-owned var so this function can still flip it
+    // exactly where the pinch is known to be starting/ending.
+    onPinchActiveChanged: (Boolean) -> Unit,
+    onCommitZoom: ((Float, Boolean) -> Unit)?,
     setZoomCommitJob: (Job?) -> Unit,
     cancelPendingZoomCommit: () -> Unit
 ) {
@@ -132,6 +143,29 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
     // normal debounce once more - a negligible edge case next to the
     // problem this fixes.
     var lastCommitNanos = 0L
+    // Running zoom base for this one continuous pinch gesture, read/
+    // written ONLY as this local var for every frame below - NOT via
+    // latestFontSize.value repeatedly. latestFontSize is a
+    // rememberUpdatedState the caller passes in; its .value only updates
+    // on the caller's NEXT recomposition, which Compose schedules
+    // asynchronously - not guaranteed to land before this same suspend
+    // function's next loop iteration resumes with another raw pinch
+    // frame. A fast continuous pinch delivers several pointer-move frames
+    // back to back well within a single recomposition pass, so each of
+    // those frames kept reading the SAME stale latestFontSize.value (from
+    // before this gesture even started calling onLiveZoom) and
+    // multiplying its own zoom ratio against that same stale base instead
+    // of compounding against the previous frame's own onLiveZoom(newSize)
+    // - a burst like that overshoots, then the instant the caller's
+    // recomposition finally catches up and latestFontSize.value reflects
+    // it, the next frame's zoom lands against the now-correct base and
+    // the size snaps hard back - exactly the "zoom yaparken geri tepiyor"
+    // bounce. Seeded once here, at function entry (this function is
+    // entered fresh at the start of every pinch gesture - see both call
+    // sites - so a single one-time read of latestFontSize.value here is
+    // safe, before this gesture has written anything back through
+    // onLiveZoom yet), then every frame below reads and updates only this.
+    var runningFontSizeSp = latestFontSize.value
     while (true) {
         val changes = lastEvent.changes.filter { it.pressed }
         if (changes.size < 2) break // back down to one finger (or zero) - pinch is over
@@ -149,8 +183,21 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
                     // fingers stopped moving ("uzaklaştırma az"). Below ~4f
                     // the glyphs themselves become unmeasurable/illegible at
                     // most device densities, so this isn't pushed further.
-                    val newSize = (latestFontSize.value * zoom).coerceIn(4f, 40f)
+                    //
+                    // Compounds against runningFontSizeSp (this gesture's
+                    // own local var above), NOT latestFontSize.value - see
+                    // that var's own doc for why reading the caller's
+                    // Compose state back mid-loop raced recomposition and
+                    // caused the bounce-back.
+                    val newSize = (runningFontSizeSp * zoom).coerceIn(4f, 40f)
+                    runningFontSizeSp = newSize
                     onLiveZoom(newSize)
+                    // Marks the pinch as active from its very first frame.
+                    // Safe to call on every tick (not just the first) -
+                    // the caller's flag is a plain Compose var, so
+                    // redundantly setting it true again each frame is a
+                    // no-op recomposition-wise once it's already true.
+                    onPinchActiveChanged(true)
                     cancelPendingZoomCommit()
                     // Same fix as MainActivity's own primary-pane pinch
                     // branch (see its inline doc): cancelling and
@@ -171,12 +218,34 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
                     // below, still reset every frame) still guarantees the
                     // exact final size once the gesture settles.
                     val throttleElapsed = System.nanoTime() - lastCommitNanos >= 150_000_000L
+                    // Snapshotted HERE, at the moment this tick's commit is
+                    // scheduled - changes.size is this loop's own local
+                    // (re-read fresh at the top of every iteration), not a
+                    // shared var read later from inside the launched
+                    // coroutine, so this can't drift the way a captured
+                    // mutable var would. true means fingers are still down
+                    // on the CURRENT tick - passed through as deferIoctl so
+                    // this ~150ms-throttled intermediate resize keeps the
+                    // buffer/canvas in sync (no black-gap) without also
+                    // firing ioctl(TIOCSWINSZ)/SIGWINCH on every tick - see
+                    // TerminalSession.resize's deferIoctl doc and
+                    // MainActivity's identical primary-pane fix. Only the
+                    // final tick, scheduled after this loop has already
+                    // broken out because fingers lifted, passes false.
+                    val stillPinching = changes.size >= 2
                     setZoomCommitJob(
                         coroutineScope.launch {
                             if (!throttleElapsed) delay(150)
                             lastCommitNanos = System.nanoTime()
-                            onCommitZoom?.invoke(newSize)
+                            onCommitZoom?.invoke(newSize, stillPinching)
                             onLiveZoom(null)
+                            // Deliberately NOT calling onPinchActiveChanged(false)
+                            // here - this is the same mid-gesture throttled tick
+                            // that races liveZoomSize's own nulling (see
+                            // MainActivity's identical fix). Fingers can still be
+                            // down when this fires; onPinchActiveChanged(false) is
+                            // only correct once the loop below has actually
+                            // observed fewer than 2 pressed pointers.
                         }
                     )
                 }
@@ -186,6 +255,26 @@ private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.run
         event.changes.forEach { it.consume() }
         lastEvent = event
     }
+    // Fingers just dropped below 2 - the gesture itself is over. Every
+    // commit scheduled from inside the loop above was captured with
+    // stillPinching = true (deferIoctl), since by definition the loop
+    // only reaches that scheduling point while 2+ fingers are still
+    // down - so none of them ever actually notified the pty. Schedule
+    // one last, non-deferred commit now so the real ioctl(TIOCSWINSZ)
+    // fires exactly once, right after the gesture settles, instead of
+    // never firing at all.
+    cancelPendingZoomCommit()
+    setZoomCommitJob(
+        coroutineScope.launch {
+            onCommitZoom?.invoke(latestFontSize.value, false)
+            onLiveZoom(null)
+            // Real end of the gesture (fingers have actually lifted, loop
+            // above already broke out) - safe to clear the cursor-suppress
+            // flag now, same placement as MainActivity's own isPinchZooming
+            // = false right after its final commit.
+            onPinchActiveChanged(false)
+        }
+    )
 }
 
 /**
@@ -458,7 +547,7 @@ fun SplitTerminalPane(
     // per-runtime path MultiPaneContainer's own tiles already use. Defaults
     // to a no-op so any other existing caller of this composable keeps
     // today's behavior unchanged.
-    onResize: (cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit = { _, _, _, _ -> },
+    onResize: (cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int, deferIoctl: Boolean) -> Unit = { _, _, _, _, _ -> },
     // Settings > Terminal Behaviour > Allow custom app schemes - same flag
     // MultiPaneContainer threads down to its own tiles' TerminalView calls.
     // Gates whether hyperlink taps outside DEFAULT_ALLOWED_HYPERLINK_SCHEMES
@@ -728,6 +817,15 @@ fun SplitTerminalPane(
                     // touch-to-cell math would use stale metrics for the
                     // duration of a pinch.
                     var liveZoomSize by remember(runtimeId) { mutableStateOf<Float?>(null) }
+                    // Stays true for the WHOLE pinch gesture (first frame
+                    // through real finger lift-off), unlike liveZoomSize
+                    // which the throttled mid-pinch commit above nulls out
+                    // every ~150ms - see runSplitPinchZoom's
+                    // onPinchActiveChanged doc. suppressCursor below reads
+                    // THIS, not liveZoomSize != null, to avoid the same
+                    // "cursor pops visible mid-pinch, reads as Enter was
+                    // pressed" flicker MainActivity's primary pane had.
+                    var isPinchZooming by remember(runtimeId) { mutableStateOf(false) }
                     var zoomCommitJob by remember { mutableStateOf<Job?>(null) }
                     val effectivePaneFontSize = liveZoomSize ?: fontSizeSp
                     // Gesture below is keyed only on runtimeId (not fontSizeSp/
@@ -799,6 +897,30 @@ fun SplitTerminalPane(
                     var paneResizeDebounceJob by remember(runtimeId) { mutableStateOf<Job?>(null) }
                     var latestPaneSizePx by remember(runtimeId) { mutableStateOf<IntSize?>(null) }
                     var paneHasSizedOnce by remember(runtimeId) { mutableStateOf(false) }
+                    // Fires the one final, non-deferred commit for this pane's own
+                    // Box once a split-divider drag ends (suppressCursorExtra
+                    // false->true->false transition - MainActivity passes
+                    // isDraggingSplit through this param). This pane's own
+                    // onSizeChanged above defers every mid-drag tick's ioctl
+                    // (deferIoctl=true) while suppressCursorExtra is true, so its
+                    // own paneColumnsRows entry never actually reaches the pty
+                    // until something fires one last deferIoctl=false call -
+                    // MainActivity's own onDragEnd only calls ITS applyResize(),
+                    // which only reaches the PRIMARY pane's session, so without
+                    // this the split pane's pty stayed silently out of sync with
+                    // its true on-screen size after every divider drag.
+                    LaunchedEffect(suppressCursorExtra) {
+                        if (!suppressCursorExtra && paneHasSizedOnce) {
+                            paneResizeDebounceJob?.cancel()
+                            val (cw, ch) = latestCharMetrics.value
+                            val finalSize = latestPaneSizePx
+                            if (cw > 0f && ch > 0f && finalSize != null) {
+                                val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
+                                val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
+                                onResize(cols, rws, finalSize.width, finalSize.height, false)
+                            }
+                        }
+                    }
                     // Wraps onZoomTextSize (which only persists the new font
                     // size via viewModel.setSessionTextSize - see MainActivity's
                     // own onZoomTextSize doc) with the same cols/rows resize
@@ -820,7 +942,7 @@ fun SplitTerminalPane(
                     // a pinch-driven resize and an onSizeChanged-driven one
                     // can never race each other into two different final
                     // sizes.
-                    val commitZoomAndResize: (Float) -> Unit = { newSize ->
+                    val commitZoomAndResize: (Float, Boolean) -> Unit = { newSize, deferIoctl ->
                         onZoomTextSize?.invoke(newSize)
                         paneResizeDebounceJob?.cancel()
                         paneResizeDebounceJob = paneCoroutineScope.launch {
@@ -845,7 +967,7 @@ fun SplitTerminalPane(
                             if (cw > 0f && ch > 0f && finalSize != null) {
                                 val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
                                 val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
-                                onResize(cols, rws, finalSize.width, finalSize.height)
+                                onResize(cols, rws, finalSize.width, finalSize.height, deferIoctl)
                             }
                         }
                     }
@@ -864,6 +986,32 @@ fun SplitTerminalPane(
                                 val sizeActuallyChanged = paneHasSizedOnce && sizePx != latestPaneSizePx
                                 latestPaneSizePx = sizePx
                                 paneHasSizedOnce = true
+                                // Same immediate-commit fix as MainActivity's own primary-
+                                // pane onSizeChanged (see its own doc): while the divider
+                                // is being dragged (suppressCursorExtra - MainActivity
+                                // passes isDraggingSplit through this param), a genuine
+                                // size delta fires on nearly every drag frame, which kept
+                                // cancelling and restarting this SAME 120ms timer before it
+                                // could ever run uninterrupted - this pane's grid stayed
+                                // pinned at its pre-drag column/row count for the entire
+                                // visible length of the drag, only catching up once the
+                                // finger actually stopped moving. Committing on every tick
+                                // (deferIoctl=true) keeps buffer.rows/columns matched to
+                                // this Box's real pixel size throughout instead of only
+                                // once it settles - MainActivity's own onDragEnd fires the
+                                // one final, non-deferred commit once the drag actually
+                                // ends (same paneColumnsRows/deferredSettling mechanism
+                                // MultiPaneContainer's corner-drag already relies on).
+                                if (suppressCursorExtra) {
+                                    paneResizeDebounceJob?.cancel()
+                                    val (cw, ch) = latestCharMetrics.value
+                                    if (cw > 0f && ch > 0f) {
+                                        val cols = (sizePx.width / cw).toInt().coerceAtLeast(1)
+                                        val rws = (sizePx.height / ch).toInt().coerceAtLeast(1)
+                                        onResize(cols, rws, sizePx.width, sizePx.height, true)
+                                    }
+                                    return@onSizeChanged
+                                }
                                 if (sizeActuallyChanged || paneResizeDebounceJob == null) {
                                     paneResizeDebounceJob?.cancel()
                                     paneResizeDebounceJob = paneCoroutineScope.launch {
@@ -873,7 +1021,11 @@ fun SplitTerminalPane(
                                         if (cw > 0f && ch > 0f && finalSize != null) {
                                             val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
                                             val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
-                                            onResize(cols, rws, finalSize.width, finalSize.height)
+                                            // Not a pinch gesture - a plain layout/size change
+                                            // (rotation, IME, divider drag settling), so the
+                                            // real ioctl should fire right away, same as
+                                            // always.
+                                            onResize(cols, rws, finalSize.width, finalSize.height, false)
                                         }
                                     }
                                 }
@@ -1130,6 +1282,7 @@ fun SplitTerminalPane(
                                                     latestFontSize = latestEffectivePaneFontSize,
                                                     coroutineScope = paneCoroutineScope,
                                                     onLiveZoom = { liveZoomSize = it },
+                                                    onPinchActiveChanged = { isPinchZooming = it },
                                                     onCommitZoom = commitZoomAndResize,
                                                     setZoomCommitJob = { zoomCommitJob = it },
                                                     cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
@@ -1244,6 +1397,7 @@ fun SplitTerminalPane(
                                                         latestFontSize = latestEffectivePaneFontSize,
                                                         coroutineScope = paneCoroutineScope,
                                                         onLiveZoom = { liveZoomSize = it },
+                                                        onPinchActiveChanged = { isPinchZooming = it },
                                                         onCommitZoom = commitZoomAndResize,
                                                         setZoomCommitJob = { zoomCommitJob = it },
                                                         cancelPendingZoomCommit = { zoomCommitJob?.cancel() }
@@ -1360,17 +1514,25 @@ fun SplitTerminalPane(
                             palette = palette,
                             fontFamily = fontFamily,
                             fontSizeSp = effectivePaneFontSize,
-                            // liveZoomSize != null: this pane is mid pinch-zoom, rendering
-                            // at a live preview size not yet committed via buffer.resize() -
-                            // see TerminalView's own suppressCursor doc / MainActivity's
-                            // identical wiring for why the block cursor has to sit out
-                            // these frames (otherwise it detaches from the real grid at
-                            // the new scale - "imleç beyaz kalıyor" bug).
+                            // isPinchZooming (NOT liveZoomSize != null): this pane is mid
+                            // pinch-zoom, rendering at a live preview size not yet
+                            // committed via buffer.resize() - see TerminalView's own
+                            // suppressCursor doc / MainActivity's identical wiring for why
+                            // the block cursor has to sit out these frames (otherwise it
+                            // detaches from the real grid at the new scale - "imleç beyaz
+                            // kalıyor" bug). liveZoomSize itself gets nulled by every
+                            // ~150ms throttled mid-pinch commit (see runSplitPinchZoom)
+                            // even while fingers are still down, which made
+                            // liveZoomSize != null flip false for one recomposition frame
+                            // on every tick - cursor popping visible right as the
+                            // SIGWINCH/redraw from that same commit landed, reading as an
+                            // Enter-press jump. isPinchZooming stays true for the whole
+                            // gesture instead, exactly mirroring MainActivity's fix.
                             // suppressCursorExtra: caller-supplied (MainActivity passes
                             // true while the split divider is being dragged) - see this
                             // param's own doc above for why the divider drag needed the
                             // same treatment as pinch-zoom.
-                            suppressCursor = liveZoomSize != null || suppressCursorExtra,
+                            suppressCursor = isPinchZooming || suppressCursorExtra,
                             bufferVersion = bufferVersion,
                             backgroundAlpha = 1f,
                             scrollOffset = scrollOffset,

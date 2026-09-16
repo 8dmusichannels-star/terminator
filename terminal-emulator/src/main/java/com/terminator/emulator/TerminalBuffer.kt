@@ -1682,6 +1682,33 @@ class TerminalBuffer(
 
     /** Resizes the grid, preserving existing content where possible. */
     fun resize(newColumns: Int, newRows: Int) = lock.withLock {
+        // No-op guard, same as Termux's own TerminalEmulator.resize()
+        // ("if (mRows == rows && mColumns == columns) return;" - checked
+        // BEFORE that resize() ever reaches its own TerminalBuffer.resize()
+        // call). Every caller here (TerminalSession.resize(), see its own
+        // doc) already skips the pty ioctl/SIGWINCH when columns/rows
+        // haven't changed, but until now nothing skipped THIS function
+        // itself - cursorRow's own rowOffset math below runs unconditionally
+        // on every call, even when newColumns/newRows are byte-for-byte
+        // identical to the CURRENT columns/rows. A live pinch-zoom commit
+        // (or any other caller that resizes on a timer/every frame rather
+        // than only on a genuine size change) can call this dozens of times
+        // with the SAME grid size in a row - measuring 24 rows against 24
+        // rows every 32ms, say - each of those redundant calls still ran
+        // the full rowOffset/scrollback-push logic and reassigned
+        // `cursorRow = (cursorRow - rowOffset).coerceIn(0, rows - 1)` as if
+        // a real shrink had just happened. Once the cursor's row is close
+        // enough to the bottom that ANY of those redundant "resizes" trips
+        // the `cursorRow + 1 - newRows > 0` branch (a coercion artifact of
+        // repeatedly reconfirming the exact same rows value), it gets
+        // clamped to `newRows - 1` and stays there - the cursor "always
+        // drops to the bottom line" bug reported after enabling live-pinch
+        // resize commits. A real caller that intentionally wants to redo
+        // this same-size resize (there isn't one today, but a future one
+        // might legitimately want to reprocess something) can still do so
+        // by changing columns or rows by even one and back; this guard only
+        // ever skips a call that would have been a complete no-op anyway.
+        if (newColumns == columns && newRows == rows) return@withLock
         val oldColumns = columns
         // A COLUMN change genuinely invalidates a placed image's anchor:
         // text reflows around it differently, and there's no meaningful
