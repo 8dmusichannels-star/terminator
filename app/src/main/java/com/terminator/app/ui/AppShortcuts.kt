@@ -75,7 +75,17 @@ enum class AppAction(val label: String, val group: String) {
     // sends OSC 133 marks, or there's no prompt further in that direction
     // yet.
     JUMP_TO_PREVIOUS_COMMAND("Jump to previous command", "Navigation"),
-    JUMP_TO_NEXT_COMMAND("Jump to next command", "Navigation");
+    JUMP_TO_NEXT_COMMAND("Jump to next command", "Navigation"),
+
+    // Zoom (font size) - same target resolution and 4f/40f clamp
+    // pinch-to-zoom already uses (see MainActivity's stepZoom), just
+    // reachable from a physical-keyboard combo instead of a two-finger
+    // gesture. Not bound to Ctrl +/-/0 by default here - the keymapper
+    // editor's picker UI is where a user assigns the actual combo, same
+    // as every other AppAction in this enum.
+    ZOOM_IN("Zoom in (increase text size)", "Appearance"),
+    ZOOM_OUT("Zoom out (decrease text size)", "Appearance"),
+    ZOOM_RESET("Reset zoom to default text size", "Appearance");
 
     companion object {
         fun groupsInOrder(): List<String> =
@@ -243,5 +253,9 @@ fun AppAction.execute(viewModel: MainViewModel, routing: PhysicalKeyboardRouting
                 else MainViewModel.JumpTarget.Primary
             viewModel.jumpToAdjacentPrompt(forward = true, target = target)
         }
+
+        AppAction.ZOOM_IN -> routing.zoomIn?.invoke()
+        AppAction.ZOOM_OUT -> routing.zoomOut?.invoke()
+        AppAction.ZOOM_RESET -> routing.zoomReset?.invoke()
     }
 }

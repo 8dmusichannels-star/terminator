@@ -5119,6 +5119,22 @@ class TerminalEmulator(
         // that already-correct value with the old one on every column
         // resize, the exact same bug the cursorRow fix above addresses.
         cursorCol = buffer.cursorCol.coerceIn(0, buffer.columns - 1)
+        // Same stale-field hazard as cursorRow above, for the DECSC/DECRC
+        // saved cursor (ESC 7 / ESC 8, CSI s / CSI u): buffer.resize() moves
+        // the on-screen content (a shrink pushes the top rows into
+        // scrollback) and shifted its OWN separate savedCursorRow for that,
+        // but this class's savedCursorRow - the one ESC 8 actually restores -
+        // was never touched, so it kept pointing at the PRE-resize row. The
+        // next restore then put the cursor that many rows BELOW the line it
+        // had been saved on, i.e. the cursor "dropping like a newline" right
+        // after a pinch-zoom/keyboard resize. Older releases never shifted
+        // content on resize (rows were just cropped/padded in place), so a
+        // saved row couldn't go stale that way. Apply the same net shift
+        // resize() applied (see TerminalBuffer.pendingResizeRowShift).
+        val resizeRowShift = buffer.consumeResizeRowShift()
+        if (resizeRowShift != 0) {
+            savedCursorRow = (savedCursorRow + resizeRowShift).coerceIn(0, (buffer.rows - 1).coerceAtLeast(0))
+        }
         // DECSLRM margins were computed against the PRE-resize column
         // count too (same staleness hazard tabStops' own doc describes) -
         // clamp scrollRight into the new width and, if that collapses the

@@ -328,6 +328,50 @@ class TerminalBuffer(
         CursorSnapshot(cursorRow, cursorCol, rows, columns, cursorVisible, cursorStyle)
     }
 
+    /**
+     * The entire visible [rows] x [columns] grid at [scrollOffset], read
+     * under [lock] in ONE critical section - the screen-wide counterpart
+     * to [cursorSnapshot]'s own per-field fix, for the exact same reason.
+     * TerminalView's draw pass used to call [lineAt] once PER CELL (up to
+     * rows*columns separate lock/unlock pairs for a single frame), which
+     * only ever guaranteed each individual cell was internally consistent -
+     * nothing stopped a pty-output write from landing on grid row 12 in
+     * between this draw pass finishing row 11 and starting row 13, so a
+     * single painted frame could freely mix a "before" state on some rows
+     * with an "after" state on others. That is real screen tearing, not a
+     * cosmetic glitch - most visible on a full-screen TUI app that redraws
+     * its ENTIRE screen every refresh (htop, top, less) rather than the
+     * handful of lines a shell prompt usually touches, because those are
+     * exactly the redraws most likely to have a pty write land mid-frame:
+     * "htop tarzi uygulamalarda ... hem tearing hemde sharping". Returning
+     * the whole grid as one immutable List<List<Cell>> snapshot, built
+     * entirely inside a single lock.withLock the same way rowPlainText/
+     * lastNonBlankColumn already read multiple cells under one lock call
+     * (the ReentrantLock is reentrant, so calling cellAt/lineAt again from
+     * inside this same lock is safe - same pattern those two already use),
+     * means a torn mid-write frame is no longer possible: the draw pass
+     * either sees every row from strictly before a given pty write or
+     * every row from strictly after it, never a mix, because nothing else
+     * can touch the grid while this method holds the lock.
+     */
+    fun snapshotVisibleGrid(scrollOffset: Int): List<List<Cell>> = lock.withLock {
+        if (scrollOffset <= 0) {
+            return@withLock (0 until rows).map { row -> (0 until columns).map { col -> cellAt(row, col) } }
+        }
+        val totalScrollback = scrollback.size
+        val scrollbackRowsShown = scrollOffset.coerceAtMost(totalScrollback)
+        (0 until rows).map { row ->
+            if (row < scrollbackRowsShown) {
+                val idx = totalScrollback - scrollbackRowsShown + row
+                val scrollbackRow = scrollback.getOrNull(idx)
+                (0 until columns).map { col -> scrollbackRow?.getOrNull(col) ?: Cell() }
+            } else {
+                val gridRow = row - scrollbackRowsShown
+                (0 until columns).map { col -> cellAt(gridRow, col) }
+            }
+        }
+    }
+
     // Visible screen grid: rows x columns
     private var grid: Array<Array<Cell>> = Array(rows) { Array(columns) { Cell() } }
 
@@ -1187,6 +1231,32 @@ class TerminalBuffer(
         return n
     }
 
+    // Net rows the on-screen CONTENT has moved DOWN (negative = up) because of
+    // resize() since the last consumeResizeRowShift() call. Its own counter -
+    // NOT pendingScrollLines/consumePendingResizeScrollLines(): those two are
+    // drained by the view/selection code, and a second consumer sharing them
+    // would silently steal its share.
+    //
+    // Exists for TerminalEmulator.onBufferResized(): the emulator keeps its
+    // OWN DECSC/DECRC (ESC 7 / ESC 8, CSI s / CSI u) saved cursor row, and
+    // resize() only ever shifted THIS class's separate savedCursorRow. On a
+    // shrink the content moves up by rowOffset (top rows go to scrollback),
+    // so an ESC 8 restoring the emulator's un-shifted row put the cursor
+    // rowOffset rows BELOW where the content it had saved actually sits - the
+    // cursor "dropping like a newline". Older releases never shifted content
+    // on a resize (rows were just cropped/padded in place), so a saved row
+    // could never go stale that way. Accumulated (+=) rather than assigned,
+    // so two resizes landing before the emulator syncs still net out.
+    private var pendingResizeRowShift: Int = 0
+
+    /** Returns and clears [pendingResizeRowShift]. Deliberately lock-free,
+     *  same as [consumePendingScrollLines] above. */
+    fun consumeResizeRowShift(): Int {
+        val n = pendingResizeRowShift
+        pendingResizeRowShift = 0
+        return n
+    }
+
     // Counts rows resize() has pushed into scrollback (rowOffset, the same
     // value folded into pendingScrollLines above) since the last
     // consumePendingResizeScrollLines() call - kept as its OWN separate
@@ -1950,6 +2020,9 @@ class TerminalBuffer(
         if (rowOffset > 0) {
             savedCursorRow = (savedCursorRow - rowOffset).coerceIn(0, rows - 1)
         }
+        // Same shift, handed to the emulator for ITS saved cursor - see
+        // pendingResizeRowShift's doc.
+        pendingResizeRowShift += totalTopPadding - rowOffset
         // Same "content moved under a fixed (row, scrollOffset) pair"
         // situation consumePendingScrollLines()'s doc describes for
         // scrollUp() - a resize shifts every row's content up by

@@ -18,6 +18,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 package com.terminator.app.ui
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.IntrinsicSize
@@ -579,6 +580,15 @@ fun MoreActionsPopup(
     onDismiss: () -> Unit
 ) {
     if (!visible) return
+    // BACK used to be handled for free by PopupProperties(focusable = true)
+    // (a focusable Popup's own onDismissRequest fires on BACK as well as
+    // outside-tap). Explicit BackHandler here replaces that half of it now
+    // that the Popup below is focusable = false - see that property's own
+    // doc for why. enabled = visible rather than always-on: this composable
+    // is only actually in the tree while visible is true anyway (the early
+    // return above), but matching the tree lifetime explicitly is cheap
+    // insurance against this ever being hoisted differently later.
+    BackHandler(enabled = visible, onBack = onDismiss)
     Popup(
         // Was alignment = Alignment.TopCenter - Compose's alignment-based
         // Popup overload only ever centers against the anchor Box (same
@@ -596,7 +606,28 @@ fun MoreActionsPopup(
         // call site always used and only ADDS the final clamp into
         // [0, windowSize] on both axes.
         popupPositionProvider = remember { WindowClampedPositionProvider(Alignment.TopCenter) },
-        properties = PopupProperties(focusable = true),
+        // Was PopupProperties(focusable = true). A focusable Popup's window
+        // takes real window-focus away from the activity while it's open,
+        // and Android/Compose don't leave that focus unclaimed when the
+        // Popup's window goes away on dismiss - same "clearFocus() doesn't
+        // leave focus empty, it hands it to the next focusable node"
+        // platform behavior VirtualKeyBar's own textEntryOpen effect
+        // documents (see its comment). That next node here is the hidden
+        // input BasicTextField, and Compose treats a text field regaining
+        // focus as a request to show the IME - which is exactly the
+        // "Copy/Paste > More kapanınca IME kendi kendine açılıyor" bug,
+        // and it happened regardless of whether the keyboard had been open
+        // before "More" was tapped (onDismiss's own restore/hide logic was
+        // never reached in time - the platform's own focus-follows-window
+        // handoff fires first). focusable = false keeps this Popup's
+        // window from ever taking window-focus in the first place, so
+        // there is nothing to hand back on dismiss and the IME is left
+        // completely alone either way - matching how Copy/Paste already
+        // behave (see their own onCopy/onPaste doc: they never touch focus
+        // either). The one thing focusable = true bought for free -
+        // onDismissRequest firing on BACK, not just outside-tap - is
+        // replaced above with an explicit BackHandler instead.
+        properties = PopupProperties(focusable = false),
         onDismissRequest = onDismiss
     ) {
         Surface(

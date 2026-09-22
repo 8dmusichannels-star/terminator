@@ -170,7 +170,11 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
             Slider(
                 value = columns,
                 onValueChange = { scope.launch { repo.set(SettingsKeys.COLUMNS, it) } },
-                valueRange = 40f..200f
+                // Upper bound raised from 200 to 1000 columns per request -
+                // no other clamp on COLUMNS exists elsewhere (MainActivity
+                // reads it straight into the PTY resize with no coerceIn),
+                // so this slider's own valueRange was the only limit.
+                valueRange = 40f..1000f
             )
 
             Spacer(modifier = Modifier.height(16.dp))

@@ -820,7 +820,34 @@ fun SplitTerminalPane(
                     // a pinch-driven resize and an onSizeChanged-driven one
                     // can never race each other into two different final
                     // sizes.
+                    // Tracks the exact newSize commitZoomAndResize itself just
+                    // wrote via onZoomTextSize - see the fontSizeResizePending
+                    // LaunchedEffect's own doc below for why this is what lets
+                    // it tell "fontSizeSp changed because THIS pane's own
+                    // pinch already resized for it" apart from "fontSizeSp
+                    // changed from an external source (stepZoom) that hasn't
+                    // resized anything yet". Set BEFORE onZoomTextSize?.invoke
+                    // so it's already in place by the time that call
+                    // recomposes this composable with the new fontSizeSp -
+                    // there is no ordering hazard here the way there would be
+                    // reading a plain remembered value from inside a
+                    // LaunchedEffect body, since this is a synchronous
+                    // composable-scope write happening in the same gesture
+                    // callback that triggers the prop change.
+                    val lastFontSizeSpFromPinch = remember(runtimeId) { mutableStateOf(fontSizeSp) }
+                    // Last cols/rows actually handed to onResize by a pinch
+                    // commit - the Schmitt-trigger anchor hystRowsOrCols (top-
+                    // level, MainActivity.kt) needs, mirroring MainActivity's
+                    // own lastCommittedCols/lastCommittedRows. Keyed on
+                    // runtimeId so a different terminal never inherits a stale
+                    // anchor. Reset to null by every NON-pinch resize path
+                    // below (onSizeChanged / fontSizeSp LaunchedEffect) so the
+                    // next pinch re-anchors from the real current grid instead
+                    // of a value that grid has since moved away from.
+                    var lastCommittedCols by remember(runtimeId) { mutableStateOf<Int?>(null) }
+                    var lastCommittedRows by remember(runtimeId) { mutableStateOf<Int?>(null) }
                     val commitZoomAndResize: (Float) -> Unit = { newSize ->
+                        lastFontSizeSpFromPinch.value = newSize
                         onZoomTextSize?.invoke(newSize)
                         paneResizeDebounceJob?.cancel()
                         paneResizeDebounceJob = paneCoroutineScope.launch {
@@ -843,11 +870,133 @@ fun SplitTerminalPane(
                             val ch = metricsPaint.fontSpacing
                             val finalSize = latestPaneSizePx
                             if (cw > 0f && ch > 0f && finalSize != null) {
-                                val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
-                                val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
+                                // hystRowsOrCols instead of a plain .toInt() - see
+                                // its own doc (MainActivity.kt) for the full why.
+                                // This runs on every ~150ms throttled tick of a
+                                // still-live pinch (runSplitPinchZoom), and finger
+                                // tremor right at a whole-number boundary was
+                                // flipping cols/rows on consecutive ticks; each
+                                // flip is a real buffer.resize() (shrink pushes a
+                                // row into scrollback, grow only pads a BLANK row
+                                // back), i.e. a line appearing on its own.
+                                val cols = hystRowsOrCols(finalSize.width / cw, lastCommittedCols)
+                                val rws = hystRowsOrCols(finalSize.height / ch, lastCommittedRows)
+                                lastCommittedCols = cols
+                                lastCommittedRows = rws
                                 onResize(cols, rws, finalSize.width, finalSize.height)
                             }
                         }
+                    }
+                    // fontSizeSp is an EXTERNAL prop - MainActivity's own
+                    // stepZoom (the keyboard +/- zoom buttons/shortcuts) can
+                    // target this split pane (see zoomTargetId()'s own doc)
+                    // and, unlike this pane's internal pinch gesture above,
+                    // writes straight to viewModel.setSessionTextSize with no
+                    // staging of its own at all - that write is what flows
+                    // back down into this composable as a new fontSizeSp.
+                    // Previously nothing here reacted to that: commitZoomAndResize
+                    // (the only thing that ever called onResize for a font-size
+                    // change) was reachable exclusively from this pane's OWN
+                    // pinch handler below, so a split pane's pty/buffer grid
+                    // never resized for a keyboard zoom step at all - Canvas
+                    // painted at the new charWidthPx/charHeightPx immediately
+                    // (effectivePaneFontSize/charWidthPx/charHeightPx above key
+                    // off fontSizeSp directly) while buffer.rows/columns and the
+                    // pty's own idea of its size silently never moved, same
+                    // underlying "siyah boşluklar" gap as the primary pane's
+                    // pre-fix keyboard-zoom path had. A fast run of keyboard
+                    // zoom steps needs the SAME coalescing as
+                    // MainActivity's fontSizeResizePending fix does for the
+                    // primary pane (see that LaunchedEffect(effectiveTextSize)'s
+                    // own "firtina" doc) - each step re-keys this LaunchedEffect
+                    // and cancels the in-flight delay before it fires, so only
+                    // the last step of a rapid burst ever reaches
+                    // paneResizeDebounceJob/onResize, instead of queuing one
+                    // full buffer.resize()+SIGWINCH (and, for a program like
+                    // btop, one full reinit) per intermediate step. Reuses
+                    // paneResizeDebounceJob/onResize directly rather than
+                    // routing through commitZoomAndResize, since
+                    // onZoomTextSize(newSize) here would just write the exact
+                    // fontSizeSp value the ViewModel already holds right back
+                    // to itself.
+                    //
+                    // fontSizeResizePending mirrors MainActivity's OWN flag of
+                    // the same name for the primary pane (see that flag's own
+                    // doc for the full mechanism) - this pane never had an
+                    // equivalent, so the exact same bug MainActivity fixed
+                    // there ("zoom yapip enter basinca cursor yanlis yere
+                    // dusuyor") was still open here: fontSizeSp changes
+                    // straight away (this composable recomposes at the new
+                    // charWidthPx/charHeightPx that same frame - see
+                    // effectivePaneFontSize/the remember(...) block above),
+                    // but the actual buffer.resize()/SIGWINCH below only
+                    // lands after this LaunchedEffect's 150ms delay - a real
+                    // window where TerminalView draws the NEW pixel scale
+                    // against the OLD buffer.rows/columns (and therefore
+                    // stale cursorRow/cursorCol indices), most visible the
+                    // instant a newline lands in that window. Set true the
+                    // same composition fontSizeSp changes (synchronously, not
+                    // from inside the LaunchedEffect body, which only runs on
+                    // a LATER coroutine dispatch - same reasoning as
+                    // MainActivity's own lastEffectiveTextSizeSeen check),
+                    // folded into suppressCursor below so the cursor stays
+                    // hidden for the whole gap instead of one visible glitch
+                    // frame.
+                    //
+                    // CRITICAL: this pane's OWN pinch gesture also drives
+                    // fontSizeSp - onZoomTextSize?.invoke(newSize) inside
+                    // commitZoomAndResize above calls
+                    // viewModel.setSessionTextSize, which is the exact same
+                    // ViewModel write that flows back down as a new
+                    // fontSizeSp value. Without the liveZoomSize == null
+                    // guard below, EVERY pinch commit would also re-trigger
+                    // this LaunchedEffect, which would then race
+                    // commitZoomAndResize's OWN coroutine for the same
+                    // paneResizeDebounceJob - both cancel-and-relaunch the
+                    // same job, so whichever one's delay happened to finish
+                    // last silently overwrote/raced the other's resize call,
+                    // producing exactly the unpredictable "split/multi even
+                    // slower, bug still there" timing observed. Guarding on
+                    // liveZoomSize == null (liveZoomSize is non-null for the
+                    // ENTIRE pinch gesture, only going null the instant
+                    // commitZoomAndResize's own onLiveZoom(null) fires -
+                    // which happens BEFORE onZoomTextSize's fontSizeSp write
+                    // reaches this composable on the same commit) is not
+                    // enough by itself since both are null by the time this
+                    // recomposes - lastFontSizeSpSeenFromPinch below instead
+                    // tracks the exact newSize commitZoomAndResize itself
+                    // just wrote, so THIS LaunchedEffect can tell "fontSizeSp
+                    // changed because commitZoomAndResize already handled the
+                    // resize for it" apart from "fontSizeSp changed from
+                    // stepZoom, which handled nothing" - only the latter
+                    // needs this LaunchedEffect to do anything at all.
+                    var fontSizeResizePending by remember(runtimeId) { mutableStateOf(false) }
+                    val lastFontSizeSpSeen = remember(runtimeId) { mutableStateOf(fontSizeSp) }
+                    if (lastFontSizeSpSeen.value != fontSizeSp) {
+                        lastFontSizeSpSeen.value = fontSizeSp
+                        fontSizeResizePending = true
+                    }
+                    LaunchedEffect(fontSizeSp) {
+                        if (paneHasSizedOnce && liveZoomSize == null && fontSizeSp != lastFontSizeSpFromPinch.value) {
+                            delay(150)
+                            val metricsPaint = android.graphics.Paint().apply {
+                                typeface = fontFamily
+                                textSize = fontSizeSp * density.density * density.fontScale
+                            }
+                            val cw = metricsPaint.measureText("M")
+                            val ch = metricsPaint.fontSpacing
+                            val finalSize = latestPaneSizePx
+                            if (cw > 0f && ch > 0f && finalSize != null) {
+                                val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
+                                val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
+                                // Non-pinch resize: drop the pinch anchor so the
+                                // next pinch re-anchors from this real grid.
+                                lastCommittedCols = null
+                                lastCommittedRows = null
+                                onResize(cols, rws, finalSize.width, finalSize.height)
+                            }
+                        }
+                        fontSizeResizePending = false
                     }
                     Box(
                         modifier = Modifier
@@ -873,6 +1022,11 @@ fun SplitTerminalPane(
                                         if (cw > 0f && ch > 0f && finalSize != null) {
                                             val cols = (finalSize.width / cw).toInt().coerceAtLeast(1)
                                             val rws = (finalSize.height / ch).toInt().coerceAtLeast(1)
+                                            // Real layout change (rotation, IME, split
+                                            // drag): never deadbanded, and it
+                                            // invalidates the pinch anchor.
+                                            lastCommittedCols = null
+                                            lastCommittedRows = null
                                             onResize(cols, rws, finalSize.width, finalSize.height)
                                         }
                                     }
@@ -1369,8 +1523,12 @@ fun SplitTerminalPane(
                             // suppressCursorExtra: caller-supplied (MainActivity passes
                             // true while the split divider is being dragged) - see this
                             // param's own doc above for why the divider drag needed the
-                            // same treatment as pinch-zoom.
-                            suppressCursor = liveZoomSize != null || suppressCursorExtra,
+                            // same treatment as pinch-zoom. fontSizeResizePending
+                            // (see its own doc above, right by where it's declared)
+                            // folds in the keyboard-zoom stale-cursor-coordinate gap
+                            // the same way MainActivity's identically-named flag
+                            // already covers for the primary pane.
+                            suppressCursor = liveZoomSize != null || suppressCursorExtra || fontSizeResizePending,
                             bufferVersion = bufferVersion,
                             backgroundAlpha = 1f,
                             scrollOffset = scrollOffset,

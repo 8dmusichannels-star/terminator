@@ -521,7 +521,16 @@ data class PhysicalKeyboardRouting(
     // MainActivity's own splitPaneFocused Compose state setter, mirrored
     // down for the same reason the rest of this class already is - see
     // this class's own top doc.
-    val toggleSplitFocus: (() -> Unit)? = null
+    val toggleSplitFocus: (() -> Unit)? = null,
+    // Physical-keyboard font-size zoom (Ctrl +/-/0), mirrored down from
+    // MainActivity's own stepZoom/zoomTargetId the same way toggleSplitFocus
+    // is - see MainActivity's LaunchedEffect that constructs this. Null in
+    // the default/no-op instance, same "nothing to do yet" contract as
+    // toggleSplitFocus above; AppAction.execute treats a null callback as a
+    // no-op for ZOOM_IN/ZOOM_OUT/ZOOM_RESET.
+    val zoomIn: (() -> Unit)? = null,
+    val zoomOut: (() -> Unit)? = null,
+    val zoomReset: (() -> Unit)? = null
 ) {
     /** Same three-way routing VirtualKeyBar's onKeyPressed/onKeymapTriggered
      *  callbacks already do by hand at each of MainActivity's two

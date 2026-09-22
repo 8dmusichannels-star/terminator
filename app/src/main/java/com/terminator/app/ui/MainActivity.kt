@@ -752,12 +752,48 @@ class MainActivity : ComponentActivity() {
                 // it fresh on the next key press, there's no UI to
                 // recompose off of it.
                 LaunchedEffect(splitPaneFocused, state.splitRuntimeId, state.panes.isNotEmpty(), broadcastAllPanes) {
+                    // Same focused-target resolution AppAction.execute()
+                    // itself already uses for every other pane-aware
+                    // action (TOGGLE_WAKE_LOCK, PANE_CLONE_FOCUSED, etc.):
+                    // the focused multi-pane tile first, else the split's
+                    // secondary pane if it's the one focused, else the
+                    // plain active/primary session. Resolved fresh on each
+                    // press (reads viewModel.uiState.value, not a stale
+                    // closure) since these lambdas are only rebuilt when
+                    // splitPaneFocused/splitRuntimeId/panes/broadcast
+                    // change, not on every keystroke.
+                    fun zoomTargetId(): String? {
+                        val s = viewModel.uiState.value
+                        val focusedPaneId = s.focusedPaneRuntimeId ?: s.activeSessionId
+                        return if (s.panes.isNotEmpty()) focusedPaneId
+                            else if (splitPaneFocused) s.splitRuntimeId
+                            else s.activeSessionId
+                    }
+                    // Same clamp pinch-zoom uses (see its own 4f/40f doc
+                    // above) - a keyboard zoom step should never be able to
+                    // push a session smaller/larger than a two-finger pinch
+                    // ever could.
+                    fun stepZoom(delta: Float) {
+                        val id = zoomTargetId() ?: return
+                        val current = viewModel.uiState.value.sessionTextSizes[id] ?: textSize
+                        viewModel.setSessionTextSize(id, (current + delta).coerceIn(4f, 40f))
+                    }
                     physicalKeyboardRouting = PhysicalKeyboardRouting(
                         isMultiPane = state.panes.isNotEmpty(),
                         broadcastAllPanes = broadcastAllPanes,
                         splitPaneFocused = splitPaneFocused,
                         splitRuntimeId = state.splitRuntimeId,
-                        toggleSplitFocus = { splitPaneFocused = !splitPaneFocused }
+                        toggleSplitFocus = { splitPaneFocused = !splitPaneFocused },
+                        zoomIn = { stepZoom(1f) },
+                        zoomOut = { stepZoom(-1f) },
+                        zoomReset = {
+                            // "Reset" means back to the global default
+                            // (Settings > Appearance > Text size), i.e.
+                            // dropping this session's override entirely -
+                            // same as how a session naturally starts before
+                            // any pinch/keyboard zoom ever touches it.
+                            zoomTargetId()?.let { viewModel.setSessionTextSize(it, textSize) }
+                        }
                     )
                 }
 
@@ -1023,8 +1059,23 @@ class MainActivity : ComponentActivity() {
                             // see the throttleElapsed check where zoomCommitJob is
                             // (re)launched below for why this exists.
                             var lastZoomCommitNanos by remember { mutableStateOf(0L) }
+                            // Last row/col count actually pushed to buffer.resize() during
+                            // this pinch - see hystRowsOrCols's own doc (top-level, below
+                            // this composable) for why a live pinch's rows/cols computation
+                            // needs this instead of just truncating pixelSize/charSize
+                            // straight to Int on every tick. Reset per activeSessionId like
+                            // liveZoomSize above, so switching sessions doesn't carry a
+                            // stale hysteresis anchor into a different terminal's grid.
+                            var lastCommittedCols by remember(activeSessionId) { mutableStateOf<Int?>(null) }
+                            var lastCommittedRows by remember(activeSessionId) { mutableStateOf<Int?>(null) }
 
                             val effectiveTextSize = liveZoomSize ?: sessionTextSize ?: textSize
+                            var fontSizeResizePending by remember { mutableStateOf(false) }
+                            val lastEffectiveTextSizeSeen = remember { mutableStateOf(effectiveTextSize) }
+                            if (lastEffectiveTextSizeSeen.value != effectiveTextSize) {
+                                lastEffectiveTextSizeSeen.value = effectiveTextSize
+                                fontSizeResizePending = true
+                            }
                             // Hoisted here (rather than created inside TerminalView) so the
                             // toolbar below can read selectionState.selectedTexts to decide
                             // whether it's visible and what Copy actually copies - passed down
@@ -1301,6 +1352,13 @@ class MainActivity : ComponentActivity() {
                                 }
                                 val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
                                 val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
+                                // A real (non-pinch) resize - layout/IME/rotation/font
+                                // step - is never deadbanded, and it invalidates the
+                                // pinch's hysteresis anchor: the next pinch must
+                                // re-anchor from THIS grid, not from whatever the last
+                                // pinch tick committed before the grid moved on.
+                                lastCommittedCols = null
+                                lastCommittedRows = null
                                 viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
                                 // Whatever buffer.rows/columns are now, they match this
                                 // finalSize - safe for drawTerminal to trust
@@ -1323,14 +1381,71 @@ class MainActivity : ComponentActivity() {
                             // Canvas repaints at the new (post-rotation) pixel size while
                             // buffer.rows/columns still hold the pre-rotation grid, which is
                             // what showed up as corrupted/reset-looking content after rotating.
-                            // A LaunchedEffect keyed on currentOrientation has no such ordering
-                            // ambiguity: Compose guarantees it re-runs exactly when the key's
-                            // value actually changes between compositions, decoupled entirely
-                            // from onSizeChanged's own firing order.
+                            // A LaunchedEffect keyed on currentOrientation reliably fires
+                            // exactly once per rotation, decoupled from onSizeChanged's own
+                            // firing order - but "fires at the right time" isn't "sees the
+                            // right data": see the staleSize check inside the block below for
+                            // why this still can't call applyResize() unconditionally.
                             LaunchedEffect(currentOrientation) {
                                 if (hasSizedOnce) {
+                                    // latestTerminalSize is written by onSizeChanged's
+                                    // OWN layout-pass callback - a completely
+                                    // separate callback from this LaunchedEffect,
+                                    // with no ordering guarantee between the two.
+                                    // The comment above claims a LaunchedEffect
+                                    // keyed on currentOrientation sidesteps the
+                                    // ordering problem entirely, but it only
+                                    // fixed the DIRECTION of the race (this now
+                                    // reliably fires ON rotation, not "whenever
+                                    // onSizeChanged next happens to run") - it did
+                                    // nothing to guarantee onSizeChanged has
+                                    // already delivered the POST-rotation size by
+                                    // the time this coroutine actually runs.
+                                    // LaunchedEffect's start block is a scheduled
+                                    // coroutine resumption, not something layout
+                                    // blocks on, so on a real device this can
+                                    // (and does) run a frame ahead of the real
+                                    // onSizeChanged callback - reading a
+                                    // latestTerminalSize that's still the OLD,
+                                    // pre-rotation box size. Calling applyResize()
+                                    // with that stale size pushes a bogus
+                                    // buffer.resize()/SIGWINCH at the wrong
+                                    // dimensions, immediately followed - once the
+                                    // real onSizeChanged/120ms debounce lands - by
+                                    // a second, correct one. A full-screen ncurses
+                                    // app (btop/top chief among them) redraws
+                                    // itself from scratch on each of those two
+                                    // SIGWINCHes, so the wrong-size one shows up
+                                    // as a full-screen redraw against a grid that
+                                    // doesn't match the real box - blank/garbled
+                                    // (often reading as solid black) for the
+                                    // fraction of a second until the second,
+                                    // correct SIGWINCH's redraw lands - and
+                                    // buffer.resize()'s own cursorRow-vs-newRows
+                                    // clamp (see its own doc) runs TWICE against
+                                    // two different, momentarily-wrong row counts
+                                    // instead of once against the real one, which
+                                    // is what visibly drops the cursor an extra
+                                    // row or two on rotation. A stale size's
+                                    // aspect ratio still matches the OLD
+                                    // orientation, not the new one currentOrientation
+                                    // just switched to - checking that catches
+                                    // exactly this window without needing any
+                                    // cross-callback ordering guarantee at all:
+                                    // skip the immediate apply and let the real
+                                    // onSizeChanged/debounce path (which always
+                                    // eventually fires with the genuinely new
+                                    // size) do it once, correctly.
+                                    val size = latestTerminalSize
+                                    val staleSize = size != null && when (currentOrientation) {
+                                        android.content.res.Configuration.ORIENTATION_LANDSCAPE -> size.height >= size.width
+                                        android.content.res.Configuration.ORIENTATION_PORTRAIT -> size.width >= size.height
+                                        else -> false
+                                    }
                                     pendingResize = true
-                                    applyResize()
+                                    if (!staleSize) {
+                                        applyResize()
+                                    }
                                 }
                             }
 
@@ -1358,10 +1473,71 @@ class MainActivity : ComponentActivity() {
                             // while a pinch is actively live (liveZoomSize != null) so this
                             // doesn't fight that gesture's own throttled commit; the pinch
                             // path already keeps the grid in sync for its own duration.
+                            //
+                            // fontSizeResizePending flips true the SAME composition this
+                            // LaunchedEffect gets (re)armed by a new effectiveTextSize (see
+                            // where it's set, right below the effectiveTextSize declaration
+                            // above), and back false only once applyResize() actually runs
+                            // here - a LaunchedEffect body doesn't run synchronously with the
+                            // recomposition that changed its key, it runs on a LATER
+                            // coroutine dispatch, so there is a real (if short) window where
+                            // Compose has already redrawn TerminalView at the NEW font size/
+                            // charWidth/charHeight while buffer.rows/columns (and therefore
+                            // cursorRow/cursorCol, which are indices into THAT old grid) still
+                            // reflect the size from before this zoom step. A block cursor
+                            // drawn against stale row/col indices at the new pixel scale
+                            // lands at the wrong on-screen position for that one frame -
+                            // most visible right after a keyboard zoom step (stepZoom has no
+                            // liveZoomSize-style staging at all, unlike pinch) immediately
+                            // followed by a newline moving the cursor again, which is what
+                            // made it look specifically like "zoom yapip enter basinca cursor
+                            // yanlis yere dusuyor". suppressCursor below already exists
+                            // exactly for hiding the cursor through this kind of stale-
+                            // coordinate gap (see liveZoomSize's own use of it) - folding this
+                            // flag into that same parameter covers the keyboard-zoom path
+                            // pinch-zoom was already exempted from.
+                            // Keyboard zoom (stepZoom, called from the +/- buttons or a
+                            // physical key repeat) has no liveZoomSize-style staging at
+                            // all - every single step calls viewModel.setSessionTextSize
+                            // directly, so a fast run of steps (holding the zoom button,
+                            // or a key-repeat firing every ~50ms) re-keys effectiveTextSize
+                            // once per step, and this LaunchedEffect previously restarted
+                            // and called applyResize() - a real buffer.resize() +
+                            // ioctl(TIOCSWINSZ)/SIGWINCH - on EVERY one of those steps
+                            // immediately, uncoalesced. A full-screen program like btop
+                            // doesn't just redraw on SIGWINCH, it does a full internal
+                            // reinit (re-probe terminal size, rebuild its whole layout)
+                            // each time - "firtina teorisi" confirmed this: a burst of
+                            // N rapid zoom steps queues N of those reinits back-to-back,
+                            // and btop working through that queue is what actually
+                            // produced the multi-second black-screen stall, not any
+                            // single resize being slow. Pinch-zoom already avoids this
+                            // exact failure via liveZoomSize's own 150ms throttleElapsed
+                            // commit (see the pointerInput block below) - this mirrors
+                            // that same coalescing for the keyboard-zoom path, which had
+                            // never gone through liveZoomSize/setSessionTextSize at all.
+                            // fontSizeResizePending is intentionally left alone here (set
+                            // true the same composition effectiveTextSize changes, per its
+                            // own doc above) so suppressCursor keeps the cursor hidden for
+                            // the ENTIRE coalescing window, not just the final step's -
+                            // otherwise the cursor would flicker back on between rapid
+                            // steps only to be suppressed again a moment later.
                             LaunchedEffect(effectiveTextSize) {
                                 if (hasSizedOnce && liveZoomSize == null) {
+                                    // Debounced, not immediate: if another effectiveTextSize
+                                    // change lands within 150ms (the same window pinch-zoom's
+                                    // own throttle uses), this coroutine gets cancelled by
+                                    // LaunchedEffect's own key-change semantics before delay()
+                                    // returns, so applyResize() never runs for the
+                                    // intermediate step - only the last step of a rapid run
+                                    // ever reaches it. A single, isolated zoom step still
+                                    // resizes within 150ms same as before; nothing regresses
+                                    // for the slow/deliberate case, only the rapid-burst case
+                                    // is now coalesced to one resize instead of N.
+                                    delay(150)
                                     applyResize()
                                 }
+                                fontSizeResizePending = false
                             }
 
                             Column(modifier = Modifier.fillMaxSize()) {
@@ -1395,6 +1571,17 @@ class MainActivity : ComponentActivity() {
                                     palette = terminalPalette,
                                     fontFamily = terminalTypeface,
                                     fontSizeSp = textSize,
+                                    // Per-pane override lookup - mirrors the split pane's own
+                                    // call site (state.sessionTextSizes[splitRuntimeId] ?:
+                                    // textSize) just keyed per-tile instead of one fixed id.
+                                    // Without this, every tile fell back to the shared flat
+                                    // fontSizeSp (textSize) above the instant its own pinch
+                                    // commit reset zoomSizeSp to null - onZoomTextSize below
+                                    // was writing the new size into sessionTextSizes, but
+                                    // nothing here ever read it back, so the zoom visibly
+                                    // snapped back to the old size right after every commit
+                                    // ("geri tepme").
+                                    fontSizeSpFor = { runtimeId -> state.sessionTextSizes[runtimeId] ?: textSize },
                                     zoomEnabled = zoomEnabled,
                                     softKeyboardEnabled = softKeyboardEnabled,
                                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -1462,6 +1649,15 @@ class MainActivity : ComponentActivity() {
                                     onMovePane = { runtimeId, offset -> viewModel.movePane(runtimeId, offset) },
                                     onResizePane = { runtimeId, size -> viewModel.resizePane(runtimeId, size) },
                                     onResizeSessionPty = { runtimeId, cols, rws, pxW, pxH -> viewModel.updateTerminalSizeFor(runtimeId, cols, rws, pxW, pxH) },
+                                    // Persists a tile's pinch-zoom result into the ViewModel's
+                                    // own fontSizeSp for that session - without this the tile's
+                                    // zoomSizeSp (PaneContent's tile-local state) is the only
+                                    // place the new size lives, and MultiPaneContainer's own
+                                    // zoomSizeSp-reset-to-null fix (see PaneContent's doc) makes
+                                    // the tile revert to the stale fontSizeSp prop as soon as the
+                                    // debounced resize commits. Mirrors the primary/split pane's
+                                    // own commitZoomAndResize -> setSessionTextSize call below.
+                                    onZoomTextSize = { runtimeId, newSize -> viewModel.setSessionTextSize(runtimeId, newSize) },
                                     onSetMode = { mode -> viewModel.setPaneMode(mode) },
                                     onAddPaneRequested = {
                                         // Same "don't pop up an empty list"
@@ -2416,8 +2612,19 @@ class MainActivity : ComponentActivity() {
                                                                         val newCharHeight = metricsPaint.fontSpacing
                                                                         val finalSize = latestTerminalSize
                                                                         if (charWidth > 0f && newCharHeight > 0f && finalSize != null) {
-                                                                            val cols = (finalSize.width / charWidth).toInt().coerceAtLeast(1)
-                                                                            val rws = (finalSize.height / newCharHeight).toInt().coerceAtLeast(1)
+                                                                            // hystRowsOrCols (top-level, bottom of file) instead of a
+                                                                            // plain .toInt() - see its own doc for why: this same block
+                                                                            // fires on every ~150ms throttled tick of a still-live
+                                                                            // pinch, and ordinary finger tremor right at a whole-number
+                                                                            // boundary was flipping cols/rows back and forth on
+                                                                            // consecutive ticks, each flip a real buffer.resize() that
+                                                                            // visibly shifted content up (shrink) then padded a blank
+                                                                            // row back in (grow) - "satır kendiliğinden düşüyor/yeni
+                                                                            // satır beliriyor" during a pinch with no Enter involved.
+                                                                            val cols = hystRowsOrCols(finalSize.width / charWidth, lastCommittedCols)
+                                                                            val rws = hystRowsOrCols(finalSize.height / newCharHeight, lastCommittedRows)
+                                                                            lastCommittedCols = cols
+                                                                            lastCommittedRows = rws
                                                                             viewModel.updateTerminalSize(cols, rws, finalSize.width, finalSize.height)
                                                                             // Re-anchor: the row the fingers were
                                                                             // over (anchorRow, in OLD char-height
@@ -2659,7 +2866,7 @@ class MainActivity : ComponentActivity() {
                                             // with both: cursor now stays visible through
                                             // keyboard open/close here too, same as split and
                                             // floating already did.
-                                            suppressCursor = liveZoomSize != null || isDraggingSplit,
+                                            suppressCursor = liveZoomSize != null || isDraggingSplit || fontSizeResizePending,
                                             bufferVersion = state.bufferVersion,
                                             // Only let the terminal's own background go
                                             // translucent when there's actually a wallpaper
@@ -2736,83 +2943,19 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 selectionState.clear()
                                                 actionModeController.hide()
-                                                // Tapping a toolbar button steals focus away from
-                                                // the hidden input field, which drops
-                                                // hiddenFieldFocused (and therefore keyboardOpen)
-                                                // to false - the soft keyboard would otherwise
-                                                // close itself right along with dismissing the
-                                                // selection, forcing the user to tap the terminal
-                                                // again just to keep typing after a Copy/Paste.
-                                                // Restoring it here (only when the keyboard was
-                                                // actually open BEFORE the toolbar appeared -
-                                                // keyboardWasOpenBeforeSelection, not the live
-                                                // keyboardOpen this button's own tap just raced
-                                                // against and possibly already flipped) brings it
-                                                // back immediately instead, and - just as
-                                                // importantly - does nothing when the keyboard was
-                                                // already closed, so tapping Copy/Paste can't
-                                                // spuriously pop the keyboard open on its own.
-                                                //
-                                                // requestFocus() alone is not reliable here: once
-                                                // the IME has genuinely finished hiding (which the
-                                                // toolbar's own focus-stealing tap can trigger),
-                                                // Compose focus moving back to a field does not
-                                                // reliably resurface it again - this is a
-                                                // well-documented Compose/IME gap, not specific to
-                                                // this field. Pairing the focus request with an
-                                                // explicit keyboardController.show() call is the
-                                                // documented workaround, and pairing hide() with a
-                                                // clearFocus() on the "was already closed" branch
-                                                // closes the other half of the same gap: without
-                                                // it, this field could still end up focused (it's
-                                                // the only focusable target once the toolbar's own
-                                                // buttons are gone) with nothing having told the
-                                                // system to actually show its keyboard - a state
-                                                // Android can resolve either way depending on
-                                                // what still holds an active input connection,
-                                                // which is what made "closed -> tap Copy/Paste ->
-                                                // opens anyway" intermittent instead of
-                                                // consistently one behavior or the other.
-                                                //
-                                                // requestFocus() itself already fires its own IME
-                                                // show request the instant focus lands (visible in
-                                                // logcat as onRequestShow ... SHOW_SOFT_INPUT_BY_
-                                                // INSETS_API). Calling keyboardController.show()
-                                                // synchronously right after, in the same callback,
-                                                // fires a SECOND, independent show request
-                                                // (SHOW_SOFT_INPUT) before the first one has been
-                                                // dispatched - the platform then has two competing
-                                                // in-flight IME animation requests and cancels one
-                                                // against the other (onCancelled at
-                                                // PHASE_CLIENT_APPLY_ANIMATION / PHASE_CLIENT_
-                                                // ANIMATION_CANCEL), which is what actually produced
-                                                // the "sometimes shows, sometimes doesn't" behavior -
-                                                // not stale focus state. Moving the show() into its
-                                                // own post-frame callback lets the first (focus-
-                                                // driven) request be dispatched and let the
-                                                // animation system settle before the explicit show()
-                                                // fires, so the second call reinforces the first
-                                                // instead of racing it.
-                                                if (keyboardWasOpenBeforeSelection) {
-                                                    focusRequester.requestFocus()
-                                                    // Deferred via view.post: requestFocus() above
-                                                    // already fires its own IME show request the
-                                                    // instant focus lands. Calling show() here
-                                                    // synchronously in the same callback used to fire
-                                                    // a second, independent show request before the
-                                                    // first was dispatched, and the platform would
-                                                    // cancel one against the other - see this
-                                                    // function's own doc above for the full story.
-                                                    // Posting this call lets the focus-driven request
-                                                    // be dispatched and the animation settle first, so
-                                                    // this one reinforces it instead of racing it.
-                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
-                                                    lastKeyboardIntentOpen = true
-                                                } else {
-                                                    focusManager.clearFocus()
-                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
-                                                    lastKeyboardIntentOpen = false
-                                                }
+                                                // Copy/Paste/More must leave the IME completely
+                                                // alone - neither opening it nor closing it,
+                                                // regardless of whether it was open before the
+                                                // toolbar appeared ("IME hiç tetiklenmiycek ne
+                                                // acilicak nede kapanicak"). The previous
+                                                // restore-if-was-open/hide-if-wasn't logic still
+                                                // counted as the toolbar reaching into the
+                                                // keyboard, and that reach-in is exactly what was
+                                                // producing visible open/close flicker here - so
+                                                // this button now does nothing with focus or the
+                                                // IME at all; whatever state the keyboard was
+                                                // already in (shown or hidden) is left completely
+                                                // untouched.
                                             },
                                             onPaste = {
                                                 clipboardManager.getText()?.text?.let { pasted ->
@@ -2840,20 +2983,9 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 selectionState.clear()
                                                 actionModeController.hide()
-                                                // See onCopy's comment above for why this reads
-                                                // keyboardWasOpenBeforeSelection rather than the
-                                                // live keyboardOpen, and defers show() to the next
-                                                // frame rather than calling it synchronously right
-                                                // after requestFocus().
-                                                if (keyboardWasOpenBeforeSelection) {
-                                                    focusRequester.requestFocus()
-                                                    currentView.post { insetsController.show(WindowInsetsCompat.Type.ime()) }
-                                                    lastKeyboardIntentOpen = true
-                                                } else {
-                                                    focusManager.clearFocus()
-                                                    insetsController.hide(WindowInsetsCompat.Type.ime())
-                                                    lastKeyboardIntentOpen = false
-                                                }
+                                                // See onCopy's comment above - Copy/Paste/More
+                                                // leave the IME completely untouched now, in
+                                                // whatever state it was already in.
                                             },
                                             onMore = if (activeSessionId != null) {
                                                 {
@@ -3204,6 +3336,20 @@ class MainActivity : ComponentActivity() {
                                             moreVisible = false
                                             selectionState.clear()
                                             actionModeController.hide()
+                                            // Deliberately does NOT touch focus or the IME at
+                                            // all - no requestFocus(), no clearFocus(), no
+                                            // insetsController.show()/hide(). Every previous
+                                            // attempt here (restore-if-was-open, or
+                                            // unconditionally clearing focus) still counted as
+                                            // this callback reaching into the keyboard, and any
+                                            // such reach-in is exactly what was producing the
+                                            // open/close flicker ("IME hiç tetiklenmiycek ne
+                                            // acilicak nede kapanicak"). Compose's own default
+                                            // handling of a dismissed focusable Popup is left to
+                                            // do whatever it does with focus on its own; this
+                                            // callback's job is only to close the popup and
+                                            // clear the selection/toolbar, nothing about
+                                            // keyboard visibility.
                                         }
                                     )
                                 }
@@ -3956,6 +4102,54 @@ class MainActivity : ComponentActivity() {
             viewModel.setDrawerOpen(true)
         }
     }
+}
+
+/**
+ * Rounds a live pixel-size/char-size ratio (e.g. pixelHeight/charHeight,
+ * pre-.toInt()) to a row or column count, but with a Schmitt-trigger-style
+ * deadband around whichever integer was last actually committed to
+ * buffer.resize() during THIS gesture - not just a plain floor().
+ *
+ * Why: a live pinch's throttled ~150ms commit ticks (see zoomCommitJob/
+ * commitZoomAndResize/PaneContent's own pinch commit, all three of which
+ * call this) each recompute rows/cols fresh from the current finger
+ * distance. Real fingers never move in a perfectly monotonic line - tiny,
+ * completely normal tremor in the pinch distance is enough to walk the
+ * raw pixelSize/charSize ratio back and forth across a whole-number
+ * boundary (e.g. 24.4 -> 24.6 -> 24.3) even while the user's intent is
+ * "zoom in a bit," with no actual reversal. Every one of those boundary
+ * crossings used to fire a REAL buffer.resize() - and TerminalBuffer's own
+ * resize() pushes departing rows into scrollback on a shrink and leaves
+ * newly-available rows blank (not reclaimed) on a grow (see that
+ * function's own extensive doc on why grow doesn't reclaim) - so a rapid
+ * shrink-tick immediately followed by a grow-tick visibly shifted
+ * on-screen content up a row and then padded a blank row in at the
+ * bottom, which is indistinguishable on screen from a newline having
+ * appeared on its own. This is exactly the "rapid pinch-zoom oscillation"
+ * TerminalBuffer.resize()'s own doc already names - a TIME-based attempt
+ * to suppress it was tried there and reverted, because it couldn't tell
+ * this jitter apart from a genuinely continuous, deliberate shrink (e.g.
+ * dragging a floating pane's corner handle, which fires a real shrink
+ * roughly every 32ms for as long as the finger moves and must NOT be
+ * debounced away). A VALUE-based deadband instead of a time-based one
+ * sidesteps that: it only suppresses a change that's within [margin] of
+ * the last committed integer, so a real, sustained shrink or grow (which
+ * keeps moving further past the boundary as the gesture continues) still
+ * goes through immediately once it clears the deadband, while a single
+ * tremor-sized wobble right at the line does not.
+ *
+ * A jump of more than one row/col from the last committed value (a big,
+ * unambiguous size change, e.g. after switching sessions or a real
+ * rotation) always goes through with no deadband - hysteresis only
+ * matters for the ambiguous exactly-adjacent-integer case.
+ */
+internal fun hystRowsOrCols(raw: Float, lastCommitted: Int?, margin: Float = 0.3f): Int {
+    val floor = raw.toInt().coerceAtLeast(1)
+    if (lastCommitted == null || floor == lastCommitted) return floor
+    if (kotlin.math.abs(floor - lastCommitted) > 1) return floor
+    val boundary = if (floor > lastCommitted) lastCommitted + 1 else lastCommitted
+    val cleared = if (floor > lastCommitted) raw >= boundary + margin else raw <= boundary - margin
+    return if (cleared) floor else lastCommitted
 }
 
 /**

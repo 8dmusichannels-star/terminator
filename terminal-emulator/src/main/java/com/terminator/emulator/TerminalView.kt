@@ -37,6 +37,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -893,6 +894,17 @@ fun TerminalView(
         // selectedTexts of size 3 at indices 0/1/2, which this used to
         // read directly as rows 0/1/2 instead of offsetting by startRow.
         val range = if (selectionState.active) selectionState.normalized() else null
+        // The (row, col) of a hyperlink cell currently being pressed - null
+        // the rest of the time. Drives hyperlinkUnderline in drawTerminal
+        // below so a link's underline only shows up WHILE the finger/mouse
+        // is actually down on it, not permanently on every OSC 8 cell
+        // ("hyperlinkteki highlight sadece tıklandığında olsun, hep
+        // olmasın"). Set the instant a down lands on a link-carrying cell
+        // (see the gesture block's own down-handling below) and cleared on
+        // every exit from that gesture - release, abort, movement past
+        // slop, or the link actually being opened - so it can never get
+        // stuck showing after the finger lifts.
+        var pressedHyperlinkCell by remember { mutableStateOf<Pair<Int, Int>?>(null) }
         // Per-row [fromCol, toColExclusive) span actually selected on that
         // row - NOT a whole-row flag. Mirrors recomputeFrom's own column
         // math (fromCol is startCol only on the first row, 0 on every row
@@ -1052,6 +1064,30 @@ fun TerminalView(
 
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
+
+                        // Mark whether this down landed on a hyperlink cell
+                        // so the underline can show for exactly as long as
+                        // this gesture holds it down - see
+                        // pressedHyperlinkCell's own doc above. A
+                        // right-click on a link now also underlines/opens
+                        // it same as a left-click or touch would - right-
+                        // click gets no special treatment here anymore (see
+                        // isMouseDown's own doc for why: it's treated like
+                        // any other button now, matching how most real
+                        // terminals actually behave). Wrapped in try/finally
+                        // around the WHOLE gesture below so every exit path
+                        // - short tap opening the link, movement-abort into
+                        // a scroll/pan, a long-press turning into selection
+                        // instead, or a handle-grab - reliably clears it
+                        // again, never leaving a link visually stuck
+                        // underlined after release.
+                        run {
+                            val (dRow, dCol) = cellOf(down.position.x, down.position.y)
+                            if (buffer.lineAt(dRow, dCol, latestScrollOffset.value).hyperlink != null) {
+                                pressedHyperlinkCell = dRow to dCol
+                            }
+                        }
+                        try {
 
                         // If a selection is already active, a fresh down
                         // ON one of its own handles re-grabs that handle
@@ -1339,7 +1375,47 @@ fun TerminalView(
                         // long-press-confirmed branch further below checks
                         // existingRange to decide whether to plant a new
                         // selection.
-                        val longPressDeadline = System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                        // A real mouse's press+drag (any button - see
+                        // below) is a click-and-drag-to-select gesture on
+                        // every desktop terminal - it should confirm a
+                        // selection immediately, not wait out a touch
+                        // long-press timeout first ("fiziksel mouse ile
+                        // selection toolbar tetikleme + selection
+                        // desteği"). Zeroing the deadline for a mouse down
+                        // falls straight through the wait loop below on its
+                        // very first check (remainingMillis <= 0L) with
+                        // aborted still false, landing on the exact same
+                        // "long-press confirmed" path a touch long-press
+                        // reaches - every line from there on (existingRange
+                        // handling, startAt/snappedCellOf, the drag-extend
+                        // loop, and MainActivity's own
+                        // selectionState.selectedTexts-driven
+                        // SelectionActionBar/toolbar popup) is unchanged and
+                        // already mouse-agnostic, so a mouse drag ends up
+                        // with a normal confirmed selection and the same
+                        // Copy/Paste/More toolbar a touch long-press-then-
+                        // drag produces.
+                        //
+                        // Not limited to the left/primary button: right-
+                        // click used to be special-cased here to always
+                        // dismiss rather than select, but most real desktop
+                        // terminals let right-click start/extend a selection
+                        // exactly like the left button, so that special case
+                        // was removed - "sag tik ile secim baslasin ...
+                        // pratikde cogu terminalde oluyor". Every branch
+                        // below this point (dismiss-on-click-elsewhere,
+                        // deferred startAt, etc.) already reads only
+                        // isMouseDown / PointerType, never which specific
+                        // button, so removing that branch was enough to
+                        // make right-click behave identically to left-click
+                        // everywhere in this gesture without touching
+                        // anything past this line.
+                        val isMouseDown = down.type == PointerType.Mouse
+                        val longPressDeadline = if (isMouseDown) {
+                            System.nanoTime()
+                        } else {
+                            System.nanoTime() + viewConfiguration.longPressTimeoutMillis * 1_000_000L
+                        }
                         var aborted = false
                         // Distinguishes WHY the long-press wait was aborted:
                         // a plain tap (lifted, or a second finger landed)
@@ -1574,13 +1650,35 @@ fun TerminalView(
                         // new one-cell selection here: that used to
                         // silently overwrite the user's existing selection
                         // the instant the long-press timeout elapsed (see
-                        // the long doc comment above). Fall through
-                        // unconsumed instead, exactly like an ordinary
-                        // long-press on empty space with no selection at
-                        // all, so MainActivity's own pointerInput block
-                        // handles it (e.g. scroll/pan while preserving the
-                        // active selection).
+                        // the long doc comment above).
+                        //
+                        // Touch falls through unconsumed instead, exactly
+                        // like an ordinary long-press on empty space with
+                        // no selection at all, so MainActivity's own
+                        // pointerInput block handles it (e.g. scroll/pan
+                        // while preserving the active selection) - a touch
+                        // long-press away from the selection is ambiguous
+                        // enough (could be the start of a scroll) that
+                        // dismissing outright would be too eager.
+                        //
+                        // A mouse reaching this same point is unambiguous:
+                        // isMouseDown means this is a plain mouse-button
+                        // down with no long-press wait at all (see
+                        // isMouseDown's own doc), so landing here away from
+                        // the existing selection's handles is a genuine
+                        // "clicked elsewhere" - behave like clicking empty
+                        // space anywhere else and dismiss it ("mouse
+                        // bosluga basinca selection kaybolsun"), consuming
+                        // the down so this doesn't also fall through into
+                        // MainActivity's tap-to-toggle-keyboard handling
+                        // the way an ordinary click on truly empty space
+                        // (existingRange == null, further below) already
+                        // does via down.consume() there.
                         if (existingRange != null) {
+                            if (isMouseDown) {
+                                selectionState.clear()
+                                down.consume()
+                            }
                             return@awaitEachGesture
                         }
 
@@ -1589,10 +1687,36 @@ fun TerminalView(
                         // every event for the rest of this gesture so
                         // MainActivity's own tap/pan block never sees it
                         // as a tap-to-toggle-keyboard or a pan.
+                        //
+                        // For a mouse specifically, this "long-press
+                        // confirmed" branch is reached on EVERY left-button
+                        // down (see isMouseDown's own doc above - the
+                        // long-press wait is zeroed out entirely for a
+                        // mouse), including a plain click with no drag at
+                        // all. Touch reaching this same point genuinely DID
+                        // wait out the long-press timeout, so planting a
+                        // one-cell selection immediately is the right call
+                        // there - but for a mouse, starting a selection
+                        // (down) here still consumes the whole gesture, then
+                        // the drag-extend loop below runs it: it's not until
+                        // AFTER that loop we can tell whether the button was
+                        // ever actually dragged (pastDeadZone) or just
+                        // clicked and released in place. A plain mouse click
+                        // on empty space is expected to behave like clicking
+                        // empty space anywhere else - dismiss whatever
+                        // selection already existed, not plant a new
+                        // degenerate one-cell one ("mouse bosluga basinca
+                        // selection kaybolsun"). So for a mouse, selection
+                        // start is deferred out of this call and into the
+                        // loop below, right where the first real movement
+                        // past touchSlop is detected - see that loop's own
+                        // updated doc.
                         down.consume()
                         val (startRow, startCol) = snappedCellOf(down.position.x, down.position.y)
-                        selectionState.startAt(startRow, startCol)
-                        selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                        if (!isMouseDown) {
+                            selectionState.startAt(startRow, startCol)
+                            selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                        }
 
                         // A character cell is often only 20-30px wide/tall on
                         // a phone screen - well inside the amount a finger
@@ -1621,13 +1745,35 @@ fun TerminalView(
                         // from `down` every time, since the user may then
                         // legitimately drag back near the start column - that
                         // should still track, not get stuck ungated again).
+                        //
+                        // For a mouse (isMouseDown), this same flag doubles
+                        // as "did the button ever actually get dragged" -
+                        // see startAt's own doc just above for why a mouse's
+                        // selectionState.startAt call is deferred to the
+                        // very first time this flips true, rather than
+                        // happening unconditionally before this loop like it
+                        // does for touch.
                         var pastDeadZone = false
                         while (true) {
                             val event = awaitPointerEvent()
                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
                             change.consume()
                             if (!change.pressed) {
-                                selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                if (isMouseDown && !pastDeadZone) {
+                                    // A mouse click with no drag at all -
+                                    // never started a selection above (see
+                                    // startAt's own doc), so there is
+                                    // nothing of THIS gesture's to
+                                    // recompute. Behave like clicking empty
+                                    // space anywhere else: dismiss whatever
+                                    // selection already existed instead of
+                                    // leaving it sitting there untouched.
+                                    if (selectionState.active) {
+                                        selectionState.clear()
+                                    }
+                                } else {
+                                    selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                                }
                                 break
                             }
                             if (!pastDeadZone) {
@@ -1637,10 +1783,45 @@ fun TerminalView(
                                     continue
                                 }
                                 pastDeadZone = true
+                                if (isMouseDown) {
+                                    // Deferred from before this loop (see
+                                    // startAt's own doc above) - this is the
+                                    // first frame that proves the mouse
+                                    // button is actually being dragged, not
+                                    // just clicked, so start the selection
+                                    // here instead of at the original down
+                                    // point directly. change.position (not
+                                    // down.position) so the visible
+                                    // selection's start cell matches where
+                                    // the drag has ALREADY moved to by the
+                                    // time touchSlop was crossed, exactly
+                                    // like every subsequent updateFocusAt
+                                    // call below already does for its own
+                                    // frame - starting from down.position
+                                    // instead would anchor the selection one
+                                    // touchSlop-radius short of where the
+                                    // drag visibly began.
+                                    val (dragStartRow, dragStartCol) = snappedCellOf(change.position.x, change.position.y)
+                                    selectionState.startAt(dragStartRow, dragStartCol)
+                                }
                             }
                             val (row, col) = cellOf(change.position.x, change.position.y)
                             selectionState.updateFocusAt(row, col)
                             selectionState.recomputeFrom(buffer, latestScrollOffset.value)
+                        }
+
+                        } finally {
+                            // Every exit path from the try block above -
+                            // link opened, short tap elsewhere, movement-
+                            // abort, handle-grab, long-press-confirmed
+                            // selection - lands here, so the underline
+                            // never stays stuck on after release. See
+                            // pressedHyperlinkCell's own doc for why this
+                            // has to be try/finally rather than clearing
+                            // at each individual return@awaitEachGesture:
+                            // there are too many exit branches above to
+                            // reliably remember to clear it at every one.
+                            pressedHyperlinkCell = null
                         }
                     }
                 }
@@ -1649,7 +1830,7 @@ fun TerminalView(
             bufferVersion
             @Suppress("UNUSED_EXPRESSION")
             animTick
-            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedColumnRanges, highlightColor, effectiveSuppressCursor, blinkPhaseOn)
+            drawTerminal(buffer, palette, fontFamily, fontSizeSp, backgroundAlpha, scrollOffset, selectedColumnRanges, highlightColor, effectiveSuppressCursor, blinkPhaseOn, pressedHyperlinkCell)
             // Custom selection handles - two small teardrop markers at the
             // normalized start/end of the active selection, drawn directly
             // against the same charWidthPx/charHeightPx grid the gesture
@@ -1696,7 +1877,13 @@ private fun DrawScope.drawTerminal(
     // blink=true (SGR 5) only actually paints its glyph while this is true,
     // same on/off rhythm every blinking cell on screen shares (see
     // blinkPhaseOn's own doc for why it's one shared clock, not per-cell).
-    blinkPhaseOn: Boolean = true
+    blinkPhaseOn: Boolean = true,
+    // The (row, col) of a hyperlink cell currently being pressed, or null.
+    // See TerminalView's own pressedHyperlinkCell doc for why this exists -
+    // only this ONE cell's hyperlink run gets its underline; every other
+    // OSC 8 cell on screen draws with no special decoration until it's
+    // pressed too.
+    pressedHyperlinkCell: Pair<Int, Int>? = null
 ) {
     // DrawScope implements Density, so both `density` and `fontScale` are
     // available directly here. Real Android sp->px conversion is
@@ -1785,10 +1972,21 @@ private fun DrawScope.drawTerminal(
     // apply), so every one of the four `cell.inverse` reads below becomes
     // `cell.inverse xor reverseVideo` instead.
     val reverseVideo = buffer.reverseVideoMode
+    // Snapshot the WHOLE frame under one lock before painting a single
+    // pixel of it - see snapshotVisibleGrid's own doc for why the old
+    // per-cell buffer.lineAt(row, col, scrollOffset) call inside this loop
+    // (one separate lock/unlock pair PER CELL) was real screen tearing,
+    // not a false alarm: a pty write landing mid-loop could flip some
+    // already-painted rows to "before" and the rest of this same frame to
+    // "after". Reading pressedHyperlinkCell's target-row hyperlink (used
+    // by isPressedLink below) against THIS snapshot rather than calling
+    // buffer.lineAt again keeps that comparison inside the same
+    // consistent instant as everything else this frame paints.
+    val gridSnapshot = buffer.snapshotVisibleGrid(scrollOffset)
     drawIntoCanvas { canvas ->
         for (row in 0 until buffer.rows) {
             for (col in 0 until buffer.columns) {
-                val cell = buffer.lineAt(row, col, scrollOffset)
+                val cell = gridSnapshot[row][col]
                 val x = col * charWidth
                 val y = (row + 1) * charHeight
 
@@ -1869,6 +2067,33 @@ private fun DrawScope.drawTerminal(
                 // second, wrong-shaped/wrong-colored line underneath it.
                 val hasCustomUnderline = cell.underline && (cell.underlineCurly || cell.underlineColor != null)
                 paint.isUnderlineText = cell.underline && !hasCustomUnderline
+                // OSC 8 hyperlink cells get their own underline even when
+                // the source never sent an SGR 4 - this is what makes a
+                // link visually distinguishable as tappable in the first
+                // place (real terminals - iTerm2, kitty, VTE - all do the
+                // same: the underline is a property of "this text carries
+                // a URI", not of whatever SGR state happened to be active
+                // when it was printed). Only kicks in when the cell has no
+                // underline of its own already; an explicitly-SGR-
+                // underlined link keeps whatever shape/color that SGR
+                // requested instead of being overridden here.
+                //
+                // Was unconditional on cell.hyperlink != null - every OSC 8
+                // cell drew underlined ALL the time, whether or not it was
+                // being touched ("hyperlinkteki highlight sadece
+                // tıklandığında olsun, hep olmasın"). Now gated on this
+                // cell sharing the SAME hyperlink URI as pressedHyperlinkCell
+                // (not just being on the same row/col as it) - a press
+                // highlights the WHOLE link run (every adjacent cell
+                // carrying that URI on this row), matching how a real
+                // terminal underlines the full link text rather than a
+                // single character, while everything else on screen stays
+                // undecorated until it's pressed too.
+                val isPressedLink = pressedHyperlinkCell != null &&
+                    pressedHyperlinkCell.first == row &&
+                    cell.hyperlink != null &&
+                    cell.hyperlink == gridSnapshot[row][pressedHyperlinkCell.second].hyperlink
+                val hyperlinkUnderline = isPressedLink && !cell.underline
                 paint.isStrikeThruText = cell.strikethrough
                 paint.textSkewX = if (cell.italic) -0.25f else 0f
 
@@ -1917,7 +2142,7 @@ private fun DrawScope.drawTerminal(
                     if (!drew && (cell.text != " " || cell.underline || cell.strikethrough)) {
                         canvas.nativeCanvas.drawText(cell.text, x, y, paint)
                     }
-                } else if (cell.text != " " || cell.underline || cell.strikethrough) {
+                } else if (cell.text != " " || cell.underline || cell.strikethrough || hyperlinkUnderline) {
                     canvas.nativeCanvas.drawText(cell.text, x, y, paint)
                 }
 
@@ -1965,6 +2190,16 @@ private fun DrawScope.drawTerminal(
                         } else {
                             canvas.nativeCanvas.drawLine(x, underlineY, x + decorWidth, underlineY, decorPaint)
                         }
+                    } else if (hyperlinkUnderline) {
+                        // Plain straight underline in the glyph's own
+                        // color - deliberately the same treatment as a
+                        // bare SGR 4 underline (just driven by cell.
+                        // hyperlink instead of cell.underline), so a link
+                        // reads as "underlined text" rather than getting
+                        // its own distinct decoration style.
+                        decorPaint.color = fg
+                        val underlineY = y + charHeight * 0.06f
+                        canvas.nativeCanvas.drawLine(x, underlineY, x + decorWidth, underlineY, decorPaint)
                     }
                 }
             }

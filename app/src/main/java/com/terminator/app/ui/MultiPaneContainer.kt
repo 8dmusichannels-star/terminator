@@ -146,6 +146,10 @@ fun MultiPaneContainer(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    // Per-pane font-size lookup (a pane's own pinch/step override, falling
+    // back to the flat fontSizeSp above). Defaults to that flat value so a
+    // caller that doesn't track per-pane sizes keeps working unchanged.
+    fontSizeSpFor: (runtimeId: String) -> Float = { fontSizeSp },
     // Settings > Appearance > Pinch to zoom. Threaded down through
     // TilingLayout/FloatingLayout to PaneContent's own gesture loop, which
     // previously ignored this setting entirely (it has its own local,
@@ -182,6 +186,12 @@ fun MultiPaneContainer(
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
     onResizePane: (runtimeId: String, size: Size) -> Unit,
     onResizeSessionPty: (runtimeId: String, columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit,
+    // Pinch-zoom commit for a tile - see TilingLayout's identical param for
+    // the full doc on why this needs to reach the caller's ViewModel
+    // instead of staying tile-local. Defaults to a no-op so any existing
+    // caller not yet updated keeps compiling with today's behavior (a
+    // pinch-zoomed tile reverts once its debounced resize commits).
+    onZoomTextSize: (runtimeId: String, newSizeSp: Float) -> Unit = { _, _ -> },
     onSetMode: (PaneMode) -> Unit,
     onAddPaneRequested: () -> Unit,
     onExitMultiPane: () -> Unit,
@@ -240,6 +250,7 @@ fun MultiPaneContainer(
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
+                    fontSizeSpFor = fontSizeSpFor,
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -248,6 +259,7 @@ fun MultiPaneContainer(
                     onFocusPane = onFocusPane,
                     onClosePane = onClosePane,
                     onResizeSessionPty = onResizeSessionPty,
+                    onZoomTextSize = onZoomTextSize,
                     onWantsMouseEvents = onWantsMouseEvents,
                     onWantsMouseMoveEvents = onWantsMouseMoveEvents,
                     onMouseEvent = onMouseEvent,
@@ -271,6 +283,7 @@ fun MultiPaneContainer(
                     palette = palette,
                     fontFamily = fontFamily,
                     fontSizeSp = fontSizeSp,
+                    fontSizeSpFor = fontSizeSpFor,
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -281,6 +294,7 @@ fun MultiPaneContainer(
                     onMovePane = onMovePane,
                     onResizePane = onResizePane,
                     onResizeSessionPty = onResizeSessionPty,
+                    onZoomTextSize = onZoomTextSize,
                     onWantsMouseEvents = onWantsMouseEvents,
                     onWantsMouseMoveEvents = onWantsMouseMoveEvents,
                     onMouseEvent = onMouseEvent,
@@ -374,6 +388,7 @@ private fun TilingLayout(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    fontSizeSpFor: (String) -> Float,
     zoomEnabled: Boolean = true,
     softKeyboardEnabled: Boolean = true,
     allowCustomHyperlinkSchemes: Boolean = false,
@@ -382,6 +397,14 @@ private fun TilingLayout(
     onFocusPane: (String) -> Unit,
     onClosePane: (String) -> Unit,
     onResizeSessionPty: (String, Int, Int, Int, Int) -> Unit,
+    // Threaded down to each tile's own PaneContent(onZoomTextSize=...) -
+    // see PaneContent's own doc on why this needs to reach the ViewModel
+    // (pinch commit must persist fontSizeSp, not just the tile-local
+    // zoomSizeSp, or the zoom silently reverts the next time
+    // effectiveFontSizeSp falls back to reading the fontSizeSp prop).
+    // Defaults to a no-op so any existing caller not yet updated keeps
+    // compiling with today's (reverting) behavior.
+    onZoomTextSize: (runtimeId: String, newSizeSp: Float) -> Unit = { _, _ -> },
     onWantsMouseEvents: (String) -> Boolean = { false },
     onWantsMouseMoveEvents: (String) -> Boolean = { false },
     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
@@ -461,7 +484,7 @@ private fun TilingLayout(
                                     bufferVersion = bufferVersion,
                                     palette = palette,
                                     fontFamily = fontFamily,
-                                    fontSizeSp = fontSizeSp,
+                                    fontSizeSp = fontSizeSpFor(pane.runtimeId),
                                     zoomEnabled = zoomEnabled,
                                     softKeyboardEnabled = softKeyboardEnabled,
                                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -470,6 +493,7 @@ private fun TilingLayout(
                                     onFocus = { onFocusPane(pane.runtimeId) },
                                     onClose = { onClosePane(pane.runtimeId) },
                                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
+                                    onZoomTextSize = { newSize -> onZoomTextSize(pane.runtimeId, newSize) },
                                     fontDensity = density,
                                     showDragHandle = false,
                                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
@@ -588,6 +612,7 @@ private fun FloatingLayout(
     palette: TerminalPalette,
     fontFamily: android.graphics.Typeface,
     fontSizeSp: Float,
+    fontSizeSpFor: (String) -> Float,
     zoomEnabled: Boolean = true,
     softKeyboardEnabled: Boolean = true,
     allowCustomHyperlinkSchemes: Boolean = false,
@@ -598,6 +623,8 @@ private fun FloatingLayout(
     onMovePane: (runtimeId: String, offset: Offset) -> Unit,
     onResizePane: (runtimeId: String, size: Size) -> Unit,
     onResizeSessionPty: (String, Int, Int, Int, Int) -> Unit,
+    // See TilingLayout's identical param for the full doc.
+    onZoomTextSize: (runtimeId: String, newSizeSp: Float) -> Unit = { _, _ -> },
     onWantsMouseEvents: (String) -> Boolean = { false },
     onWantsMouseMoveEvents: (String) -> Boolean = { false },
     onMouseEvent: (runtimeId: String, kind: TerminalEmulator.MouseEventKind, col: Int, row: Int, button: Int) -> Unit = { _, _, _, _, _ -> },
@@ -673,7 +700,7 @@ private fun FloatingLayout(
                     bufferVersion = bufferVersion,
                     palette = palette,
                     fontFamily = fontFamily,
-                    fontSizeSp = fontSizeSp,
+                    fontSizeSp = fontSizeSpFor(pane.runtimeId),
                     zoomEnabled = zoomEnabled,
                     softKeyboardEnabled = softKeyboardEnabled,
                     allowCustomHyperlinkSchemes = allowCustomHyperlinkSchemes,
@@ -682,6 +709,7 @@ private fun FloatingLayout(
                     onFocus = { onFocusPane(pane.runtimeId) },
                     onClose = { onClosePane(pane.runtimeId) },
                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
+                    onZoomTextSize = { newSize -> onZoomTextSize(pane.runtimeId, newSize) },
                     fontDensity = density,
                     showDragHandle = true,
                     onDragStart = {
@@ -761,6 +789,18 @@ private fun PaneContent(
     onFocus: () -> Unit,
     onClose: () -> Unit,
     onMeasuredSize: (columns: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) -> Unit,
+    // Persists a pinch-zoom's final font size back to the ViewModel (see
+    // zoomSizeSp's own "never reset" doc above, right where it's declared,
+    // for the full story) - defaulted to a no-op so any existing caller not
+    // yet updated keeps compiling, same degradation pattern as
+    // emulatorForPane/onRegisterJumpHandler's own defaults just above.
+    // Without this wired, zoomSizeSp resetting to null after a pinch (the
+    // fix for THAT bug) would just make the pinch's own zoom silently
+    // revert once the debounced resize commits, since fontSizeSp - with
+    // nothing here ever writing the pinch's result back to it - would still
+    // hold whatever value the ViewModel had before the gesture ever
+    // started.
+    onZoomTextSize: (Float) -> Unit = {},
     fontDensity: Float,
     showDragHandle: Boolean,
     modifier: Modifier = Modifier,
@@ -905,6 +945,12 @@ private fun PaneContent(
         mutableStateOf<IntSize?>(null)
     }
     val latestOnMeasuredSize = rememberUpdatedState(onMeasuredSize)
+    // Same rememberUpdatedState treatment as latestOnMeasuredSize just
+    // above, for the exact same reason - the pinch/pan pointerInput block
+    // below is keyed only on runtimeId (see its own doc), so a plain
+    // captured onZoomTextSize would go stale across recompositions the same
+    // way a plain onMeasuredSize would.
+    val latestOnZoomTextSize = rememberUpdatedState(onZoomTextSize)
     val latestCharMetrics = rememberUpdatedState(charMetrics)
     // Set true for the duration of a manual corner-handle resize drag (see
     // onDragStart/onDragEnd below) so onSizeChanged's own debounce can tell
@@ -942,8 +988,44 @@ private fun PaneContent(
     // along the right/bottom exactly like the primary pane's own case.
     // Skipped while zoomSizeSp is non-null so this never fights an
     // in-progress pinch's own gesture-loop resize.
+    //
+    // Debounced 150ms (same window as MainActivity's primary-pane fix and
+    // SplitTerminalPane's own fontSizeSp LaunchedEffect - see either one's
+    // "firtina" doc for the full story): this tile is also a valid
+    // stepZoom target (MainActivity's zoomTargetId() returns
+    // focusedPaneRuntimeId first, whenever any multi-pane tile is open),
+    // and stepZoom writes straight to viewModel.setSessionTextSize with no
+    // staging of its own per keyboard-zoom step - so a fast run of steps
+    // re-keyed this LaunchedEffect, and being undebounced, fired one real
+    // buffer.resize()+SIGWINCH (and, for a full-screen program in this
+    // tile, one full reinit) per intermediate step instead of once for the
+    // whole burst. A single, isolated font-size change (e.g. the Settings
+    // slider this was originally written for) still resizes within 150ms,
+    // same as before - only a rapid multi-step burst is now coalesced to
+    // its last value.
+    // fontSizeResizePending mirrors MainActivity's/SplitTerminalPane's own
+    // flag of the same name (see either one's doc for the full mechanism):
+    // effectiveFontSizeSp changes straight away (charMetrics above recomputes
+    // that same composition, via its own remember(effectiveFontSizeSp) key),
+    // but the actual buffer.resize()/SIGWINCH below only lands after this
+    // LaunchedEffect's 150ms delay - a real window where this tile's Canvas
+    // draws the NEW charWidth/charHeight against the OLD buffer.rows/columns
+    // (and therefore stale cursorRow/cursorCol indices), same "zoom yapip
+    // enter basinca cursor yanlis yere dusuyor" gap already fixed for the
+    // primary pane and split pane. Set true the same composition
+    // effectiveFontSizeSp changes (synchronously, not from inside the
+    // LaunchedEffect body, which only runs on a LATER coroutine dispatch),
+    // folded into suppressCursor below so the cursor stays hidden for the
+    // whole gap instead of flashing at the wrong position for one frame.
+    var fontSizeResizePending by remember(runtimeId) { mutableStateOf(false) }
+    val lastEffectiveFontSizeSpSeen = remember(runtimeId) { mutableStateOf(effectiveFontSizeSp) }
+    if (lastEffectiveFontSizeSpSeen.value != effectiveFontSizeSp) {
+        lastEffectiveFontSizeSpSeen.value = effectiveFontSizeSp
+        fontSizeResizePending = true
+    }
     LaunchedEffect(effectiveFontSizeSp) {
         if (zoomSizeSp == null) {
+            delay(150)
             val finalSize = latestPaneSizePx
             val (charWidth, charHeight) = latestCharMetrics.value
             if (charWidth > 0f && charHeight > 0f && finalSize != null) {
@@ -952,6 +1034,7 @@ private fun PaneContent(
                 latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
             }
         }
+        fontSizeResizePending = false
     }
 
     // Local scroll offset into this pane's own scrollback - independent of
@@ -1862,6 +1945,38 @@ private fun PaneContent(
                                 // zoomed (zoomedThisGesture) - a pure pan
                                 // has nothing to resize.
                                 if (zoomedThisGesture) {
+                                    // zoomSizeSp was NEVER reset back to null after a
+                                    // pinch ended - effectiveFontSizeSp (zoomSizeSp ?:
+                                    // fontSizeSp) is a val computed once per
+                                    // composition, so once any pinch ever touched this
+                                    // tile, zoomSizeSp stayed permanently non-null and
+                                    // effectiveFontSizeSp NEVER fell back to reading
+                                    // fontSizeSp again for the rest of this tile's
+                                    // lifetime. Two knock-on failures from that: (1) a
+                                    // later Settings > Appearance > Text Size change, or
+                                    // a keyboard stepZoom targeting this tile (both of
+                                    // which only ever write fontSizeSp, never
+                                    // zoomSizeSp), silently had NO visible effect on
+                                    // this tile once it had been pinched even once -
+                                    // charMetrics/drawTerminal kept rendering at the
+                                    // frozen last-pinch size forever; (2) the
+                                    // LaunchedEffect(effectiveFontSizeSp) fix above
+                                    // (both the original black-gap fix and this file's
+                                    // own font-size-resize-pending flag) could never
+                                    // fire again for this tile after the first pinch
+                                    // either, since its key (effectiveFontSizeSp) had
+                                    // stopped changing - so the keyboard-zoom cursor/
+                                    // resize fix landed everywhere else but silently
+                                    // never engaged here, which is exactly the "hepsinde
+                                    // var, split/multide daha yavas" gap that remained.
+                                    // Setting it back to null here - AFTER firing the
+                                    // resize below against this gesture's own final
+                                    // value, mirroring SplitTerminalPane's own
+                                    // onLiveZoom(null)-after-commit ordering - lets
+                                    // effectiveFontSizeSp read fontSizeSp again for any
+                                    // later external change, exactly like every other
+                                    // pinch-zoom commit path in this codebase already
+                                    // does.
                                     paneResizeDebounceJob?.cancel()
                                     paneResizeDebounceJob = paneResizeScope.launch {
                                         delay(120L)
@@ -1872,6 +1987,18 @@ private fun PaneContent(
                                             val rws = (finalSize.height / charHeight).toInt().coerceAtLeast(1)
                                             latestOnMeasuredSize.value(cols, rws, finalSize.width, finalSize.height)
                                         }
+                                        // Persists the gesture's final font size to the
+                                        // ViewModel BEFORE clearing zoomSizeSp - onZoomTextSize
+                                        // writes fontSizeSp's own backing state
+                                        // (viewModel.setSessionTextSize), so by the time
+                                        // zoomSizeSp goes null on the next line and
+                                        // effectiveFontSizeSp falls back to reading fontSizeSp,
+                                        // that prop has already caught up to the pinch's result -
+                                        // otherwise this composable would recompose for one frame
+                                        // with effectiveFontSizeSp snapping back to the PRE-pinch
+                                        // fontSizeSp value before the new prop value arrived.
+                                        latestOnZoomTextSize.value(latestEffectiveFontSizeSp.value)
+                                        zoomSizeSp = null
                                     }
                                 }
                             }
@@ -2022,7 +2149,7 @@ private fun PaneContent(
                         // means the cursor simply reappears at the right spot the moment
                         // the drag ends and the final resize commits, instead of
                         // visibly drifting the entire time.
-                        suppressCursor = zoomSizeSp != null || isManuallyResizing,
+                        suppressCursor = zoomSizeSp != null || isManuallyResizing || fontSizeResizePending,
                         modifier = Modifier.fillMaxSize()
                     )
                     // Anchored in this same Box as TerminalView (top-center
