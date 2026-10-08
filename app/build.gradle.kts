@@ -17,8 +17,8 @@ android {
         applicationId = "com.terminator.app"
         minSdk = 33
         targetSdk = 37
-        versionCode = 22
-        versionName = "2.3.3"
+        versionCode = 23
+        versionName = "2.4.5"
     }
     buildFeatures {
         compose = true
