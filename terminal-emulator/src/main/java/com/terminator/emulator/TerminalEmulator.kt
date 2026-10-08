@@ -1530,6 +1530,10 @@ class TerminalEmulator(
         }
     }
 
+    /** After the last column is written cursorCol == columns (xterm's pending-wrap state).
+     *  Cursor-movement and erase operations must act from columns-1, like xterm. */
+    private fun pendingWrapCol(): Int = cursorCol.coerceAtMost(buffer.columns - 1)
+
     private fun handleNormal(ch: Char) {
         when (ch) {
             '\u001B' -> { state = State.ESCAPE }
@@ -1548,7 +1552,9 @@ class TerminalEmulator(
             // characters into the grid instead of moving the cursor.
             '\n', '\u000B', '\u000C' -> lineFeed()
             '\r' -> cursorCol = 0
-            '\b' -> if (cursorCol > 0) cursorCol--
+            // Backspace from a pending-wrap cursor (cursorCol == columns) moves
+            // to columns-2, matching xterm.
+            '\b' -> cursorCol = (pendingWrapCol() - 1).coerceAtLeast(0)
             '\t' -> cursorCol = nextTabStop(cursorCol)
             // SO (Shift Out) / SI (Shift In) - lock in G1/G0 respectively
             // (see lockingGSet's own doc). Classic ncurses line-drawing
@@ -1982,6 +1988,9 @@ class TerminalEmulator(
             state = State.NORMAL
             return
         }
+
+        // Movement/erase finals act from the pending-wrap column (see pendingWrapCol).
+        if (ch in "ABCDEFGHfaed`KJXP@") cursorCol = pendingWrapCol()
 
         when (ch) {
             'A' -> cursorRow = (cursorRow - (params.getOrElse(0) { 1 }).coerceAtLeast(1)).coerceAtLeast(0)
