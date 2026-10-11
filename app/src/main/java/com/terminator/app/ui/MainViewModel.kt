@@ -775,8 +775,8 @@ class MainViewModel(
                 _uiState.value = _uiState.value.copy(bellTick = _uiState.value.bellTick + 1)
             }
             override fun onTitleChanged(title: String) { /* surfaced via titlebar if desired */ }
-            override fun onCursorMoved(row: Int, col: Int) { bumpVersionThrottled() }
-            override fun onContentChanged() { bumpVersionThrottled() }
+            override fun onCursorMoved(row: Int, col: Int) { bumpVersionThrottled(session.inputPending, session.recentlyErasedScreen) }
+            override fun onContentChanged() { bumpVersionThrottled(session.inputPending, session.recentlyErasedScreen) }
             // DSR/CPR replies (CSI 6n/5n) - the emulator computed the
             // answer, this just has to get those bytes back onto the pty.
             // Without this, anything that probes cursor position on
@@ -1956,7 +1956,17 @@ class MainViewModel(
         // single call.
         val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
             (pixelWidth != lastCommittedPixelWidth || pixelHeight != lastCommittedPixelHeight)
-        if (newColumns == columns && newRows == rows && !pixelSizeChanged) return
+        val splitRuntimeId = _uiState.value.splitRuntimeId
+        // The cached columns/rows alone isn't proof every session is at that
+        // size: updateTerminalSizeFor (split/multi-pane) resizes sessions
+        // individually without touching this cache, so after a mode switch a
+        // session can sit at a stale size while the cache still matches the
+        // new measurement - skipping here swallowed the resize + SIGWINCH
+        // (grid not filling the screen, ncurses never redrawing = black area).
+        val sessionsInSync = liveSessions.all { (id, session) ->
+            id == splitRuntimeId || (session.buffer.columns == newColumns && session.buffer.rows == newRows)
+        }
+        if (newColumns == columns && newRows == rows && !pixelSizeChanged && sessionsInSync) return
         columns = newColumns
         rows = newRows
         if (pixelWidth > 0 && pixelHeight > 0) {
@@ -1977,7 +1987,6 @@ class MainViewModel(
         // overwrite the split partner's just-computed correct size back to
         // the primary's (wrong, for anything but a dead-center split)
         // size, undoing updateTerminalSizeFor's own commit a moment later.
-        val splitRuntimeId = _uiState.value.splitRuntimeId
         liveSessions.forEach { (runtimeId, session) ->
             if (runtimeId != splitRuntimeId) {
                 session.resize(newColumns, newRows, pixelWidth, pixelHeight)
@@ -2043,7 +2052,11 @@ class MainViewModel(
         // Canvas's new font size.
         val pixelSizeChanged = pixelWidth > 0 && pixelHeight > 0 &&
             (current == null || current.size < 4 || pixelWidth != current[2] || pixelHeight != current[3])
-        if (current != null && current[0] == newColumns && current[1] == newRows && !pixelSizeChanged) return
+        // Same reasoning as updateTerminalSize's sessionsInSync: the cache can
+        // outlive a classic-path resize of this very session.
+        val liveBuf = liveSessions[runtimeId]?.buffer
+        val bufferInSync = liveBuf == null || (liveBuf.columns == newColumns && liveBuf.rows == newRows)
+        if (current != null && current[0] == newColumns && current[1] == newRows && !pixelSizeChanged && bufferInSync) return
         paneColumnsRows[runtimeId] = intArrayOf(newColumns, newRows, pixelWidth, pixelHeight)
         liveSessions[runtimeId]?.resize(newColumns, newRows, pixelWidth, pixelHeight)
         bumpVersion()
@@ -2097,9 +2110,14 @@ class MainViewModel(
     // A plain background Thread does the wait rather than a coroutine, since
     // this must not depend on viewModelScope/Dispatchers.Main - it's invoked
     // from a raw reader Thread that has no coroutine context of its own.
-    private fun bumpVersionThrottled() {
+    // deferLeading: more pty bytes are already queued behind this chunk, so
+    // the screen is likely mid-redraw (e.g. after CSI 2J) - skip the
+    // immediate paint and let the trailing flush below show the finished frame.
+    // erased: a full-screen erase just happened, so hold the paint (40ms
+    // instead of one frame) for the redraw's content lines to land after it.
+    private fun bumpVersionThrottled(deferLeading: Boolean = false, erased: Boolean = false) {
         val now = System.nanoTime()
-        if (now - lastVersionBumpNanos >= versionBumpThrottleNanos) {
+        if (!deferLeading && !erased && now - lastVersionBumpNanos >= versionBumpThrottleNanos) {
             lastVersionBumpNanos = now
             bumpVersion()
             return
@@ -2107,7 +2125,7 @@ class MainViewModel(
         if (pendingVersionBump.compareAndSet(false, true)) {
             Thread {
                 try {
-                    Thread.sleep(versionBumpThrottleNanos / 1_000_000L)
+                    Thread.sleep(if (erased) 40L else versionBumpThrottleNanos / 1_000_000L)
                 } catch (_: InterruptedException) {
                     // Falls through and flushes anyway - a dropped final
                     // frame here would be the exact tearing/stale-paint this
