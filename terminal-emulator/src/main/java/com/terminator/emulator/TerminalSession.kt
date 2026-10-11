@@ -153,6 +153,22 @@ class TerminalSession(
     // race, not a hypothetical one. Both call sites synchronize on this
     // same object so at most one is ever inside append() at a time.
     private val emulatorAppendLock = Any()
+
+    // True while more pty bytes are already waiting right behind the chunk
+    // the reader is currently appending. A full-screen redraw (ncurses:
+    // CSI H + CSI 2J, then content) usually spans several reads, and
+    // painting right after the first one shows a cleared/half-drawn frame
+    // (black flash). The UI uses this to defer its paint to the trailing
+    // flush instead of painting immediately.
+    @Volatile var inputPending: Boolean = false
+        private set
+
+    /** True for ~40ms after a full-screen erase - see
+     *  [TerminalEmulator.lastFullEraseNanos]. The UI holds its paint for it. */
+    val recentlyErasedScreen: Boolean
+        get() = ::emulator.isInitialized && emulator.lastFullEraseNanos.let {
+            it != 0L && System.nanoTime() - it < 40_000_000L
+        }
     // All writes to the pty - user keystrokes, mouse events, and (critically)
     // DSR/CPR auto-replies from TerminalEmulator.Listener.onRespond - go
     // through this queue instead of a direct outputStream.write() call. The
@@ -294,6 +310,7 @@ class TerminalSession(
                     val n = isr.read(buf)
                     if (n < 0) break
                     val chunk = String(buf, 0, n)
+                    inputPending = isr.ready()
                     synchronized(emulatorAppendLock) { emulator.append(chunk) }
                     appendHistory(chunk)
                 }

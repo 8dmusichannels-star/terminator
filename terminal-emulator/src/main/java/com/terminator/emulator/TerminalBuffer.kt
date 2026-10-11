@@ -355,7 +355,9 @@ class TerminalBuffer(
      * can touch the grid while this method holds the lock.
      */
     fun snapshotVisibleGrid(scrollOffset: Int): List<List<Cell>> = lock.withLock {
-        if (scrollOffset <= 0) {
+        // Alternate screen has no scrollback (see scrollUp) - a stale
+        // scrollOffset must not splice the PRIMARY screen's history above it.
+        if (scrollOffset <= 0 || altGrid != null) {
             return@withLock (0 until rows).map { row -> (0 until columns).map { col -> cellAt(row, col) } }
         }
         val totalScrollback = scrollback.size
@@ -1347,7 +1349,8 @@ class TerminalBuffer(
      * `scrollback[scrollback.size - offset]`.
      */
     fun lineAt(row: Int, col: Int, scrollOffset: Int): Cell = lock.withLock {
-        if (scrollOffset <= 0) return@withLock cellAt(row, col)
+        // Same alt-screen rule as snapshotVisibleGrid: no scrollback view.
+        if (scrollOffset <= 0 || altGrid != null) return@withLock cellAt(row, col)
         val totalScrollback = scrollback.size
         // The visible window is `rows` lines tall. At scrollOffset, the
         // first `scrollOffset` visible rows come from the tail of
@@ -1374,7 +1377,7 @@ class TerminalBuffer(
     }
 
     /** How many lines are available to scroll back through right now. */
-    val maxScrollOffset: Int get() = lock.withLock { scrollback.size }
+    val maxScrollOffset: Int get() = lock.withLock { if (altGrid != null) 0 else scrollback.size }
 
     /**
      * [row]'s on-screen text, respecting [scrollOffset] the same way

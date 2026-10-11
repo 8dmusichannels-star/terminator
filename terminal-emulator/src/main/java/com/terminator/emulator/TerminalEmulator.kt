@@ -4767,9 +4767,17 @@ class TerminalEmulator(
         cursorRow = (anchorRow + actualRows).coerceAtMost(buffer.rows - 1)
     }
 
+    // System.nanoTime() of the last full-screen erase (CSI 2J, or CSI J from
+    // home), 0 = never. Lets the UI hold its next paint for a few ms: programs
+    // that redraw as "erase everything, then write lines" (toybox top, ...)
+    // otherwise get a blank frame painted between the erase and the content.
+    @Volatile var lastFullEraseNanos: Long = 0L
+        private set
+
     private fun eraseInDisplay(mode: Int) {
         when (mode) {
             0 -> { // cursor to end of screen
+                if (cursorRow == 0 && cursorCol == 0) lastFullEraseNanos = System.nanoTime()
                 eraseInLine(0)
                 for (r in cursorRow + 1 until buffer.rows) buffer.clearRow(r, curBg)
             }
@@ -4778,6 +4786,7 @@ class TerminalEmulator(
                 eraseInLine(1)
             }
             2 -> {
+                lastFullEraseNanos = System.nanoTime()
                 buffer.clearAll(curBg)
                 if (clearAlwaysPurgesScrollback) buffer.clearScrollback()
             }
@@ -5144,18 +5153,13 @@ class TerminalEmulator(
         if (resizeRowShift != 0) {
             savedCursorRow = (savedCursorRow + resizeRowShift).coerceIn(0, (buffer.rows - 1).coerceAtLeast(0))
         }
-        // DECSLRM margins were computed against the PRE-resize column
-        // count too (same staleness hazard tabStops' own doc describes) -
-        // clamp scrollRight into the new width and, if that collapses the
-        // region to nothing meaningful (left >= right), just drop back to
-        // the full new width rather than leaving an inverted/degenerate
-        // margin pair in place.
-        scrollRight = scrollRight.coerceIn(0, buffer.columns - 1)
-        scrollLeft = scrollLeft.coerceIn(0, buffer.columns - 1)
-        if (scrollLeft >= scrollRight) {
-            scrollLeft = 0
-            scrollRight = buffer.columns - 1
-        }
+        // DECSLRM margins were computed against the PRE-resize column count.
+        // coerceIn() only ever shrinks, so after a grow (e.g. 61 -> 154 cols on
+        // pinch-zoom) scrollRight stayed at the old width, marginsActive turned
+        // true and lines wrapped at the stale right edge. Like xterm, a resize
+        // resets the left/right margins; DECSLRM apps re-set them on SIGWINCH.
+        scrollLeft = 0
+        scrollRight = buffer.columns - 1
         // A custom tab-stop set was built against the PRE-resize column
         // count (defaultTabStops() reads buffer.columns at the moment HTS/
         // TBC first materializes it). If the grid just shrank, stale stops

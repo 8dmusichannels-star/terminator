@@ -494,7 +494,7 @@ private fun TilingLayout(
                                     onClose = { onClosePane(pane.runtimeId) },
                                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
                                     onZoomTextSize = { newSize -> onZoomTextSize(pane.runtimeId, newSize) },
-                                    fontDensity = density,
+                                    fontDensity = density * LocalDensity.current.fontScale,
                                     showDragHandle = false,
                                     onWantsMouseEvents = { onWantsMouseEvents(pane.runtimeId) },
                                     onWantsMouseMoveEvents = { onWantsMouseMoveEvents(pane.runtimeId) },
@@ -710,7 +710,7 @@ private fun FloatingLayout(
                     onClose = { onClosePane(pane.runtimeId) },
                     onMeasuredSize = { cols, rws, pxW, pxH -> onResizeSessionPty(pane.runtimeId, cols, rws, pxW, pxH) },
                     onZoomTextSize = { newSize -> onZoomTextSize(pane.runtimeId, newSize) },
-                    fontDensity = density,
+                    fontDensity = density * LocalDensity.current.fontScale,
                     showDragHandle = true,
                     onDragStart = {
                         dragStartOffset = pane.floatOffset
@@ -1979,7 +1979,9 @@ private fun PaneContent(
                                     // does.
                                     paneResizeDebounceJob?.cancel()
                                     paneResizeDebounceJob = paneResizeScope.launch {
-                                        delay(120L)
+                                        // ~2 frames: lets the last pinch frame's recomposition refresh
+                                        // latestCharMetrics; the old 120ms made zoom commits lag.
+                                        delay(32L)
                                         val (charWidth, charHeight) = latestCharMetrics.value
                                         val finalSize = latestPaneSizePx
                                         if (charWidth > 0f && charHeight > 0f && finalSize != null) {
