@@ -163,6 +163,18 @@ class TerminalSession(
     @Volatile var inputPending: Boolean = false
         private set
 
+    /** Program acik bir synchronized-output frame'inde (ESC[?2026h..l) mi. */
+    val syncOutputActive: Boolean
+        get() = ::emulator.isInitialized && emulator.syncUpdateActive
+
+    @Volatile private var burstUntilNanos: Long = 0L
+
+    /** Neredeyse dolu bir pty okumasindan sonra ~8 ms true: program buyuk bir
+     *  yazmanin ortasinda (ornegin btop menu katmani), sonraki parca birkac ms
+     *  uzakta. Kucuk okumalar (yazi yazma) bunu tetiklemez, gecikme eklemez. */
+    val burstActive: Boolean
+        get() = System.nanoTime() < burstUntilNanos
+
     /** True for ~40ms after a full-screen erase - see
      *  [TerminalEmulator.lastFullEraseNanos]. The UI holds its paint for it. */
     val recentlyErasedScreen: Boolean
@@ -311,6 +323,7 @@ class TerminalSession(
                     if (n < 0) break
                     val chunk = String(buf, 0, n)
                     inputPending = isr.ready()
+                    if (n >= 3500) burstUntilNanos = System.nanoTime() + 8_000_000L
                     synchronized(emulatorAppendLock) { emulator.append(chunk) }
                     appendHistory(chunk)
                 }

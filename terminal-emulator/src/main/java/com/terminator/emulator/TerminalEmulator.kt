@@ -459,8 +459,16 @@ class TerminalEmulator(
     // skip a repaint while true; nothing here withholds buffer writes based
     // on it; a program that never asked for this keeps rendering exactly as
     // before (default false = always paint immediately, same as today).
-    var inSynchronizedUpdate: Boolean = false
+    @Volatile var inSynchronizedUpdate: Boolean = false
         private set
+
+    /** ESC[?2026h zamani (nanoTime). Hic 'l' gelmezse ekran sonsuza dek donmasin. */
+    @Volatile private var syncUpdateStartNanos: Long = 0L
+
+    /** Acik bir synchronized-output frame'i var mi (UI bu sirada paint etmemeli). */
+    val syncUpdateActive: Boolean
+        get() = inSynchronizedUpdate &&
+            System.nanoTime() - syncUpdateStartNanos < TerminalBuffer.SYNC_TIMEOUT_NANOS
 
     // G0/G1 designated character sets (SCS, "ESC ( X" / "ESC ) X") and
     // which of the two is currently invoked (SI/SO, \u000F/\u000E) - see
@@ -1695,10 +1703,11 @@ class TerminalEmulator(
             // swallowed (fell to the `else` branch below), which lost the
             // saved position entirely and could leave the cursor - and
             // anything drawn relative to it - in the wrong place.
-            '7' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol; state = State.NORMAL }
+            '7' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol; decscSgr = captureSgr(); state = State.NORMAL }
             '8' -> {
                 cursorRow = savedCursorRow.coerceIn(0, buffer.rows - 1)
                 cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
+                decscSgr?.let { applySgr(it) }
                 state = State.NORMAL
             }
             // IND (Index) - move down one line, scrolling the region if
@@ -2113,11 +2122,12 @@ class TerminalEmulator(
                 cursorRow = scrollTop
                 cursorCol = scrollLeft
             } else {
-                savedCursorRow = cursorRow; savedCursorCol = cursorCol
+                savedCursorRow = cursorRow; savedCursorCol = cursorCol; decscSgr = captureSgr()
             }
             'u' -> {
                 cursorRow = savedCursorRow.coerceIn(0, buffer.rows - 1)
                 cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
+                decscSgr?.let { applySgr(it) }
             }
             'r' -> {
                 // DECSTBM: set scrolling region (1-indexed, inclusive). No
@@ -2386,10 +2396,18 @@ class TerminalEmulator(
                     // clean separate buffer, which is what made them look
                     // garbled. 1049 also implies save/restore cursor.
                     if (enable) {
+                        if (!buffer.inAlternateScreen) altScreenSgr = captureSgr()
                         buffer.enterAlternateScreen()
+                        // Alt ekrani shell'den kalan renkle degil varsayilan arka planla temizle.
+                        val keepBg = curBg
+                        curBg = TerminalBuffer.DEFAULT_BACKGROUND
                         eraseInDisplay(2)
+                        curBg = keepBg
                     } else {
+                        val wasAlt = buffer.inAlternateScreen
                         buffer.exitAlternateScreen()
+                        // TUI'dan once shell'in sahip oldugu renkleri geri ver.
+                        if (wasAlt) { applySgr(altScreenSgr); altScreenSgr = null }
                     }
                     cursorRow = buffer.cursorRow
                     cursorCol = buffer.cursorCol
@@ -2421,7 +2439,16 @@ class TerminalEmulator(
                 // Purely advisory (this module doesn't defer any writes on
                 // its own), so simply mirrors the h/l straight into the
                 // flag the UI layer's render loop can check.
-                2026 -> inSynchronizedUpdate = enable
+                2026 -> {
+                    if (enable) {
+                        // Frame'in ilk 'h'inde dondur; tekrarlayan 'h' yarim grid yakalamasin.
+                        if (!syncUpdateActive) buffer.freezeFrame()
+                        syncUpdateStartNanos = System.nanoTime()
+                    } else {
+                        buffer.unfreezeFrame()
+                    }
+                    inSynchronizedUpdate = enable
+                }
                 // Bracketed paste (see bracketedPasteMode's own doc) - was
                 // previously matched by the generic `else` branch below
                 // (silently ignored), which is why pasted multi-line text
@@ -4941,6 +4968,34 @@ class TerminalEmulator(
         }
     }
 
+    // DECSC/DECRC ve 1049/47 imlec ile birlikte SGR (renk/nitelik) durumunu da
+    // kaydedip geri yuklemeli (xterm boyle yapar). Yoksa btop'un cikista biraktigi
+    // arka plan rengi shell'de kalir ve terminal maviye boyanir.
+    private class SgrState(
+        val fg: Int, val bg: Int, val bold: Boolean, val underline: Boolean,
+        val inverse: Boolean, val italic: Boolean, val dim: Boolean,
+        val blink: Boolean, val strike: Boolean, val conceal: Boolean,
+        val overline: Boolean, val curly: Boolean, val ulColor: Int?
+    )
+
+    private fun captureSgr() = SgrState(
+        curFg, curBg, curBold, curUnderline, curInverse, curItalic, curDim,
+        curBlink, curStrikethrough, curConceal, curOverline,
+        curUnderlineCurly, curUnderlineColor
+    )
+
+    private fun applySgr(s: SgrState?) {
+        if (s == null) { resetSgr(); return }
+        curFg = s.fg; curBg = s.bg; curBold = s.bold; curUnderline = s.underline
+        curInverse = s.inverse; curItalic = s.italic; curDim = s.dim
+        curBlink = s.blink; curStrikethrough = s.strike; curConceal = s.conceal
+        curOverline = s.overline; curUnderlineCurly = s.curly
+        curUnderlineColor = s.ulColor
+    }
+
+    private var decscSgr: SgrState? = null
+    private var altScreenSgr: SgrState? = null
+
     private fun resetSgr() {
         curFg = TerminalBuffer.DEFAULT_FOREGROUND
         curBg = TerminalBuffer.DEFAULT_BACKGROUND
@@ -4992,6 +5047,9 @@ class TerminalEmulator(
         deccolm132Mode = false
         focusReportingMode = false
         inSynchronizedUpdate = false
+        decscSgr = null
+        altScreenSgr = null
+        buffer.unfreezeFrame()
         // RIS puts every DEC-private/ANSI mode this emulator tracks back
         // to its power-on default, the same as autoWrapMode/
         // focusReportingMode/etc. just above - DECOM and IRM off (xterm's

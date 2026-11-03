@@ -60,6 +60,8 @@ class TerminalBuffer(
     var rows: Int
 ) {
     companion object {
+        /** 'l' gelmeyen DEC 2026 frame'i icin guvenlik zaman asimi. */
+        const val SYNC_TIMEOUT_NANOS = 1_000_000_000L
         const val DEFAULT_FOREGROUND = 15 // ANSI bright white
         const val DEFAULT_BACKGROUND = 0  // ANSI black
 
@@ -354,7 +356,27 @@ class TerminalBuffer(
      * every row from strictly after it, never a mix, because nothing else
      * can touch the grid while this method holds the lock.
      */
+    // DEC 2026: program ESC[?2026h gonderdiginde yakalanan SON TAMAMLANMIS frame.
+    // Set iken cizim canli grid yerine bunu boyar; boylece dokunma/scroll/imlec
+    // gibi herhangi bir yeniden cizim yarim yazilmis frame'i asla gostermez.
+    @Volatile private var frozenFrame: List<List<Cell>>? = null
+    @Volatile private var frozenAtNanos: Long = 0L
+
+    fun freezeFrame() = lock.withLock {
+        frozenFrame = grid.map { it.copyOf().asList() }
+        frozenAtNanos = System.nanoTime()
+    }
+
+    fun unfreezeFrame() { frozenFrame = null }
+
     fun snapshotVisibleGrid(scrollOffset: Int): List<List<Cell>> = lock.withLock {
+        frozenFrame?.let { f ->
+            if (scrollOffset <= 0 &&
+                System.nanoTime() - frozenAtNanos < SYNC_TIMEOUT_NANOS &&
+                f.size == rows && (f.isEmpty() || f[0].size == columns)
+            ) return@withLock f
+            frozenFrame = null
+        }
         // Alternate screen has no scrollback (see scrollUp) - a stale
         // scrollOffset must not splice the PRIMARY screen's history above it.
         if (scrollOffset <= 0 || altGrid != null) {

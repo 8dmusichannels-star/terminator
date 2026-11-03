@@ -775,8 +775,8 @@ class MainViewModel(
                 _uiState.value = _uiState.value.copy(bellTick = _uiState.value.bellTick + 1)
             }
             override fun onTitleChanged(title: String) { /* surfaced via titlebar if desired */ }
-            override fun onCursorMoved(row: Int, col: Int) { bumpVersionThrottled(session.inputPending, session.recentlyErasedScreen) }
-            override fun onContentChanged() { bumpVersionThrottled(session.inputPending, session.recentlyErasedScreen) }
+            override fun onCursorMoved(row: Int, col: Int) { bumpVersionThrottled(session.inputPending || session.burstActive, session.recentlyErasedScreen, session) }
+            override fun onContentChanged() { bumpVersionThrottled(session.inputPending || session.burstActive, session.recentlyErasedScreen, session) }
             // DSR/CPR replies (CSI 6n/5n) - the emulator computed the
             // answer, this just has to get those bytes back onto the pty.
             // Without this, anything that probes cursor position on
@@ -2115,9 +2115,16 @@ class MainViewModel(
     // immediate paint and let the trailing flush below show the finished frame.
     // erased: a full-screen erase just happened, so hold the paint (40ms
     // instead of one frame) for the redraw's content lines to land after it.
-    private fun bumpVersionThrottled(deferLeading: Boolean = false, erased: Boolean = false) {
+    private fun bumpVersionThrottled(
+        deferLeading: Boolean = false,
+        erased: Boolean = false,
+        session: TerminalSession? = null
+    ) {
+        // DEC 2026: program "frame cizilirken gosterme" dedi -> simdi paint yok;
+        // ESU gelince (veya zaman asiminda) trailing flush gosterir.
+        val syncHeld = session?.syncOutputActive == true
         val now = System.nanoTime()
-        if (!deferLeading && !erased && now - lastVersionBumpNanos >= versionBumpThrottleNanos) {
+        if (!syncHeld && !deferLeading && !erased && now - lastVersionBumpNanos >= versionBumpThrottleNanos) {
             lastVersionBumpNanos = now
             bumpVersion()
             return
@@ -2126,12 +2133,17 @@ class MainViewModel(
             Thread {
                 try {
                     Thread.sleep(if (erased) 40L else versionBumpThrottleNanos / 1_000_000L)
+                    if (session != null) {
+                        while (session.syncOutputActive) Thread.sleep(2L)
+                        // 2026 kullanmayan buyuk yazma suruyorsa bitmesini bekle (en fazla 40 ms).
+                        val deadline = System.nanoTime() + 40_000_000L
+                        while (System.nanoTime() < deadline &&
+                            (session.inputPending || session.burstActive)) {
+                            Thread.sleep(2L)
+                        }
+                    }
                 } catch (_: InterruptedException) {
-                    // Falls through and flushes anyway - a dropped final
-                    // frame here would be the exact tearing/stale-paint this
-                    // throttle exists to prevent, so an interrupt (e.g. app
-                    // shutdown mid-wait) still gets one last flush rather
-                    // than silently swallowing it.
+                    // yine de flush et
                 }
                 lastVersionBumpNanos = System.nanoTime()
                 bumpVersion()
