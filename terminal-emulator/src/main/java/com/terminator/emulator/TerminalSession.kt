@@ -633,6 +633,12 @@ class TerminalSession(
             // single-line fallback" - so this is never worse than before.
             if (pixelHeight > 0 && rows > 0) {
                 emulator.cellHeightPx = pixelHeight / rows
+                emulator.windowHeightPx = pixelHeight
+            }
+            // Same for the horizontal axis (CSI 14/16 t replies, Kitty c=-only sizing).
+            if (pixelWidth > 0 && columns > 0) {
+                emulator.cellWidthPx = pixelWidth / columns
+                emulator.windowWidthPx = pixelWidth
             }
         }
         // Skip the ioctl (and the SIGWINCH + full redraw it triggers in
