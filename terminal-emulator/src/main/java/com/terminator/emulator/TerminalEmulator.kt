@@ -459,8 +459,16 @@ class TerminalEmulator(
     // skip a repaint while true; nothing here withholds buffer writes based
     // on it; a program that never asked for this keeps rendering exactly as
     // before (default false = always paint immediately, same as today).
-    var inSynchronizedUpdate: Boolean = false
+    @Volatile var inSynchronizedUpdate: Boolean = false
         private set
+
+    /** ESC[?2026h zamani (nanoTime). Hic 'l' gelmezse ekran sonsuza dek donmasin. */
+    @Volatile private var syncUpdateStartNanos: Long = 0L
+
+    /** Acik bir synchronized-output frame'i var mi (UI bu sirada paint etmemeli). */
+    val syncUpdateActive: Boolean
+        get() = inSynchronizedUpdate &&
+            System.nanoTime() - syncUpdateStartNanos < TerminalBuffer.SYNC_TIMEOUT_NANOS
 
     // G0/G1 designated character sets (SCS, "ESC ( X" / "ESC ) X") and
     // which of the two is currently invoked (SI/SO, \u000F/\u000E) - see
@@ -1643,7 +1651,7 @@ class TerminalEmulator(
             // stream. dcsBuffer collects raw params+body from here; the
             // 'q' final byte flips dcsIsSixel once we know which kind of
             // DCS this is (see handleDcs).
-            'P' -> { state = State.DCS; dcsBuffer.clear(); dcsIsSixel = false }
+            'P' -> { state = State.DCS; dcsBuffer.clear(); dcsIsSixel = false; sixelDecoder = null; sixelChunk.setLength(0) }
             // APC (Application Program Command) introducer - "ESC _ <data>
             // ST". The Kitty graphics protocol rides entirely inside APC
             // (never DCS - Sixel and Kitty graphics are two unrelated
@@ -1695,10 +1703,11 @@ class TerminalEmulator(
             // swallowed (fell to the `else` branch below), which lost the
             // saved position entirely and could leave the cursor - and
             // anything drawn relative to it - in the wrong place.
-            '7' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol; state = State.NORMAL }
+            '7' -> { savedCursorRow = cursorRow; savedCursorCol = cursorCol; decscSgr = captureSgr(); state = State.NORMAL }
             '8' -> {
                 cursorRow = savedCursorRow.coerceIn(0, buffer.rows - 1)
                 cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
+                decscSgr?.let { applySgr(it) }
                 state = State.NORMAL
             }
             // IND (Index) - move down one line, scrolling the region if
@@ -2113,11 +2122,12 @@ class TerminalEmulator(
                 cursorRow = scrollTop
                 cursorCol = scrollLeft
             } else {
-                savedCursorRow = cursorRow; savedCursorCol = cursorCol
+                savedCursorRow = cursorRow; savedCursorCol = cursorCol; decscSgr = captureSgr()
             }
             'u' -> {
                 cursorRow = savedCursorRow.coerceIn(0, buffer.rows - 1)
                 cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
+                decscSgr?.let { applySgr(it) }
             }
             'r' -> {
                 // DECSTBM: set scrolling region (1-indexed, inclusive). No
@@ -2195,7 +2205,7 @@ class TerminalEmulator(
             'c' -> if (secondaryDA) {
                 listener.onRespond("\u001B[>0;64;0c")
             } else if (params.getOrElse(0) { 0 } == 0) {
-                listener.onRespond("\u001B[?1;2c")
+                listener.onRespond("\u001B[?1;2;4c")
             }
             // TBC (Tab Clear), "CSI g" / "CSI 0 g" clears the stop at the
             // cursor column, "CSI 3 g" clears every stop. Same silent-drop
@@ -2300,6 +2310,14 @@ class TerminalEmulator(
             //   unsupported-final-byte `else`, so title restore on exit
             //   from such a program simply never happened.
             't' -> when (params.getOrElse(0) { 0 }) {
+                // 14: text-area size in pixels, 16: one cell's size in
+                // pixels - what kitten icat / chafa / timg fall back to
+                // when TIOCGWINSZ reports 0 pixels. No reply while the
+                // size is still unknown (0) rather than a bogus 0x0 one.
+                14 -> if (windowWidthPx > 0 && windowHeightPx > 0)
+                    listener.onRespond("\u001B[4;${windowHeightPx};${windowWidthPx}t")
+                16 -> if (cellWidthPx > 0 && cellHeightPx > 0)
+                    listener.onRespond("\u001B[6;${cellHeightPx};${cellWidthPx}t")
                 18 -> listener.onRespond("\u001B[8;${buffer.rows};${buffer.columns}t")
                 19 -> listener.onRespond("\u001B[9;${buffer.rows};${buffer.columns}t")
                 22 -> {
@@ -2386,10 +2404,18 @@ class TerminalEmulator(
                     // clean separate buffer, which is what made them look
                     // garbled. 1049 also implies save/restore cursor.
                     if (enable) {
+                        if (!buffer.inAlternateScreen) altScreenSgr = captureSgr()
                         buffer.enterAlternateScreen()
+                        // Alt ekrani shell'den kalan renkle degil varsayilan arka planla temizle.
+                        val keepBg = curBg
+                        curBg = TerminalBuffer.DEFAULT_BACKGROUND
                         eraseInDisplay(2)
+                        curBg = keepBg
                     } else {
+                        val wasAlt = buffer.inAlternateScreen
                         buffer.exitAlternateScreen()
+                        // TUI'dan once shell'in sahip oldugu renkleri geri ver.
+                        if (wasAlt) { applySgr(altScreenSgr); altScreenSgr = null }
                     }
                     cursorRow = buffer.cursorRow
                     cursorCol = buffer.cursorCol
@@ -2421,7 +2447,16 @@ class TerminalEmulator(
                 // Purely advisory (this module doesn't defer any writes on
                 // its own), so simply mirrors the h/l straight into the
                 // flag the UI layer's render loop can check.
-                2026 -> inSynchronizedUpdate = enable
+                2026 -> {
+                    if (enable) {
+                        // Frame'in ilk 'h'inde dondur; tekrarlayan 'h' yarim grid yakalamasin.
+                        if (!syncUpdateActive) buffer.freezeFrame()
+                        syncUpdateStartNanos = System.nanoTime()
+                    } else {
+                        buffer.unfreezeFrame()
+                    }
+                    inSynchronizedUpdate = enable
+                }
                 // Bracketed paste (see bracketedPasteMode's own doc) - was
                 // previously matched by the generic `else` branch below
                 // (silently ignored), which is why pasted multi-line text
@@ -3021,6 +3056,7 @@ class TerminalEmulator(
             // exactly what decodeSixel expects).
             if (ch == 'q') {
                 dcsIsSixel = true
+                startSixel()
             }
             // Digits/';' before 'q' are params this emulator doesn't act on
             // (Sixel macro id / background-fill mode / horizontal grid
@@ -3028,25 +3064,80 @@ class TerminalEmulator(
             // dropped rather than buffered since they're never re-read.
             return
         }
-        // Runaway-growth guard, sized far larger than OSC's 8192 - Sixel
-        // bodies are legitimately large (see dcsBuffer's own doc). 2 MiB of
-        // ASCII sixel data decodes to a multi-hundred-KB image, comfortably
-        // past anything a terminal-width image actually needs; a stream
-        // that blows through this without ever reaching ST is almost
-        // certainly garbled, not a real large image.
-        if (dcsBuffer.length >= 2_000_000) {
-            state = State.NORMAL
-            dcsIsSixel = false
+        if (dcsIsSixel) {
+            // Streaming: no size limit, nothing accumulated in dcsBuffer.
+            feedSixel(ch)
             return
         }
+        // Runaway-growth guard for non-Sixel DCS payloads (DECRQSS etc.).
+        // On overflow the excess is DISCARDED but the parser stays in the
+        // DCS until its real terminator - dropping back to NORMAL here
+        // used to print the rest of the payload on screen as plain text.
+        if (dcsBuffer.length >= 2_000_000) return
         dcsBuffer.append(ch)
     }
 
     private fun finishDcs() {
         if (dcsIsSixel) {
-            decodeAndPlaceSixel(dcsBuffer.toString())
+            finishSixel()?.let { placeSixelImage(it) }
         }
         dcsIsSixel = false
+        dcsBuffer.setLength(0)
+    }
+
+    // ---------------------------------------------------------------
+    // Sixel pipeline. The pty-reader thread only slices the incoming
+    // stream into chunks and hands them to a single background worker that
+    // runs the actual [SixelDecoder], so decoding overlaps with reading the
+    // rest of the stream instead of happening in one big blocking step at
+    // the terminator. At the terminator the reader thread waits only for
+    // the (short) tail still queued - it must know the image height to
+    // advance the cursor before it can parse any following text, which is
+    // why the wait cannot be dropped entirely without reordering output.
+    // ---------------------------------------------------------------
+    private val SIXEL_CHUNK_CHARS = 32 * 1024
+    private val sixelExecutor: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "sixel-decode").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 }
+        }
+    }
+    private var sixelDecoder: SixelDecoder? = null
+    private val sixelChunk = StringBuilder(SIXEL_CHUNK_CHARS)
+
+    private fun startSixel() {
+        sixelDecoder = SixelDecoder()
+        sixelChunk.setLength(0)
+    }
+
+    private fun feedSixel(ch: Char) {
+        sixelChunk.append(ch)
+        if (sixelChunk.length >= SIXEL_CHUNK_CHARS) flushSixelChunk()
+    }
+
+    private fun flushSixelChunk() {
+        val dec = sixelDecoder ?: return
+        if (sixelChunk.isEmpty()) return
+        val piece = sixelChunk.toString()
+        sixelChunk.setLength(0)
+        sixelExecutor.execute { dec.feed(piece) }
+    }
+
+    private fun finishSixel(): TerminalBuffer.SixelImage? {
+        val dec = sixelDecoder ?: return null
+        sixelDecoder = null
+        val tail = sixelChunk.toString()
+        sixelChunk.setLength(0)
+        return try {
+            sixelExecutor.submit<TerminalBuffer.SixelImage?> {
+                if (tail.isNotEmpty()) dec.feed(tail)
+                dec.finish()
+            }.get()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun handleApc(ch: Char) {
@@ -3166,11 +3257,11 @@ class TerminalEmulator(
     }
 
     /**
-     * Decodes a Sixel image body (everything after the "ESC P <params> q"
-     * introducer's 'q', up to but not including the terminating ST) into a
-     * plain ARGB pixel raster, then hands it to [buffer] to be anchored at
-     * the current cursor position - see [TerminalBuffer.placeImage] for how
-     * that anchoring/scroll-following works.
+     * Anchors a Sixel image that [SixelDecoder] finished decoding (see the
+     * sixel pipeline in [handleDcs]/[finishDcs]) at the current cursor
+     * position - see [TerminalBuffer.placeImage] for how that
+     * anchoring/scroll-following works. The format notes below describe what
+     * [SixelDecoder] implements.
      *
      * Sixel encodes an image column-major in bands of 6 vertical pixels at
      * a time ("a sixel"): each data byte in the range 0x3F..0x7E ('?'..'~')
@@ -3193,169 +3284,9 @@ class TerminalEmulator(
      * uncommon from hand-rolled encoders) would otherwise clip or
      * misplace the real pixels.
      */
-    private fun decodeAndPlaceSixel(body: String) {
-        // Sixel's own default 16-color VT340 palette (indices 0-15) -
-        // present so a stream that never bothers defining its own colors
-        // (rare in practice, but valid per spec) still renders something
-        // recognizable rather than an all-black image. Real encoders
-        // almost always emit explicit '#'-definitions for every index they
-        // use, which simply overwrite these defaults in the loop below.
-        val palette = HashMap<Int, Int>(64).apply {
-            // 0=black 1=blue 2=red 3=green 4=magenta 5=cyan 6=yellow 7=white
-            // (dim/standard tones), 8-15 the "bright" counterparts - values
-            // taken from the VT340 reference palette xterm itself ships.
-            this[0] = argb(0, 0, 0); this[1] = argb(20, 20, 80); this[2] = argb(80, 13, 13)
-            this[3] = argb(20, 80, 20); this[4] = argb(80, 20, 80); this[5] = argb(20, 80, 80)
-            this[6] = argb(80, 80, 20); this[7] = argb(53, 53, 53); this[8] = argb(26, 26, 26)
-            this[9] = argb(33, 33, 60); this[10] = argb(60, 26, 26); this[11] = argb(33, 60, 33)
-            this[12] = argb(60, 33, 60); this[13] = argb(33, 60, 60); this[14] = argb(60, 60, 33)
-            this[15] = argb(100, 100, 100)
-        }
-        var currentColor = palette[0]!!
-        var x = 0
-        var maxX = 0
-        var y = 0
-        var maxY = 0
-        // Sparse pixel storage keyed by (row * tentativeWidth + col) would
-        // need a width up front, which Sixel doesn't declare reliably (see
-        // this function's own doc) - a row-major list of IntArrays grown
-        // on demand as y advances avoids needing one. 6 is the band
-        // height; rows are only materialized as a '-'/data byte actually
-        // reaches them.
-        val rows = ArrayList<IntArray?>()
-        fun ensureRow(r: Int): IntArray {
-            while (rows.size <= r) rows.add(null)
-            var row = rows[r]
-            if (row == null) {
-                row = IntArray(1) { 0 } // grown lazily below as x advances
-                rows[r] = row
-            }
-            return row
-        }
-        fun setPixel(px: Int, py: Int, color: Int) {
-            if (px < 0 || py < 0) return
-            var row = ensureRow(py)
-            if (px >= row.size) {
-                val grown = IntArray((px + 1).coerceAtLeast(row.size * 2))
-                row.copyInto(grown)
-                rows[py] = grown
-                row = grown
-            }
-            row[px] = color
-            if (px > maxX) maxX = px
-            if (py > maxY) maxY = py
-        }
-
-        var i = 0
-        val n = body.length
-        // Repeat count set by a preceding '!' ("DECGRI", e.g. "!255~" draws
-        // the same sixel byte 255 times in a row) - the single most common
-        // real-world Sixel command after plain data bytes, since it's how
-        // encoders compress large flat-colored runs instead of emitting
-        // one byte per pixel column.
-        var repeatCount = 1
-        while (i < n) {
-            val c = body[i]
-            when {
-                c == '#' -> {
-                    // Color introducer: "# Pc" (select existing index Pc)
-                    // or "# Pc ; Pu ; Px ; Py ; Pz" (DEFINE index Pc, Pu=2
-                    // meaning Px/Py/Pz are 0-100 RGB percentages - the only
-                    // Pu this decoder supports, which is also the only one
-                    // any modern encoder actually emits; Pu=1 HLS is
-                    // vanishingly rare and left as an unrecognized-select,
-                    // i.e. falls back to whatever palette[Pc] already was).
-                    i++
-                    val numStart = i
-                    while (i < n && body[i].isDigit()) i++
-                    val pc = body.substring(numStart, i).toIntOrNull() ?: 0
-                    if (i < n && body[i] == ';') {
-                        // Definition form - collect the remaining up to 4
-                        // ';'-separated numeric fields.
-                        val fields = ArrayList<Int>(4)
-                        while (i < n && body[i] == ';') {
-                            i++
-                            val fs = i
-                            while (i < n && body[i].isDigit()) i++
-                            fields.add(body.substring(fs, i).toIntOrNull() ?: 0)
-                        }
-                        if (fields.size >= 4 && fields[0] == 2) {
-                            val r = (fields[1].coerceIn(0, 100) * 255) / 100
-                            val g = (fields[2].coerceIn(0, 100) * 255) / 100
-                            val b = (fields[3].coerceIn(0, 100) * 255) / 100
-                            palette[pc] = argb(r, g, b)
-                        }
-                    }
-                    currentColor = palette.getOrPut(pc) { palette[0]!! }
-                }
-                c == '!' -> {
-                    // Repeat count: "! Pn" applies to the NEXT single sixel
-                    // data byte only (reset to 1 after it's consumed, in
-                    // the data-byte branch below).
-                    i++
-                    val numStart = i
-                    while (i < n && body[i].isDigit()) i++
-                    repeatCount = body.substring(numStart, i).toIntOrNull()?.coerceAtLeast(1) ?: 1
-                }
-                c == '$' -> {
-                    // Graphics Carriage Return - back to column 0 of the
-                    // SAME 6-row band (y unchanged), used to overlay
-                    // another color's pixels into a band already partly
-                    // drawn by a previous color.
-                    x = 0
-                    i++
-                }
-                c == '-' -> {
-                    // Graphics New Line - next 6-row band, column 0.
-                    x = 0
-                    y += 6
-                    i++
-                }
-                c == '"' -> {
-                    // Raster attributes ("\" Pan;Pad;Ph;Pv") - aspect ratio
-                    // and a declared width/height this decoder deliberately
-                    // ignores (see this function's own doc); skip past its
-                    // up-to-4 numeric fields without acting on them.
-                    i++
-                    var fieldsLeft = 4
-                    while (fieldsLeft > 0 && i < n) {
-                        while (i < n && body[i].isDigit()) i++
-                        if (i < n && body[i] == ';') { i++; fieldsLeft-- } else break
-                    }
-                }
-                c in '\u003F'..'\u007E' -> {
-                    // A real sixel data byte - 6 vertically-stacked pixels
-                    // for the current x column, current color, current
-                    // band. Subtracting '?' (0x3F) recovers the raw 6-bit
-                    // value; bit 0 is the TOP row of the band (per DEC's
-                    // own bit-to-scanline mapping), hence py = y + bitIndex
-                    // rather than y + (5 - bitIndex).
-                    val bits = c.code - '?'.code
-                    repeat(repeatCount) {
-                        for (bitIndex in 0 until 6) {
-                            if ((bits shr bitIndex) and 1 == 1) {
-                                setPixel(x, y + bitIndex, currentColor)
-                            }
-                        }
-                        x++
-                    }
-                    repeatCount = 1
-                    i++
-                }
-                else -> i++ // Whitespace/newlines some encoders pad with; ignore.
-            }
-        }
-
-        val width = maxX + 1
-        val height = maxY + 6 // last band's full 6-row height, even if only partly drawn
-        if (width <= 0 || height <= 0 || rows.isEmpty()) return
-        val pixels = IntArray(width * height)
-        for (r in 0 until height) {
-            val row = rows.getOrNull(r) ?: continue
-            val copyLen = row.size.coerceAtMost(width)
-            System.arraycopy(row, 0, pixels, r * width, copyLen)
-        }
-        buffer.placeImage(TerminalBuffer.SixelImage(width, height, pixels), cursorRow, cursorCol)
+    private fun placeSixelImage(image: TerminalBuffer.SixelImage) {
+        val height = image.height
+        buffer.placeImage(image, cursorRow, cursorCol, imageRowSpan(height))
         // Real terminals leave the cursor positioned after the image
         // rather than on top of it, so text a program prints right after
         // ("Image loaded." on the line below, a common pattern) doesn't
@@ -3366,7 +3297,7 @@ class TerminalEmulator(
         // advanceCursorRows (see its own doc) caps this at the rows
         // actually available below the image instead of scrolling it
         // straight off the top for anything taller than the screen.
-        advanceCursorRows(imageRowSpan(height), anchorRow = cursorRow)
+        advanceCursorRows(imageRowSpan(height))
     }
 
     private fun argb(r: Int, g: Int, b: Int): Int =
@@ -3903,45 +3834,34 @@ class TerminalEmulator(
         val cellOffsetY = fields["Y"]?.toIntOrNull() ?: 0
         val displayCols = fields["c"]?.toIntOrNull() ?: 0
         val displayRows = fields["r"]?.toIntOrNull() ?: 0
+        // Rows the placement covers - needed by the buffer so the image can
+        // follow text into scrollback and be cropped rather than dropped.
+        val croppedH = (if (srcH > 0) srcH else image.height - srcY).coerceIn(1, image.height.coerceAtLeast(1))
+        val croppedW = (if (srcW > 0) srcW else image.width - srcX).coerceIn(1, image.width.coerceAtLeast(1))
+        val heightRows = when {
+            displayRows > 0 -> displayRows
+            displayCols > 0 && cellWidthPx > 0 && cellHeightPx > 0 ->
+                kotlin.math.ceil(croppedH * (displayCols * cellWidthPx.toFloat() / croppedW) / cellHeightPx)
+                    .toInt().coerceAtLeast(1)
+            else -> imageRowSpan(croppedH)
+        }.coerceAtMost(MAX_IMAGE_ADVANCE_ROWS)
         buffer.placeKittyImage(
             imageId, placementId, cursorRow, cursorCol, z, image,
-            srcX, srcY, srcW, srcH, cellOffsetX, cellOffsetY, displayCols, displayRows
+            srcX, srcY, srcW, srcH, cellOffsetX, cellOffsetY, displayCols, displayRows, heightRows
         )
         if (fields["C"] != "1") {
-            // Per spec the cursor should advance by the placement's own
-            // on-screen size in cells. When the client DID give explicit
-            // c=/r= (a size this function already knows exactly, no pixel
-            // math needed), honor it precisely rather than falling back,
-            // since that's the common real-world case (icat/chafa almost
-            // always pass explicit c=/r=) and costs nothing extra to get
-            // exactly right. Row advance either way goes through
-            // advanceCursorRows (see its own doc) rather than a raw
-            // repeat(n){lineFeed()}: a tall placement's own auto-advance
-            // used to scroll it straight back off the top before the user
-            // even typed anything, since every lineFeed() past the bottom
-            // margin calls buffer.scrollUp(), which shifts (and eventually
-            // drops) every placed image including the one just placed.
-            val anchorRow = cursorRow
-            if (displayCols > 0 || displayRows > 0) {
-                val advanceCols = displayCols.takeIf { it > 0 } ?: 1
-                val advanceRows = displayRows.takeIf { it > 0 } ?: 1
-                val targetCol = (cursorCol + advanceCols).coerceAtMost(buffer.columns - 1)
-                advanceCursorRows(advanceRows, anchorRow)
-                cursorCol = targetCol
-            } else {
-                // No explicit c=/r= - natural size, so the on-screen row
-                // span has to come from the image's own pixel height (see
-                // imageRowSpan's own doc). Previously always a single
-                // lineFeed() regardless of how tall the image actually
-                // rendered, which left the cursor sitting on one of the
-                // image's OWN rows for anything taller than one cell - the
-                // next prompt redraw's CSI J/K would then clearRow() that
-                // row and wipe the placement out from under the image that
-                // was still fully visible on screen (icat's default,
-                // no-size-flags mode hits this constantly, matching
-                // "image render olduktan sonra enter basinca yok oluyor").
-                advanceCursorRows(imageRowSpan(image.height), anchorRow)
-            }
+            // Per spec the cursor advances by the placement's own on-screen
+            // size in rows (c=/r= when given, otherwise derived from the
+            // image's pixel height). advanceCursorRows scrolls the screen
+            // as needed; the placement is anchored to its row and follows
+            // the text up into scrollback. C=1 (handled by the surrounding
+            // if) leaves the cursor and screen alone, so the image is
+            // simply cropped at the bottom - spec-conformant.
+            val advanceCols = displayCols.takeIf { it > 0 } ?: 1
+            val targetCol = (cursorCol + advanceCols).coerceAtMost(buffer.columns - 1)
+            val keepCol = displayCols > 0
+            advanceCursorRows(heightRows)
+            if (keepCol) cursorCol = targetCol
         }
         return placementId
     }
@@ -4720,6 +4640,14 @@ class TerminalEmulator(
     // callers that don't supply it.
     var cellHeightPx: Int = 0
 
+    // Average on-screen cell width in pixels, same wiring/meaning as
+    // [cellHeightPx]; 0 = unknown. Used for XTWINOPS 14/16 replies and for
+    // sizing Kitty placements that give only c= (columns).
+    var cellWidthPx: Int = 0
+    // Whole text-area size in pixels (0 = unknown), for CSI 14 t.
+    var windowWidthPx: Int = 0
+    var windowHeightPx: Int = 0
+
     // How many on-screen ROWS an image of pixel height [heightPx] actually
     // covers once drawn, starting at its own anchor row - i.e. how many
     // lines the cursor needs to clear before it's genuinely below the
@@ -4736,36 +4664,25 @@ class TerminalEmulator(
         return kotlin.math.ceil(heightPx.toFloat() / cellHeightPx).toInt().coerceAtLeast(1)
     }
 
-    // Advances the cursor `rows` lines down (column reset to 0), the same
-    // as `repeat(rows) { lineFeed() }` - EXCEPT it never calls lineFeed()
-    // for a row that would scroll the grid while `anchorRow` (the image
-    // placement that was just anchored there) is still on-screen. A tall
-    // image (anchorRow near the top, height spanning most/all of the
-    // visible rows) previously had its own cursor-advance immediately
-    // scroll it back off the top the instant it was placed - each
-    // lineFeed() past the bottom margin calls buffer.scrollUp(), which
-    // shifts every placed image's row up by one and drops it once that
-    // goes negative (see TerminalBuffer.shiftImageRows's own doc), so
-    // "auto-advance past a big image" and "the image scrolling off-
-    // screen" were literally the same buffer.scrollUp() call. This is
-    // what made a big image vanish after only 2-3 real Enters afterward
-    // ("buyuk fotograflari render etdiyinde 3 defa enter basinca
-    // siliniyor") - almost all of its own row budget had already been
-    // silently spent by its own placement before the user typed anything.
-    // Capping at `buffer.rows - 1 - anchorRow` (the number of rows
-    // actually still below the anchor without scrolling) means the
-    // cursor parks at the last visible row instead of pushing further -
-    // an image taller than the visible screen will still get clipped at
-    // the bottom edge by TerminalView's own draw-time bounds (same as
-    // any oversized image), but at least it stays fully on-screen and
-    // reachable instead of being discarded by its own placement.
-    private fun advanceCursorRows(rows: Int, anchorRow: Int) {
-        val safeRows = (buffer.rows - 1 - anchorRow).coerceAtLeast(0)
-        val actualRows = rows.coerceAtMost(safeRows)
+    // Advances the cursor `rows` lines down (column reset to 0) exactly like
+    // `repeat(rows) { lineFeed() }`, scrolling the screen as needed. Images
+    // are anchored to rows that follow text into scrollback (see
+    // TerminalBuffer.imageGone), so letting the screen scroll is safe and
+    // is what makes an image taller than the space below the cursor - or
+    // taller than the whole screen - show up the way every other terminal
+    // does: the grid scrolls, the image's anchor row moves up (possibly
+    // into scrollback) with it, and the cursor ends up on the row right
+    // below the image. The old version clamped the advance to the rows
+    // remaining on screen, which left the image's bottom off-screen and the
+    // cursor stuck on the last line.
+    private fun advanceCursorRows(rows: Int) {
         cursorCol = 0
-        repeat(actualRows) { lineFeed() }
-        cursorRow = (anchorRow + actualRows).coerceAtMost(buffer.rows - 1)
+        repeat(rows.coerceIn(0, MAX_IMAGE_ADVANCE_ROWS)) { lineFeed() }
     }
+
+    // Hard ceiling on one image's cursor advance, so a hostile/garbled
+    // height can't spin the parser for millions of scrolls.
+    private val MAX_IMAGE_ADVANCE_ROWS = 20_000
 
     // System.nanoTime() of the last full-screen erase (CSI 2J, or CSI J from
     // home), 0 = never. Lets the UI hold its next paint for a few ms: programs
@@ -4941,6 +4858,34 @@ class TerminalEmulator(
         }
     }
 
+    // DECSC/DECRC ve 1049/47 imlec ile birlikte SGR (renk/nitelik) durumunu da
+    // kaydedip geri yuklemeli (xterm boyle yapar). Yoksa btop'un cikista biraktigi
+    // arka plan rengi shell'de kalir ve terminal maviye boyanir.
+    private class SgrState(
+        val fg: Int, val bg: Int, val bold: Boolean, val underline: Boolean,
+        val inverse: Boolean, val italic: Boolean, val dim: Boolean,
+        val blink: Boolean, val strike: Boolean, val conceal: Boolean,
+        val overline: Boolean, val curly: Boolean, val ulColor: Int?
+    )
+
+    private fun captureSgr() = SgrState(
+        curFg, curBg, curBold, curUnderline, curInverse, curItalic, curDim,
+        curBlink, curStrikethrough, curConceal, curOverline,
+        curUnderlineCurly, curUnderlineColor
+    )
+
+    private fun applySgr(s: SgrState?) {
+        if (s == null) { resetSgr(); return }
+        curFg = s.fg; curBg = s.bg; curBold = s.bold; curUnderline = s.underline
+        curInverse = s.inverse; curItalic = s.italic; curDim = s.dim
+        curBlink = s.blink; curStrikethrough = s.strike; curConceal = s.conceal
+        curOverline = s.overline; curUnderlineCurly = s.curly
+        curUnderlineColor = s.ulColor
+    }
+
+    private var decscSgr: SgrState? = null
+    private var altScreenSgr: SgrState? = null
+
     private fun resetSgr() {
         curFg = TerminalBuffer.DEFAULT_FOREGROUND
         curBg = TerminalBuffer.DEFAULT_BACKGROUND
@@ -4992,6 +4937,9 @@ class TerminalEmulator(
         deccolm132Mode = false
         focusReportingMode = false
         inSynchronizedUpdate = false
+        decscSgr = null
+        altScreenSgr = null
+        buffer.unfreezeFrame()
         // RIS puts every DEC-private/ANSI mode this emulator tracks back
         // to its power-on default, the same as autoWrapMode/
         // focusReportingMode/etc. just above - DECOM and IRM off (xterm's
@@ -5021,6 +4969,8 @@ class TerminalEmulator(
         dcsPendingSt = false
         dcsIsSixel = false
         dcsBuffer.clear()
+        sixelDecoder = null
+        sixelChunk.setLength(0)
         // RIS drops back to fully legacy key encoding - a program that
         // pushed its own enhancement flags and then crashed/was killed
         // without a matching POP would otherwise leave the NEXT program
@@ -5083,11 +5033,11 @@ class TerminalEmulator(
      */
     fun placeDecodedInlineImage(pixels: IntArray, width: Int, height: Int) {
         if (width <= 0 || height <= 0 || pixels.size < width * height) return
-        buffer.placeImage(TerminalBuffer.SixelImage(width, height, pixels), cursorRow, cursorCol)
+        buffer.placeImage(TerminalBuffer.SixelImage(width, height, pixels), cursorRow, cursorCol, imageRowSpan(height))
         // Same advanceCursorRows reasoning as decodeAndPlaceSixel's own
         // cursor advance just above - caps at what's actually available
         // below the image instead of scrolling it off via its own placement.
-        advanceCursorRows(imageRowSpan(height), anchorRow = cursorRow)
+        advanceCursorRows(imageRowSpan(height))
     }
 
     /** Call on a real focus transition (Activity onResume/onPause, or a

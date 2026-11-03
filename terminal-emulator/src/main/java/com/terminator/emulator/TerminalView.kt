@@ -2228,9 +2228,15 @@ private fun DrawScope.drawTerminal(
         // rendering limitation.
         run {
             val scrollbackRowsShown = scrollOffset.coerceAtMost(buffer.maxScrollOffset)
+            // Images are anchored to rows that may be NEGATIVE (= inside
+            // scrollback, see TerminalBuffer.imageGone), so an image is
+            // visible as long as ANY of its rows overlaps the viewport; the
+            // part outside is cut off by the clip below.
+            val imgClipSave = canvas.nativeCanvas.save()
+            canvas.nativeCanvas.clipRect(0f, 0f, size.width, buffer.rows * charHeight)
             for (placed in buffer.placedImages()) {
                 val visibleRow = placed.row + scrollbackRowsShown
-                if (visibleRow !in 0 until buffer.rows) continue
+                if (visibleRow >= buffer.rows || visibleRow + placed.heightRows <= 0) continue
                 val bitmap = bitmapFor(placed.image)
                 val left = placed.col * charWidth
                 val top = visibleRow * charHeight
@@ -2240,10 +2246,17 @@ private fun DrawScope.drawTerminal(
                 // size while destination-sizing it in cell units is what
                 // drawBitmap(src, dst, paint) does natively, avoiding a
                 // separate manual bitmap-scaling step.
-                val destWidthCells = (bitmap.width / charWidth).let {
+                // Zoom/font-size changes alter charWidth/charHeight but not
+                // the image's pixels, so an unscaled image would drift
+                // against the text it was placed next to. Remember the cell
+                // size the image was first drawn at and scale by the ratio
+                // to the current one, keeping its footprint (rows x cols)
+                // fixed, like a cell-sized glyph.
+                if (placed.refCellH <= 0f) { placed.refCellW = charWidth; placed.refCellH = charHeight }
+                val destWidthCells = (bitmap.width / placed.refCellW).let {
                     if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
-                }.coerceAtMost(buffer.columns - placed.col).coerceAtLeast(1)
-                val destHeightPx = bitmap.height.toFloat()
+                }.coerceAtLeast(1)
+                val destHeightPx = bitmap.height * (charHeight / placed.refCellH)
                 canvas.nativeCanvas.drawBitmap(
                     bitmap,
                     null,
@@ -2251,6 +2264,7 @@ private fun DrawScope.drawTerminal(
                     null
                 )
             }
+            canvas.nativeCanvas.restoreToCount(imgClipSave)
         }
 
         // Placed Kitty images (see TerminalBuffer.KittyPlacement's own doc) -
@@ -2272,9 +2286,11 @@ private fun DrawScope.drawTerminal(
         // OTHER when several overlap.
         run {
             val scrollbackRowsShown = scrollOffset.coerceAtMost(buffer.maxScrollOffset)
+            val kittyClipSave = canvas.nativeCanvas.save()
+            canvas.nativeCanvas.clipRect(0f, 0f, size.width, buffer.rows * charHeight)
             for (placed in buffer.kittyPlacements().sortedBy { it.z }) {
                 val visibleRow = placed.row + scrollbackRowsShown
-                if (visibleRow !in 0 until buffer.rows) continue
+                if (visibleRow >= buffer.rows || visibleRow + placed.heightRows <= 0) continue
                 val bitmap = bitmapFor(placed.image)
 
                 // Source rectangle (spec's x,y,w,h crop - see
@@ -2333,11 +2349,15 @@ private fun DrawScope.drawTerminal(
                     // the right of the anchor the same way this loop
                     // always has (a wide image shouldn't paint past the
                     // right edge of the grid).
-                    val destWidthCells = (croppedW / charWidth).let {
+                    // Natural size, scaled with the cell size so zoom keeps
+                    // the image aligned with the text (see the Sixel loop).
+                    // Overflow past the right edge is cut by the clip.
+                    if (placed.refCellH <= 0f) { placed.refCellW = charWidth; placed.refCellH = charHeight }
+                    val destWidthCells = (croppedW / placed.refCellW).let {
                         if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
-                    }.coerceAtMost(buffer.columns - placed.col).coerceAtLeast(1)
+                    }.coerceAtLeast(1)
                     destWidthPx = destWidthCells * charWidth
-                    destHeightPx = croppedH.toFloat()
+                    destHeightPx = croppedH * (charHeight / placed.refCellH)
                 }
 
                 canvas.nativeCanvas.drawBitmap(
@@ -2347,6 +2367,7 @@ private fun DrawScope.drawTerminal(
                     null
                 )
             }
+            canvas.nativeCanvas.restoreToCount(kittyClipSave)
         }
 
         // Block cursor: solid white rectangle at the current input position,

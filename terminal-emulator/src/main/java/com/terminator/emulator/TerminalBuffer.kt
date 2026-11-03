@@ -60,6 +60,8 @@ class TerminalBuffer(
     var rows: Int
 ) {
     companion object {
+        /** 'l' gelmeyen DEC 2026 frame'i icin guvenlik zaman asimi. */
+        const val SYNC_TIMEOUT_NANOS = 1_000_000_000L
         const val DEFAULT_FOREGROUND = 15 // ANSI bright white
         const val DEFAULT_BACKGROUND = 0  // ANSI black
 
@@ -354,7 +356,27 @@ class TerminalBuffer(
      * every row from strictly after it, never a mix, because nothing else
      * can touch the grid while this method holds the lock.
      */
+    // DEC 2026: program ESC[?2026h gonderdiginde yakalanan SON TAMAMLANMIS frame.
+    // Set iken cizim canli grid yerine bunu boyar; boylece dokunma/scroll/imlec
+    // gibi herhangi bir yeniden cizim yarim yazilmis frame'i asla gostermez.
+    @Volatile private var frozenFrame: List<List<Cell>>? = null
+    @Volatile private var frozenAtNanos: Long = 0L
+
+    fun freezeFrame() = lock.withLock {
+        frozenFrame = grid.map { it.copyOf().asList() }
+        frozenAtNanos = System.nanoTime()
+    }
+
+    fun unfreezeFrame() { frozenFrame = null }
+
     fun snapshotVisibleGrid(scrollOffset: Int): List<List<Cell>> = lock.withLock {
+        frozenFrame?.let { f ->
+            if (scrollOffset <= 0 &&
+                System.nanoTime() - frozenAtNanos < SYNC_TIMEOUT_NANOS &&
+                f.size == rows && (f.isEmpty() || f[0].size == columns)
+            ) return@withLock f
+            frozenFrame = null
+        }
         // Alternate screen has no scrollback (see scrollUp) - a stale
         // scrollOffset must not splice the PRIMARY screen's history above it.
         if (scrollOffset <= 0 || altGrid != null) {
@@ -443,7 +465,10 @@ class TerminalBuffer(
      *  invisible to everything in this class except [images] and the
      *  scroll/resize bookkeeping that keeps it (approximately) attached to
      *  the right on-screen rows as content moves. */
-    data class PlacedImage(var row: Int, val col: Int, val image: SixelImage)
+    data class PlacedImage(var row: Int, val col: Int, val image: SixelImage, var heightRows: Int = 1,
+        // Cell size (px) the renderer first drew this image at; 0 = not drawn yet.
+        // Lets zoom scale the image with the text (see TerminalView).
+        @Volatile var refCellW: Float = 0f, @Volatile var refCellH: Float = 0f)
 
     // Every image currently placed in the LIVE grid (never scrollback -
     // once an image's row scrolls off the top, it's simply dropped rather
@@ -474,9 +499,9 @@ class TerminalBuffer(
      *  lifetime. A real terminal's cursor is always somewhere in the live
      *  grid when a program prints anything (including a Sixel image), so
      *  this covers every case Sixel output can actually arrive in. */
-    fun placeImage(image: SixelImage, row: Int, col: Int) = lock.withLock {
+    fun placeImage(image: SixelImage, row: Int, col: Int, heightRows: Int = 1) = lock.withLock {
         if (row !in 0 until rows) return@withLock
-        images.add(PlacedImage(row, col, image))
+        images.add(PlacedImage(row, col, image, heightRows.coerceAtLeast(1)))
     }
 
     // ---------------------------------------------------------------
@@ -799,7 +824,14 @@ class TerminalBuffer(
         val cellOffsetX: Int = 0,
         val cellOffsetY: Int = 0,
         val displayCols: Int = 0,
-        val displayRows: Int = 0
+        val displayRows: Int = 0,
+        // How many grid rows the placement covers, starting at [row].
+        // Needed so a placement can live partly/fully in scrollback
+        // (negative [row], relative to the live grid's top row) and still
+        // be dropped only once its LAST row has left the scrollback.
+        var heightRows: Int = 1,
+        @Volatile var refCellW: Float = 0f,
+        @Volatile var refCellH: Float = 0f
     )
 
     // Every Kitty image ever uploaded this session, keyed by image id -
@@ -900,12 +932,14 @@ class TerminalBuffer(
         cellOffsetX: Int = 0,
         cellOffsetY: Int = 0,
         displayCols: Int = 0,
-        displayRows: Int = 0
+        displayRows: Int = 0,
+        heightRows: Int = 1
     ) = lock.withLock {
         if (row !in 0 until rows) return@withLock
         kittyPlacements[placementKey(imageId, placementId)] = KittyPlacement(
             imageId, placementId, row, col, z, image,
-            srcX, srcY, srcW, srcH, cellOffsetX, cellOffsetY, displayCols, displayRows
+            srcX, srcY, srcW, srcH, cellOffsetX, cellOffsetY, displayCols, displayRows,
+            heightRows.coerceAtLeast(1)
         )
     }
 
@@ -1536,12 +1570,25 @@ class TerminalBuffer(
         for (c in 0 until columns) {
             grid[row][c] = Cell(bg = bg)
         }
-        images.removeAll { it.row == row }
-        kittyPlacements.entries.removeAll { it.value.row == row }
+        // Deliberately does NOT touch placed images: per the Kitty graphics
+        // spec (and xterm/WezTerm behaviour), erasing text (EL/ED/ECH, a
+        // prompt redraw's CSI K/J) has no effect on graphics - only a full
+        // screen clear (CSI 2J, see clearAll) and RIS remove them.
     }
 
+    /** Full-screen erase (CSI 2J): clears every row AND drops every image
+     *  placed in the live grid. Images that already scrolled into
+     *  scrollback stay with their scrollback lines. */
     fun clearAll(bg: Int = DEFAULT_BACKGROUND) = lock.withLock {
         for (r in 0 until rows) clearRow(r, bg)
+        clearImagesOnGrid()
+    }
+
+    // Drops every image whose rows overlap the live grid (row+height > 0);
+    // images wholly in scrollback (bottom edge above the grid) are kept.
+    private fun clearImagesOnGrid() {
+        images.removeAll { it.row + it.heightRows > 0 }
+        kittyPlacements.entries.removeAll { it.value.row + it.value.heightRows > 0 }
     }
 
     /** Discards scrollback history entirely - used by CSI 3J ("clear
@@ -1550,6 +1597,9 @@ class TerminalBuffer(
      *  callers that want a full clear call this alongside clearAll(). */
     fun clearScrollback() = lock.withLock {
         scrollback.clear()
+        // Images wholly inside the discarded history have nothing left to
+        // show on; ones still overlapping the grid are kept (cropped).
+        dropImagesAboveScrollback()
     }
 
     /** Scrolls the grid up by one line, pushing the top line into scrollback
@@ -1594,28 +1644,48 @@ class TerminalBuffer(
         val it = images.iterator()
         while (it.hasNext()) {
             val placed = it.next()
+            // A downward shift (reverse index / grow) never moves
+            // scrollback, so images already above the grid stay put.
+            if (delta > 0 && placed.row < 0) continue
             placed.row += delta
-            if (placed.row !in 0 until rows) it.remove()
+            if (imageGone(placed.row, placed.heightRows)) it.remove()
         }
     }
 
+    // An image is anchored to a row index relative to the live grid's top
+    // row: 0..rows-1 are on-screen rows and NEGATIVE values are scrollback
+    // rows (-1 = the newest scrollback line). Scrolling therefore never
+    // needs to move or drop anything until the image's LAST row has left
+    // the retained scrollback (row + heightRows <= -scrollback.size) or it
+    // was pushed below the grid (row >= rows). The visible part of a
+    // partly-scrolled image is clipped at draw time by TerminalView.
+    private fun imageGone(row: Int, heightRows: Int): Boolean {
+        if (row >= rows) return true
+        val oldestRow = if (altGrid != null) 0 else -scrollback.size
+        return row + heightRows <= oldestRow
+    }
+
+    private fun dropImagesAboveScrollback() {
+        images.removeAll { imageGone(it.row, it.heightRows) }
+        kittyPlacements.entries.removeAll { imageGone(it.value.row, it.value.heightRows) }
+    }
+
     // Kitty counterpart of shiftImageRows - same delta-and-drop-if-off-
-    // grid bookkeeping, kept as its own function (rather than folding
-    // into shiftImageRows) since kittyPlacements is a LinkedHashMap keyed
-    // by (imageId, placementId), not a plain ArrayList, so entries have
-    // to be removed by key rather than via ArrayList iterator.remove().
-    // Deliberately does NOT touch kittyImages - a placement scrolling off
-    // the live grid is exactly the "on-screen placement gone, pixels kept
-    // in case another placement still wants them" case KittyPlacement's
-    // own doc describes, not a delete-the-data event (only an explicit
-    // uppercase a=d, see deleteKittyPlacements, ever frees kittyImages).
+    // bookkeeping, kept as its own function since kittyPlacements is a
+    // LinkedHashMap keyed by (imageId, placementId), not a plain
+    // ArrayList. Deliberately does NOT touch kittyImages - a placement
+    // leaving the retained history is the "on-screen placement gone,
+    // pixels kept in case another placement still wants them" case, not
+    // a delete-the-data event (only an explicit uppercase a=d, see
+    // deleteKittyPlacements, ever frees kittyImages).
     private fun shiftKittyPlacementRows(delta: Int) {
         if (kittyPlacements.isEmpty()) return
         val it = kittyPlacements.entries.iterator()
         while (it.hasNext()) {
             val placed = it.next().value
+            if (delta > 0 && placed.row < 0) continue
             placed.row += delta
-            if (placed.row !in 0 until rows) it.remove()
+            if (imageGone(placed.row, placed.heightRows)) it.remove()
         }
     }
 
@@ -1779,11 +1849,13 @@ class TerminalBuffer(
         // shifting/clipping instead of clearing here fixes it while still
         // preserving the real xterm-matching behavior for an actual
         // column reflow.
-        val columnsChanged = newColumns != oldColumns
-        if (columnsChanged) {
-            images.clear()
-            clearAllKittyImages()
-        }
+        // Column changes no longer clear images: this grid never reflows
+        // text on a column change (rows keep their cells, only the visible
+        // width changes), so image anchors stay valid. Clearing here is
+        // what made a photo vanish on pinch-zoom (font size -> cell size
+        // -> column count changes). Images wider than the new width are
+        // simply clipped at draw time.
+        val columnsChanged = false
         // On a shrink, rows above `rowOffset` are about to fall off the top
         // of the grid. The window kept must be anchored to the CURSOR, not
         // blindly to "the last newRows rows of the old grid": a terminal
