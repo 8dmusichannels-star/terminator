@@ -155,7 +155,7 @@ fun SessionDrawer(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.45f))
+                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.45f))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -178,7 +178,7 @@ fun SessionDrawer(
                             y = 0
                         )
                     }
-                    .background(Color.Black)
+                    .background(MaterialTheme.colorScheme.surface)
                     // Swallow taps so they don't fall through to the scrim.
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
@@ -212,7 +212,7 @@ fun SessionDrawer(
                                 Text(
                                     "RUNNING",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = Color.White.copy(alpha = 0.5f),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(vertical = 4.dp)
                                 )
                                 // Destructive one-tap action - confirm before actually
@@ -266,11 +266,11 @@ fun SessionDrawer(
                             )
                         }
                         item(key = "running-divider") {
-                            HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                             Text(
                                 "SESSIONS",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.5f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                             )
                         }
@@ -298,7 +298,7 @@ fun SessionDrawer(
                     }
                 }
 
-                HorizontalDivider()
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
                 Row(
                     modifier = Modifier
@@ -307,9 +307,9 @@ fun SessionDrawer(
                         .padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Filled.Settings, contentDescription = null)
+                    Icon(Icons.Filled.Settings, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface)
                     Spacer(modifier = Modifier.width(12.dp))
-                    Text("Settings", style = MaterialTheme.typography.bodyLarge)
+                    Text("Settings", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
                 }
             }
 
@@ -372,14 +372,17 @@ private fun RunningSessionRow(
     // together. Default true keeps existing callers unaffected.
     showPaneButton: Boolean = true
 ) {
-    Row(
+    // Name on its own line, action icons on a second line: six 48dp icon
+    // buttons next to the name left it ~0dp wide in the 300dp drawer, so the
+    // label wrapped one letter per line.
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(if (isActive) Color.White.copy(alpha = 0.08f) else Color.Transparent)
+            .background(if (isActive) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         if (!imageUri.isNullOrBlank()) {
             // See SessionImage.kt's doc - adds SVG support alongside the
             // raster formats BitmapFactory already handled.
@@ -400,16 +403,22 @@ private fun RunningSessionRow(
             Text(
                 running.label,
                 style = MaterialTheme.typography.bodyLarge,
-                color = if (isActive) MaterialTheme.colorScheme.primary else Color.White
+                color = if (isActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurface
             )
             if (running.exited) {
                 Text(
                     "Session exited",
                     style = MaterialTheme.typography.labelSmall,
-                    color = Color(0xFFBF616A)
+                    color = MaterialTheme.colorScheme.error
                 )
             }
         }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.End
+    ) {
 
         // Split / add-to-pane icons now show directly on the row, same as
         // Save/Clone/Wake/Kill below - no more "···" (MoreVert/ExpandLess)
@@ -418,29 +427,29 @@ private fun RunningSessionRow(
         // nothing sits in front of the running session's own action row
         // anymore.
         if (onSplitClick != null) {
-            IconButton(onClick = onSplitClick) {
+            IconButton(modifier = Modifier.size(40.dp), onClick = onSplitClick) {
                 Icon(
                     Icons.Filled.VerticalSplit,
                     contentDescription = if (isSplitPartner) "Close split" else "Open in split view",
-                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                    tint = if (isSplitPartner) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
         if (showPaneButton) {
-        IconButton(onClick = onAddPaneClick) {
+        IconButton(modifier = Modifier.size(40.dp), onClick = onAddPaneClick) {
             Icon(
                 Icons.Filled.GridView,
                 contentDescription = if (isPaneMember) "Already showing as a pane" else "Add to panes",
-                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f)
+                tint = if (isPaneMember) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
         }
         if (onSaveClick != null) {
-            IconButton(onClick = onSaveClick) {
+            IconButton(modifier = Modifier.size(40.dp), onClick = onSaveClick) {
                 Icon(
                     Icons.Filled.Save,
                     contentDescription = "Save session output",
-                    tint = Color.White.copy(alpha = 0.6f)
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
@@ -448,11 +457,11 @@ private fun RunningSessionRow(
         // unlike the titlebar "+" (QuickAddSessionPickerDialog) which asks
         // which running session to duplicate. This one already knows: it's
         // this row's own session.
-        IconButton(onClick = onCloneClick) {
+        IconButton(modifier = Modifier.size(40.dp), onClick = onCloneClick) {
             Icon(
                 Icons.Filled.Add,
                 contentDescription = "Clone session",
-                tint = Color.White.copy(alpha = 0.6f)
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
         // Wake-up toggle: raises this session's background-survival
@@ -460,23 +469,24 @@ private fun RunningSessionRow(
         // the notification - tapping an already-awake session's icon here
         // undoes it, same as tapping it again from the notification's
         // "..." menu would.
-        IconButton(onClick = onWakeUpClick) {
+        IconButton(modifier = Modifier.size(40.dp), onClick = onWakeUpClick) {
             Icon(
                 if (running.wakeUp) Icons.Filled.Star else Icons.Outlined.StarOutline,
                 contentDescription = if (running.wakeUp) "Let session sleep" else "Keep session awake",
-                tint = if (running.wakeUp) Color(0xFFEBCB8B) else Color.White.copy(alpha = 0.35f)
+                tint = if (running.wakeUp) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
             )
         }
         // Kill button: always available here, independent of Ctrl+D inside
         // the terminal - the two methods the spec asked for. Both send an
         // unconditional SIGKILL.
-        IconButton(onClick = onKillClick) {
+        IconButton(modifier = Modifier.size(40.dp), onClick = onKillClick) {
             Icon(
                 Icons.Filled.Delete,
                 contentDescription = "Kill session",
-                tint = Color(0xFFBF616A)
+                tint = MaterialTheme.colorScheme.error
             )
         }
+    }
     }
 }
 
@@ -526,7 +536,7 @@ private fun SessionRow(
                 .weight(1f)
                 .combinedClickable(onClick = onClick, onLongClick = onLongClick)
         ) {
-            Text(session.name, style = MaterialTheme.typography.bodyLarge)
+            Text(session.name, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
             if (session.isDefault) {
                 Text(
                     "Default",
@@ -542,7 +552,7 @@ private fun SessionRow(
                 tint = if (session.isFavorite) {
                     MaterialTheme.colorScheme.primary
                 } else {
-                    Color.White.copy(alpha = 0.35f)
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                 }
             )
         }

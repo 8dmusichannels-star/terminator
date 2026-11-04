@@ -1652,6 +1652,28 @@ class TerminalBuffer(
         }
     }
 
+    // Resize-only image shift. Unlike shiftImageRows it does NOT drop an image
+    // that merely ends up below a (temporarily smaller) grid: a floating pane
+    // drag shrinks and grows every ~32 ms, and dropping on the shrink made the
+    // photo vanish for good although growing back would have shown it again.
+    // Such an image is just clipped at draw time. Only an image that has left
+    // the retained scrollback at the top is removed.
+    private fun shiftImagesForResize(delta: Int) {
+        val oldest = if (altGrid != null) 0 else -scrollback.size
+        val it = images.iterator()
+        while (it.hasNext()) {
+            val placed = it.next()
+            placed.row += delta
+            if (placed.row + placed.heightRows <= oldest) it.remove()
+        }
+        val kit = kittyPlacements.entries.iterator()
+        while (kit.hasNext()) {
+            val placed = kit.next().value
+            placed.row += delta
+            if (placed.row + placed.heightRows <= oldest) kit.remove()
+        }
+    }
+
     // An image is anchored to a row index relative to the live grid's top
     // row: 0..rows-1 are on-screen rows and NEGATIVE values are scrollback
     // rows (-1 = the newest scrollback line). Scrolling therefore never
@@ -1912,7 +1934,16 @@ class TerminalBuffer(
             // shrink instead of archiving it ("floating resize olunca
             // veriler yutuluyor"). Fixed for real below.
             val blankCell = Cell()
-            val hasRealContent = (0 until rowOffset).any { i -> grid[i].any { it != blankCell } }
+            // Rows covered by a Sixel/Kitty image have BLANK cells underneath,
+            // so they used to count as "no content": the rows were dropped
+            // instead of pushed to scrollback, while the images were still
+            // shifted up by rowOffset - leaving them anchored to scrollback
+            // rows that didn't exist (imageGone() then deleted them). That is
+            // the photo vanishing/shifting when a floating pane is shrunk.
+            val imageOverlapsDeparting = images.any { it.row < rowOffset && it.row + it.heightRows > -scrollback.size } ||
+                kittyPlacements.values.any { it.row < rowOffset && it.row + it.heightRows > -scrollback.size }
+            val hasRealContent = imageOverlapsDeparting ||
+                (0 until rowOffset).any { i -> grid[i].any { it != blankCell } }
             if (hasRealContent) {
                 for (i in 0 until rowOffset) {
                     scrollback.addLast(grid[i])
@@ -2018,8 +2049,12 @@ class TerminalBuffer(
                 // the real characters still sitting there rather than
                 // blank Cells.
                 val src = g[srcRow]
-                val width = maxOf(newColumns, src.size)
-                Array(width) { c -> if (c < src.size) src[c] else Cell() }
+                // Reuse the row array as-is when it is already wide enough
+                // (the common case during zoom/drag): avoids reallocating and
+                // copying every row on every resize tick.
+                if (src.size >= newColumns) src else {
+                    Array(newColumns) { c -> if (c < src.size) src[c] else Cell() }
+                }
             } else {
                 Array(newColumns) { Cell() }
             }
@@ -2051,12 +2086,33 @@ class TerminalBuffer(
         // user only sees it again once they quit back out, by which point
         // a naive truncate would already have thrown it away with no way
         // to notice or recover it.
+        // While the alt screen is active, rowOffset above is always 0, so the
+        // dormant primary screen (savedGrid) used to be cropped from the
+        // BOTTOM on a shrink - dropping the prompt/cursor row and everything
+        // near it. Anchor it to its own saved cursor row instead, and archive
+        // the departing top rows into scrollback like the primary path does.
+        val savedRowOffset = if (savedGrid != null && newRows < rows) {
+            (savedCursorRow + 1 - newRows).coerceAtLeast(0)
+        } else 0
+        if (savedRowOffset > 0) {
+            val sg = savedGrid!!
+            val blank = Cell()
+            val hasContent = (0 until savedRowOffset).any { i -> sg[i].any { it != blank } }
+            if (hasContent) {
+                for (i in 0 until savedRowOffset) scrollback.addLast(sg[i])
+                while (scrollback.size > MAX_SCROLLBACK_LINES) scrollback.removeFirst()
+            }
+        }
         fun resizedPlain(g: Array<Array<Cell>>): Array<Array<Cell>> = Array(newRows) { r ->
-            val srcRow = r + rowOffset
+            val srcRow = r + (if (savedGrid != null) savedRowOffset else rowOffset)
             if (srcRow < rows) {
                 val src = g[srcRow]
-                val width = maxOf(newColumns, src.size)
-                Array(width) { c -> if (c < src.size) src[c] else Cell() }
+                // Reuse the row array as-is when it is already wide enough
+                // (the common case during zoom/drag): avoids reallocating and
+                // copying every row on every resize tick.
+                if (src.size >= newColumns) src else {
+                    Array(newColumns) { c -> if (c < src.size) src[c] else Cell() }
+                }
             } else {
                 Array(newColumns) { Cell() }
             }
@@ -2077,8 +2133,7 @@ class TerminalBuffer(
         // Must run AFTER rows = newRows above, since both shift helpers
         // bounds-check the shifted row against the CURRENT `rows`.
         if (!columnsChanged) {
-            shiftImageRows(-rowOffset)
-            shiftKittyPlacementRows(-rowOffset)
+            shiftImagesForResize(-rowOffset)
         }
         // Content moved up by rowOffset rows above (bottom of the old grid
         // is now the new grid), so cursorRow/savedCursorRow have to move
@@ -2094,6 +2149,10 @@ class TerminalBuffer(
         cursorCol = cursorCol.coerceIn(0, columns - 1)
         if (rowOffset > 0) {
             savedCursorRow = (savedCursorRow - rowOffset).coerceIn(0, rows - 1)
+        }
+        if (savedGrid != null) {
+            savedCursorRow = (savedCursorRow - savedRowOffset).coerceIn(0, rows - 1)
+            savedCursorCol = savedCursorCol.coerceIn(0, columns - 1)
         }
         // Same shift, handed to the emulator for ITS saved cursor - see
         // pendingResizeRowShift's doc.

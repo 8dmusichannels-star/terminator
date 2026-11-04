@@ -620,9 +620,19 @@ class TerminalSession(
      * once for the whole gesture.
      */
     fun resize(columns: Int, rows: Int, pixelWidth: Int = 0, pixelHeight: Int = 0, deferIoctl: Boolean = false) {
-        buffer.resize(columns, rows)
+        // buffer.resize() + emulator.onBufferResized() must be atomic with
+        // respect to emulator.append() (reader thread). Without this lock the
+        // UI thread could swap the grid / reset scrollTop-scrollBottom /
+        // rewrite cursorRow in the MIDDLE of a chunk being parsed (e.g. right
+        // after top's ESC[H), so the rest of that frame landed at a stale
+        // cursor row on the resized (alt) grid: the "top is cloned / alt
+        // screen mixes with the normal screen" symptom after the keyboard
+        // opens or a pinch-zoom.
+        synchronized(emulatorAppendLock) {
+            buffer.resize(columns, rows)
+            if (::emulator.isInitialized) emulator.onBufferResized()
+        }
         if (::emulator.isInitialized) {
-            emulator.onBufferResized()
             // Keeps emulator.cellHeightPx (used only to size a natural-size
             // Sixel/Kitty image's cursor-advance in rows - see its own doc)
             // in sync with the view's real layout. rows > 0 guard avoids a

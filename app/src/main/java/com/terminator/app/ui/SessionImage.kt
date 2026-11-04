@@ -61,6 +61,24 @@ import kotlinx.coroutines.withContext
  */
 private const val SESSION_IMAGE_RENDER_PX = 128
 
+/** Longest edge, in px, a decoded raster picture is downsampled to. The slots
+ *  these are shown in are tiny (32dp circles up to the Settings preview), but
+ *  a full-resolution photo decoded as-is can be hundreds of MB and crashes the
+ *  renderer ("Canvas: trying to draw too large bitmap"). */
+private const val SESSION_IMAGE_MAX_PX = 512
+
+/** BitmapFactory decode that never produces a bitmap larger than
+ *  SESSION_IMAGE_MAX_PX on its longest edge (power-of-two inSampleSize). */
+private fun decodeRasterDownsampled(bytes: ByteArray): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    val longest = maxOf(bounds.outWidth, bounds.outHeight)
+    var sample = 1
+    while (longest > 0 && longest / (sample * 2) >= SESSION_IMAGE_MAX_PX) sample *= 2
+    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+}
+
 /** Process-lifetime cache keyed by uri string - see rememberSessionImage's doc. */
 private val sessionImageCache = java.util.concurrent.ConcurrentHashMap<String, Bitmap>()
 
@@ -101,9 +119,9 @@ fun decodeSessionImage(context: Context, uri: String): Bitmap? = runCatching {
     context.contentResolver.openInputStream(Uri.parse(uri))?.use { stream ->
         val bytes = stream.readBytes()
         if (sniffIsSvg(bytes)) {
-            decodeSvgToBitmap(bytes) ?: BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            decodeSvgToBitmap(bytes) ?: decodeRasterDownsampled(bytes)
         } else {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            decodeRasterDownsampled(bytes)
         }
     }
 }.getOrNull()

@@ -2253,14 +2253,17 @@ private fun DrawScope.drawTerminal(
                 // to the current one, keeping its footprint (rows x cols)
                 // fixed, like a cell-sized glyph.
                 if (placed.refCellH <= 0f) { placed.refCellW = charWidth; placed.refCellH = charHeight }
-                val destWidthCells = (bitmap.width / placed.refCellW).let {
-                    if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
-                }.coerceAtLeast(1)
+                // Scale BOTH axes continuously by the same cell-size ratio the
+                // text uses. The old ceil() to whole cells on the width axis
+                // (but not the height) distorted the aspect ratio and made the
+                // image's right edge jump relative to the text on every zoom
+                // or pane-resize tick.
+                val destWidthPx = bitmap.width * (charWidth / placed.refCellW)
                 val destHeightPx = bitmap.height * (charHeight / placed.refCellH)
                 canvas.nativeCanvas.drawBitmap(
                     bitmap,
                     null,
-                    android.graphics.RectF(left, top, left + destWidthCells * charWidth, top + destHeightPx),
+                    android.graphics.RectF(left, top, left + destWidthPx, top + destHeightPx),
                     null
                 )
             }
@@ -2353,10 +2356,7 @@ private fun DrawScope.drawTerminal(
                     // the image aligned with the text (see the Sixel loop).
                     // Overflow past the right edge is cut by the clip.
                     if (placed.refCellH <= 0f) { placed.refCellW = charWidth; placed.refCellH = charHeight }
-                    val destWidthCells = (croppedW / placed.refCellW).let {
-                        if (it <= 0f) 1 else kotlin.math.ceil(it).toInt()
-                    }.coerceAtLeast(1)
-                    destWidthPx = destWidthCells * charWidth
+                    destWidthPx = croppedW * (charWidth / placed.refCellW)
                     destHeightPx = croppedH * (charHeight / placed.refCellH)
                 }
 

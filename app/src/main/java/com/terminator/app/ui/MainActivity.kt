@@ -2585,9 +2585,9 @@ class MainActivity : ComponentActivity() {
                                                                     // still cancelled/restarted every frame)
                                                                     // is what guarantees the exact final size
                                                                     // once the gesture actually settles.
-                                                                    val throttleElapsed = System.nanoTime() - lastZoomCommitNanos >= 150_000_000L
+                                                                    val throttleElapsed = System.nanoTime() - lastZoomCommitNanos >= 90_000_000L
                                                                     zoomCommitJob = coroutineScope.launch {
-                                                                        if (!throttleElapsed) delay(150)
+                                                                        if (!throttleElapsed) delay(90)
                                                                         lastZoomCommitNanos = System.nanoTime()
                                                                         viewModel.setSessionTextSize(activeSessionId, newSize)
                                                                         liveZoomSize = null

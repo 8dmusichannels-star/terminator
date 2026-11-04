@@ -214,6 +214,18 @@ object X11Colors {
         return byKey[normalized]
     }
 
+    /**
+     * Reverse lookup: the X11 entry whose RGB exactly matches [argb]
+     * (alpha ignored), or null for a color that isn't a named X11 one.
+     * Where several names share one RGB (e.g. Aqua/Cyan) the first entry
+     * in [all] wins. Lets the palette editor show the *name* of whatever
+     * color a slot currently holds instead of only its hex.
+     */
+    fun byArgb(argb: Int): X11Color? {
+        val rgb = argb and 0xFFFFFF
+        return all.firstOrNull { (it.argb and 0xFFFFFF) == rgb }
+    }
+
     /** Case-insensitive substring search over both display name and key. */
     fun search(query: String): List<X11Color> {
         if (query.isBlank()) return all

@@ -632,7 +632,9 @@ fun MoreActionsPopup(
     ) {
         Surface(
             shape = RoundedCornerShape(10.dp),
-            color = Color(0xFF1F1F1F),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            tonalElevation = 3.dp,
             shadowElevation = 8.dp,
             modifier = Modifier.width(220.dp)
         ) {
@@ -645,21 +647,22 @@ fun MoreActionsPopup(
                 MoreMenuRow(
                     icon = if (actions.wakeUpActive) Icons.Filled.Star else Icons.Outlined.StarOutline,
                     label = if (actions.wakeUpActive) "Wake lock: on" else "Wake lock: off",
-                    tint = if (actions.wakeUpActive) Color(0xFFEBCB8B) else Color.White,
+                    tint = if (actions.wakeUpActive) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
                     onClick = { actions.onToggleWakeUp(); onDismiss() }
                 )
                 if (actions.onToggleSplitScreen != null) {
                     MoreMenuRow(
                         icon = Icons.Filled.VerticalSplit,
                         label = if (actions.splitScreenActive) "Close split screen" else "Open split screen",
-                        tint = if (actions.splitScreenActive) MaterialTheme.colorScheme.primary else Color.White,
+                        tint = if (actions.splitScreenActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         onClick = { actions.onToggleSplitScreen.invoke(); onDismiss() }
                     )
                 }
-                Divider(color = Color.White.copy(alpha = 0.08f))
+                Divider(color = MaterialTheme.colorScheme.outlineVariant)
                 MoreMenuRow(
                     icon = Icons.Filled.Save,
                     label = "Save session output",
+                    tint = MaterialTheme.colorScheme.primary,
                     onClick = { actions.onSave(); onDismiss() }
                 )
             }
@@ -670,7 +673,7 @@ fun MoreActionsPopup(
 private fun MoreMenuRow(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
-    tint: Color = Color.White,
+    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     onClick: () -> Unit
 ) {
     androidx.compose.foundation.layout.Row(
@@ -686,6 +689,6 @@ private fun MoreMenuRow(
     ) {
         Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.width(20.dp))
         androidx.compose.foundation.layout.Spacer(modifier = Modifier.width(14.dp))
-        Text(label, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+        Text(label, color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.bodyMedium)
     }
 }

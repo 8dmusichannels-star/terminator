@@ -35,6 +35,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.terminator.app.settings.SettingsKeys
 import kotlinx.coroutines.launch
@@ -435,6 +438,60 @@ private fun PalettePresetRow(onPresetSelected: (com.terminator.app.ui.settings.N
     }
 }
 
+/**
+ * Mini terminal sample drawn straight from the palette being edited: the
+ * Background/Text pair plus a swatch strip of all 16 ANSI slots. Gives
+ * immediate visual feedback that a picked color was stored, without having
+ * to leave Settings and run a colored command in a session.
+ */
+@Composable
+private fun PalettePreview(colors: IntArray, foregroundHex: String, backgroundHex: String) {
+    val bg = parseHexColor(backgroundHex) ?: DEFAULT_CUSTOM_BG
+    val fg = parseHexColor(foregroundHex) ?: DEFAULT_CUSTOM_FG
+    fun slot(i: Int) = androidx.compose.ui.graphics.Color(colors.getOrElse(i) { 0 })
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                androidx.compose.ui.graphics.Color(bg),
+                androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+            )
+            .padding(12.dp)
+    ) {
+        Text(
+            "user@terminator:~$ ls --color",
+            color = androidx.compose.ui.graphics.Color(fg),
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall
+        )
+        Text(
+            buildAnnotatedString {
+                append("docs  ")
+                withStyle(SpanStyle(color = slot(4))) { append("src/  ") }
+                withStyle(SpanStyle(color = slot(2))) { append("run.sh  ") }
+                withStyle(SpanStyle(color = slot(1))) { append("error  ") }
+                withStyle(SpanStyle(color = slot(3))) { append("warn  ") }
+                withStyle(SpanStyle(color = slot(5))) { append("img.png  ") }
+                withStyle(SpanStyle(color = slot(6))) { append("link") }
+            },
+            color = androidx.compose.ui.graphics.Color(fg),
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth()) {
+            for (i in 0 until 16) {
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(16.dp)
+                        .background(slot(i))
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun CustomPaletteEditor(
     colors: IntArray,
@@ -454,6 +511,16 @@ private fun CustomPaletteEditor(
             backgroundHex = backgroundHex,
             onForegroundChange = onForegroundChange,
             onBackgroundChange = onBackgroundChange
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        PalettePreview(colors = colors, foregroundHex = foregroundHex, backgroundHex = backgroundHex)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            "Black and Bright White also serve as the terminal's default " +
+                "background/text, so the terminal itself uses the Background/" +
+                "Text fields above for those. With \"Separate error/status " +
+                "colors\" on, Red/Yellow are pinned to that setting.",
+            style = MaterialTheme.typography.bodySmall
         )
         Spacer(modifier = Modifier.height(12.dp))
         HorizontalDivider()
@@ -477,7 +544,18 @@ private fun CustomPaletteEditor(
                         )
                 )
                 Spacer(modifier = Modifier.width(12.dp))
-                Text(label, modifier = Modifier.width(110.dp), style = MaterialTheme.typography.bodyMedium)
+                Column(modifier = Modifier.width(110.dp)) {
+                    Text(label, style = MaterialTheme.typography.bodyMedium)
+                    // Name of the X11 color this slot currently holds (or
+                    // "Custom" for a hand-typed hex) - updates every time
+                    // the slot changes, whether via the picker or the hex
+                    // field, so the picked name is actually visible.
+                    Text(
+                        X11Colors.byArgb(colors.getOrElse(index) { 0 })?.name ?: "Custom",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 OutlinedTextField(
                     value = hexText,
                     onValueChange = { text ->
@@ -497,6 +575,7 @@ private fun CustomPaletteEditor(
 
     x11PickerForSlot?.let { slotIndex ->
         X11ColorPickerDialog(
+            currentArgb = colors.getOrElse(slotIndex) { 0 },
             onDismiss = { x11PickerForSlot = null },
             onColorSelected = { x11Color ->
                 onColorChange(slotIndex, x11Color.argb)
@@ -515,6 +594,7 @@ private fun CustomPaletteEditor(
  */
 @Composable
 private fun X11ColorPickerDialog(
+    currentArgb: Int,
     onDismiss: () -> Unit,
     onColorSelected: (X11Color) -> Unit
 ) {
@@ -557,7 +637,12 @@ private fun X11ColorPickerDialog(
                                     )
                             )
                             Spacer(modifier = Modifier.width(12.dp))
-                            Text(color.name, modifier = Modifier.weight(1f))
+                            val isCurrent = (color.argb and 0xFFFFFF) == (currentArgb and 0xFFFFFF)
+                            Text(
+                                if (isCurrent) "✓ ${color.name}" else color.name,
+                                modifier = Modifier.weight(1f),
+                                fontWeight = if (isCurrent) androidx.compose.ui.text.font.FontWeight.Bold else null
+                            )
                             Text(
                                 "#%06X".format(color.argb and 0xFFFFFF),
                                 style = MaterialTheme.typography.bodySmall

@@ -585,7 +585,7 @@ private fun TilingDivider(vertical: Boolean, onDrag: (deltaPx: Float) -> Unit) {
     val thickness = 6.dp
     Box(
         modifier = (if (vertical) Modifier.width(thickness).fillMaxHeight() else Modifier.height(thickness).fillMaxWidth())
-            .background(Color.White.copy(alpha = 0.06f))
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             .pointerInput(vertical) {
                 detectDragGestures { change, dragAmount ->
                     change.consume()
@@ -1209,14 +1209,14 @@ private fun PaneContent(
 
     Column(
         modifier = modifier
-            .background(if (isFocused) MaterialTheme.colorScheme.primary.copy(alpha = 0.4f) else Color.White.copy(alpha = 0.12f))
+            .background(if (isFocused) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outlineVariant)
             .padding(1.dp) // Focus ring: the outer background peeks through as a 1dp border.
             .background(Color.Black)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF141414))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                 .padding(horizontal = 8.dp, vertical = 2.dp)
                 .let { base ->
                     if (showDragHandle) {
@@ -1264,7 +1264,7 @@ private fun PaneContent(
                 Icon(
                     Icons.Filled.OpenWith,
                     contentDescription = "Drag to move",
-                    tint = Color.White.copy(alpha = 0.4f),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                     modifier = Modifier.size(14.dp)
                 )
                 androidx.compose.foundation.layout.Spacer(modifier = Modifier.width(4.dp))
@@ -1272,7 +1272,7 @@ private fun PaneContent(
             Text(
                 label,
                 style = MaterialTheme.typography.labelSmall,
-                color = if (isFocused) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.6f),
+                color = if (isFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
@@ -1281,7 +1281,7 @@ private fun PaneContent(
                 Icon(
                     Icons.Filled.Close,
                     contentDescription = "Close pane",
-                    tint = Color.White.copy(alpha = 0.7f),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(14.dp)
                 )
             }
@@ -2352,7 +2352,7 @@ private fun PaneContent(
                     Icon(
                         Icons.Filled.OpenWith,
                         contentDescription = "Drag to resize",
-                        tint = Color.White.copy(alpha = if (isManuallyResizing) 0.9f else 0.35f),
+                        tint = if (isManuallyResizing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                         modifier = Modifier.size(16.dp).align(Alignment.BottomEnd)
                     )
                 }

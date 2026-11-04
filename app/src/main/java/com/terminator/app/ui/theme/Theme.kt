@@ -24,8 +24,15 @@ import android.os.Build
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
+import android.app.Activity
+import android.content.ContextWrapper
+import android.graphics.drawable.ColorDrawable
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.graphics.toArgb
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 
 // TERMINATOR base palette: flat black, no gradients/tint. A thin accent
@@ -106,6 +113,25 @@ fun TerminatorTheme(
         }
         amoledBlack -> TerminatorFlatScheme
         else -> TerminatorDarkFallbackScheme
+    }
+    // The system bars are transparent (see MainActivity/SettingsActivity), so
+    // whatever the WINDOW background is shows through behind the status/nav
+    // bar. themes.xml hardcodes black there; follow the active scheme instead
+    // (Material You surface normally, pure black only with AMOLED Black on),
+    // and flip the bar icons light/dark to stay readable on it.
+    val view = androidx.compose.ui.platform.LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            var c: android.content.Context = view.context
+            while (c is ContextWrapper && c !is Activity) c = c.baseContext
+            (c as? Activity)?.window?.let { w ->
+                w.setBackgroundDrawable(ColorDrawable(colorScheme.background.toArgb()))
+                val lightBg = colorScheme.background.luminance() > 0.5f
+                val ctrl = WindowCompat.getInsetsController(w, view)
+                ctrl.isAppearanceLightStatusBars = lightBg
+                ctrl.isAppearanceLightNavigationBars = lightBg
+            }
+        }
     }
     MaterialTheme(
         colorScheme = colorScheme,
