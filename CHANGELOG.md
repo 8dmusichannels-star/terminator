@@ -24,4 +24,3 @@
 - 🔧 **Pane Photo Slip:** Fixed images slipping when a floating pane is resized.
 - 🔒 **Resize Lock:** `buffer.resize()` and `emulator.onBufferResized()` now run inside the same lock as `append()`, fixing frames drawn from the wrong row.
 - 🎨 **Palette Slots:** Changing Black (0) or Bright White (15) now updates the terminal background and default text color.
-
