@@ -230,7 +230,13 @@ Java_com_terminator_emulator_NativePty_setWindowSize(
 JNIEXPORT jint JNICALL
 Java_com_terminator_emulator_NativePty_waitFor(JNIEnv *env, jclass clazz, jint pid) {
     int status = 0;
-    waitpid((pid_t) pid, &status, 0);
+    pid_t r;
+    do {
+        r = waitpid((pid_t) pid, &status, 0);
+    } while (r < 0 && errno == EINTR);
+    // On any other failure (ECHILD etc.) `status` was never written, and its
+    // zero initial value would read as a clean "exited with 0".
+    if (r < 0) return -1;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return -WTERMSIG(status);
     return -1;

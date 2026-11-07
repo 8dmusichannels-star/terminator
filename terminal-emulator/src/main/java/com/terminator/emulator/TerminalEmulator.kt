@@ -2118,6 +2118,19 @@ class TerminalEmulator(
             return
         }
 
+        // DECRQPSR (CSI Ps $ w): request presentation state report. Ps 1 = DECCIR
+        // (cursor information), Ps 2 = DECTABSR (tab stops). Must be answered here,
+        // before the generic dispatch, because 'w' with a '$' intermediate has no
+        // other meaning in this emulator and would otherwise be dropped unanswered
+        // (the querying program then sits waiting for its reply).
+        if (ch == 'w' && csiIntermediate == '$' && !private && !secondaryDA &&
+            (raw.isEmpty() || raw[0].isDigit())
+        ) {
+            handleDecrqpsr(params.getOrElse(0) { 0 })
+            endCsi()
+            return
+        }
+
         if (private) {
             // Only h/l are mode set/reset. Every other '?'-prefixed final used
             // to be fed to handlePrivateMode as if it were a reset, so e.g.
@@ -2172,6 +2185,26 @@ class TerminalEmulator(
         if ((secondaryDA || raw.startsWith("=") || raw.startsWith("<")) && ch != 'c' && ch != 'q') {
             endCsi()
             return
+        }
+
+        // Every plain CSI final below is only valid WITHOUT an intermediate byte, except
+        // the few forms that explicitly use one. Without this guard a sequence such as
+        // DECCARA ("CSI Pt;Pl;Pb;Pr;Ps $ r") ran as DECSTBM (resetting the scroll region
+        // and homing the cursor), SL/SR ("CSI Ps SP @" / "SP A") ran as ICH/CUU, and so
+        // on: unsupported intermediate sequences executed the wrong function. Allowed:
+        //   SP q  DECSCUSR      " q  DECSCA      ! p  DECSTR      " p  DECSCL
+        // ('$ p' DECRQM and '$ w' DECRQPSR are answered earlier and never reach here.)
+        if (csiIntermediate != null) {
+            val known = when (csiIntermediate) {
+                ' ' -> ch == 'q'
+                '"' -> ch == 'q' || ch == 'p'
+                '!' -> ch == 'p'
+                else -> false
+            }
+            if (!known) {
+                endCsi()
+                return
+            }
         }
 
         // Movement/erase finals act from the pending-wrap column (see pendingWrapCol).
@@ -2608,6 +2641,82 @@ class TerminalEmulator(
         var body = s.substring(2)
         if (body.endsWith("\u001B\\")) body = body.dropLast(2) + '\u009C'
         listener.onRespond(c1 + body)
+    }
+
+    /** DECRQPSR: Ps 1 -> DECCIR, Ps 2 -> DECTABSR; any other Ps is ignored. */
+    private fun handleDecrqpsr(ps: Int) {
+        when (ps) {
+            1 -> respond(decCir())
+            2 -> respond(decTabsr())
+            else -> {}
+        }
+    }
+
+    /**
+     * DECTABSR: "DCS 2 $ u D...D ST", D...D being the 1-based tab stop columns
+     * in ascending order separated by '/'. An untouched terminal (no HTS/TBC yet)
+     * reports the default every-8 layout: 9/17/25/... Column 1 is never listed
+     * (xterm does not either): nothing can tab *to* it, and CBT already treats
+     * column 0 as an implicit stop.
+     */
+    private fun decTabsr(): String {
+        val stops = (tabStops ?: defaultTabStops())
+            .filter { it in 1 until buffer.columns }
+            .sorted()
+            .joinToString("/") { (it + 1).toString() }
+        return "\u001BP2\$u$stops\u001B\\"
+    }
+
+    /**
+     * DECCIR: "DCS 1 $ u Pr ; Pc ; Pp ; Srend ; Satt ; Sflag ; Pgl ; Pgr ; Scss ; Sdesig ST".
+     * The flag bytes are '@' plus bits:
+     *  Srend: 1 bold, 2 underline, 4 blink, 8 inverse
+     *  Satt : 1 DECSCA-protected
+     *  Sflag: 1 origin mode, 2 SS2 pending, 4 SS3 pending, 8 autowrap pending
+     *  Scss : 1/2/4/8 = G0/G1/G2/G3 is a 96-character set
+     *  Pgr is a fixed 2 (GR = G2): GR locking shifts are not modelled. The DEC
+     *  VT510 manual's own DECCIR example reports "0; 2" for the default state.
+     * Row/column are ABSOLUTE (origin mode ignored), as a real xterm reports them -
+     * unlike DECXCPR/CPR, which are margin-relative under DECOM.
+     * Scss follows the bit table in the VT510 manual (the manual's own worked example
+     * contradicts that table); xterm changed this encoding in patch #389 (2024).
+     * Default sets: xterm reports "BBBB" (all ASCII) like here, not the manual's "BB%5%5".
+     */
+    private fun decCir(): String {
+        val srend = 0x40 + (if (curBold) 1 else 0) + (if (curUnderline) 2 else 0) +
+            (if (curBlink) 4 else 0) + (if (curInverse) 8 else 0)
+        val satt = 0x40 + (if (curProtected) 1 else 0)
+        val sflag = 0x40 + (if (originMode) 1 else 0) +
+            (if (singleShiftGSet == CharsetSlot.G2) 2 else 0) +
+            (if (singleShiftGSet == CharsetSlot.G3) 4 else 0) +
+            (if (cursorCol >= buffer.columns) 8 else 0)
+        val scss = 0x40 + gSets.foldIndexed(0) { i, acc, id ->
+            if (id == CharsetId.LATIN1_SUPP) acc or (1 shl i) else acc
+        }
+        val sdesig = gSets.joinToString("") { id ->
+            when (id) {
+                CharsetId.ASCII -> "B"
+                CharsetId.GRAPHICS -> "0"
+                CharsetId.UK -> "A"
+                CharsetId.DUTCH -> "4"
+                CharsetId.FINNISH -> "C"
+                CharsetId.FRENCH -> "R"
+                CharsetId.FRENCH_CANADIAN -> "Q"
+                CharsetId.GERMAN -> "K"
+                CharsetId.ITALIAN -> "Y"
+                CharsetId.NORWEGIAN_DANISH -> "E"
+                CharsetId.SPANISH -> "Z"
+                CharsetId.SWEDISH -> "H"
+                CharsetId.SWISS -> "="
+                CharsetId.PORTUGUESE -> "%6"
+                CharsetId.LATIN1_SUPP -> "A"
+                CharsetId.DEC_SUPP -> "%5"
+            }
+        }
+        // Absolute position even under DECOM: verified on a real xterm (margins 5-20,
+        // origin mode on, cursor at relative row 3 -> xterm reported row 7).
+        return "\u001BP1\$u${cursorRow.coerceAtLeast(0) + 1};${pendingWrapCol() + 1};1;${srend.toChar()};${satt.toChar()};" +
+            "${sflag.toChar()};${lockingGSet.ordinal};2;${scss.toChar()};$sdesig\u001B\\"
     }
 
     private fun reportRow(): Int = (if (originMode) cursorRow - scrollTop else cursorRow).coerceAtLeast(0) + 1

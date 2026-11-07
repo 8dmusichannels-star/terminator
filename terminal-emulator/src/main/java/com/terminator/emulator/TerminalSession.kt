@@ -311,6 +311,18 @@ class TerminalSession(
         pid = pidOut[0]
         alive = true
 
+        // Reap the child. Nothing ever called waitpid, so every session that
+        // exited stayed a zombie (<defunct>) until the whole app process died.
+        // Blocks until the child exits, so it lives on its own daemon thread.
+        val childPid = pid
+        if (childPid > 0) {
+            Thread { NativePty.waitFor(childPid) }.apply {
+                isDaemon = true
+                name = "pty-reaper-$childPid"
+                start()
+            }
+        }
+
         val pfd = ParcelFileDescriptor.adoptFd(masterFd)
         masterPfd = pfd
         inputStream = FileInputStream(pfd.fileDescriptor)
@@ -794,7 +806,10 @@ class TerminalSession(
         // the drawer trash icon (kill(), which is a SIGKILL per spec).
         if (::emulator.isInitialized) {
             val message = "\r\n[Process completed - press Enter]\r\n"
-            emulator.append(message)
+            // Same lock as the reader thread's append(): destroy()/kill() run
+            // this on the UI thread while the reader may still be inside
+            // append(), and the emulator/buffer are not thread-safe.
+            synchronized(emulatorAppendLock) { emulator.append(message) }
             appendHistory(message)
         }
         // See mainHandler's doc above - this MUST NOT invoke exitListener
