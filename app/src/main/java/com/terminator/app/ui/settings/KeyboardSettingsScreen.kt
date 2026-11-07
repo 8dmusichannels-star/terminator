@@ -61,6 +61,7 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
     // already picked xterm-256color/vt100/ansi sees.
     val termType by repo.flow(SettingsKeys.TERM_TYPE, "NONE").collectAsState(initial = "NONE")
     var showKeymapper by remember { mutableStateOf(false) }
+    val cursorBlink by repo.flow(SettingsKeys.CURSOR_BLINK, "OFF").collectAsState(initial = "OFF")
     var showTermTypeDialog by remember { mutableStateOf(false) }
 
     if (showKeymapper) {
@@ -146,6 +147,24 @@ fun KeyboardSettingsScreen(onBack: () -> Unit) {
             ) {
                 Text(if (termType == "NONE") "NONE (don't set \$TERM)" else termType)
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
+            Text("Cursor blink", style = MaterialTheme.typography.labelLarge)
+            InputModeOption(
+                title = "Off",
+                description = "Cursor never blinks (default)",
+                selected = cursorBlink == "OFF"
+            ) { scope.launch { repo.set(SettingsKeys.CURSOR_BLINK, "OFF") } }
+            InputModeOption(
+                title = "Follow program",
+                description = "Blink only when the program asks for it (DECSET 12 / DECSCUSR)",
+                selected = cursorBlink == "PROGRAM"
+            ) { scope.launch { repo.set(SettingsKeys.CURSOR_BLINK, "PROGRAM") } }
+            InputModeOption(
+                title = "Always",
+                description = "Cursor always blinks",
+                selected = cursorBlink == "ALWAYS"
+            ) { scope.launch { repo.set(SettingsKeys.CURSOR_BLINK, "ALWAYS") } }
 
             Spacer(modifier = Modifier.height(24.dp))
             OutlinedButton(onClick = { showKeymapper = true }) {
@@ -234,7 +253,7 @@ private fun TermTypeDialog(
 // SettingsKeys.TERM_TYPE / passed as $TERM) stay a plain, easily-diffable
 // list of strings.
 private fun termTypeDescription(option: String): String = when (option) {
-    "NONE" -> "Leave \$TERM unset - whatever the shell/exec environment would otherwise provide"
+    "NONE" -> "Leave \$TERM unset - whatever the shell/exec environment would otherwise provide. Key codes use the generic profile"
     "xterm" -> "Base xterm entry, no 256-color extension"
     "xterm-color" -> "xterm with basic (16) color support"
     "xterm-256color" -> "Full color and feature support; uses this app's bundled terminfo entry"

@@ -20,6 +20,7 @@
 
 package com.terminator.app.ui
 
+import com.terminator.emulator.TermProfile
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 
@@ -50,6 +51,16 @@ object PhysicalKeyEvent {
      * checking KeyEvent.getDevice() rather than getSource() avoids
      * misclassifying those OEM soft-keyboards as physical.
      */
+    // Keys whose xterm modified form ("CSI 1;m X" / "CSI n;m ~") already encodes Alt.
+    private val MODIFIABLE_KEYS = setOf(
+        KeyEvent.KEYCODE_FORWARD_DEL, KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_MOVE_END,
+        KeyEvent.KEYCODE_PAGE_UP, KeyEvent.KEYCODE_PAGE_DOWN, KeyEvent.KEYCODE_INSERT,
+        KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_LEFT,
+        KeyEvent.KEYCODE_F1, KeyEvent.KEYCODE_F2, KeyEvent.KEYCODE_F3, KeyEvent.KEYCODE_F4,
+        KeyEvent.KEYCODE_F5, KeyEvent.KEYCODE_F6, KeyEvent.KEYCODE_F7, KeyEvent.KEYCODE_F8,
+        KeyEvent.KEYCODE_F9, KeyEvent.KEYCODE_F10, KeyEvent.KEYCODE_F11, KeyEvent.KEYCODE_F12
+    )
+
     fun isFromPhysicalKeyboard(event: KeyEvent): Boolean {
         val device = event.device ?: return false
         if (device.isVirtual) return false
@@ -74,7 +85,19 @@ object PhysicalKeyEvent {
      * program that opted into the protocol needs a structurally different
      * encoding, not just tweaks to the legacy one.
      */
-    fun sequenceFor(event: KeyEvent, kittyFlags: Int = 0): String? {
+    fun sequenceFor(
+        event: KeyEvent,
+        kittyFlags: Int = 0,
+        // Per-$TERM key encodings (Home/End/F1-F4/Backspace/modified keys), the
+        // session's DECCKM state and its DECBKM override - see TermProfile.
+        profile: TermProfile = TermProfile.GENERIC,
+        applicationCursorKeys: Boolean = false,
+        backarrowMode: Boolean? = null,
+        // XTMODKEYS level the running program asked for (TerminalEmulator.modifyOtherKeysLevel).
+        modifyOtherKeys: Int = 0,
+        // DECKPAM ("ESC =" / DECSET 66): numpad keys send SS3 codes instead of characters.
+        applicationKeypad: Boolean = false
+    ): String? {
         val keyCode = event.keyCode
         val ctrl = event.isCtrlPressed
         val alt = event.isAltPressed
@@ -110,40 +133,96 @@ object PhysicalKeyEvent {
             // functional-key codepoint for. See that function's own doc.
         }
 
-        // Named/control keys - same escape sequences VirtualKey's own
-        // sendSequence table already uses, so a physical arrow key or
-        // Ctrl+arrow behaves identically to tapping the on-screen bar.
+        // Modifier parameter of the xterm "modified key" forms: 1 + shift(1) +
+        // alt(2) + ctrl(4). Applies only to profiles whose terminfo has
+        // modified keys (TermProfile.modifiedKeys).
+        val mod = (if (shift) 1 else 0) + (if (alt) 2 else 0) + (if (ctrl) 4 else 0)
+        val modParam = mod + 1
+        val useMods = profile.modifiedKeys && mod != 0
+
+        // modifyOtherKeys (CSI > 4 ; Pv m): Enter/Tab/Backspace/Escape combined
+        // with Ctrl (or Shift, except Shift+Tab which keeps "CSI Z") have no
+        // legacy encoding, so a program that asked for it gets
+        // "CSI 27 ; mods ; code ~" instead.
+        if (modifyOtherKeys > 0 && (ctrl || (shift && keyCode != KeyEvent.KEYCODE_TAB))) {
+            val mokCode = when (keyCode) {
+                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> 13
+                KeyEvent.KEYCODE_TAB -> 9
+                KeyEvent.KEYCODE_DEL -> 127
+                KeyEvent.KEYCODE_ESCAPE -> 27
+                else -> 0
+            }
+            if (mokCode != 0) return "\u001B[27;$modParam;$mokCode~"
+        }
+
+        fun letterKey(letter: Char, plain: String): String =
+            if (useMods) "\u001B[1;$modParam$letter" else plain
+        fun tildeKey(n: Int): String =
+            if (useMods) "\u001B[$n;$modParam~" else "\u001B[$n~"
+
+        // Application keypad (DECKPAM): numpad keys become "ESC O <letter>".
+        if (applicationKeypad && !ctrl) {
+            val k = when (keyCode) {
+                KeyEvent.KEYCODE_NUMPAD_0 -> 'p'
+                KeyEvent.KEYCODE_NUMPAD_1 -> 'q'
+                KeyEvent.KEYCODE_NUMPAD_2 -> 'r'
+                KeyEvent.KEYCODE_NUMPAD_3 -> 's'
+                KeyEvent.KEYCODE_NUMPAD_4 -> 't'
+                KeyEvent.KEYCODE_NUMPAD_5 -> 'u'
+                KeyEvent.KEYCODE_NUMPAD_6 -> 'v'
+                KeyEvent.KEYCODE_NUMPAD_7 -> 'w'
+                KeyEvent.KEYCODE_NUMPAD_8 -> 'x'
+                KeyEvent.KEYCODE_NUMPAD_9 -> 'y'
+                KeyEvent.KEYCODE_NUMPAD_MULTIPLY -> 'j'
+                KeyEvent.KEYCODE_NUMPAD_ADD -> 'k'
+                KeyEvent.KEYCODE_NUMPAD_COMMA -> 'l'
+                KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> 'm'
+                KeyEvent.KEYCODE_NUMPAD_DOT -> 'n'
+                KeyEvent.KEYCODE_NUMPAD_DIVIDE -> 'o'
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> 'M'
+                KeyEvent.KEYCODE_NUMPAD_EQUALS -> 'X'
+                else -> null
+            }
+            if (k != null) return "\u001BO$k"
+        }
+
+        // Named/control keys. Arrows/Home/End/F1-F4 follow the profile and
+        // DECCKM, so a physical key and the on-screen key bar agree.
         val named = when (keyCode) {
             KeyEvent.KEYCODE_ESCAPE -> "\u001B"
             KeyEvent.KEYCODE_TAB -> if (shift) "\u001B[Z" else "\t"
             KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> "\r"
-            KeyEvent.KEYCODE_DEL -> "\u007F" // Backspace
-            KeyEvent.KEYCODE_FORWARD_DEL -> "\u001B[3~" // Delete
-            KeyEvent.KEYCODE_MOVE_HOME -> "\u001B[H"
-            KeyEvent.KEYCODE_MOVE_END -> "\u001B[F"
-            KeyEvent.KEYCODE_PAGE_UP -> "\u001B[5~"
-            KeyEvent.KEYCODE_PAGE_DOWN -> "\u001B[6~"
-            KeyEvent.KEYCODE_INSERT -> "\u001B[2~"
-            KeyEvent.KEYCODE_DPAD_UP -> if (ctrl) "\u001B[1;5A" else "\u001B[A"
-            KeyEvent.KEYCODE_DPAD_DOWN -> if (ctrl) "\u001B[1;5B" else "\u001B[B"
-            KeyEvent.KEYCODE_DPAD_RIGHT -> if (ctrl) "\u001B[1;5C" else "\u001B[C"
-            KeyEvent.KEYCODE_DPAD_LEFT -> if (ctrl) "\u001B[1;5D" else "\u001B[D"
-            KeyEvent.KEYCODE_F1 -> "\u001BOP"
-            KeyEvent.KEYCODE_F2 -> "\u001BOQ"
-            KeyEvent.KEYCODE_F3 -> "\u001BOR"
-            KeyEvent.KEYCODE_F4 -> "\u001BOS"
-            KeyEvent.KEYCODE_F5 -> "\u001B[15~"
-            KeyEvent.KEYCODE_F6 -> "\u001B[17~"
-            KeyEvent.KEYCODE_F7 -> "\u001B[18~"
-            KeyEvent.KEYCODE_F8 -> "\u001B[19~"
-            KeyEvent.KEYCODE_F9 -> "\u001B[20~"
-            KeyEvent.KEYCODE_F10 -> "\u001B[21~"
-            KeyEvent.KEYCODE_F11 -> "\u001B[23~"
-            KeyEvent.KEYCODE_F12 -> "\u001B[24~"
+            KeyEvent.KEYCODE_DEL -> profile.backspaceFor(backarrowMode) // Backspace
+            KeyEvent.KEYCODE_FORWARD_DEL -> tildeKey(3) // Delete
+            KeyEvent.KEYCODE_MOVE_HOME -> letterKey('H', profile.home(applicationCursorKeys))
+            KeyEvent.KEYCODE_MOVE_END -> letterKey('F', profile.end(applicationCursorKeys))
+            KeyEvent.KEYCODE_PAGE_UP -> tildeKey(5)
+            KeyEvent.KEYCODE_PAGE_DOWN -> tildeKey(6)
+            KeyEvent.KEYCODE_INSERT -> tildeKey(2)
+            KeyEvent.KEYCODE_DPAD_UP -> letterKey('A', profile.cursorKey('A', applicationCursorKeys))
+            KeyEvent.KEYCODE_DPAD_DOWN -> letterKey('B', profile.cursorKey('B', applicationCursorKeys))
+            KeyEvent.KEYCODE_DPAD_RIGHT -> letterKey('C', profile.cursorKey('C', applicationCursorKeys))
+            KeyEvent.KEYCODE_DPAD_LEFT -> letterKey('D', profile.cursorKey('D', applicationCursorKeys))
+            KeyEvent.KEYCODE_F1 -> letterKey('P', profile.functionKey1to4(1))
+            KeyEvent.KEYCODE_F2 -> letterKey('Q', profile.functionKey1to4(2))
+            KeyEvent.KEYCODE_F3 -> letterKey('R', profile.functionKey1to4(3))
+            KeyEvent.KEYCODE_F4 -> letterKey('S', profile.functionKey1to4(4))
+            KeyEvent.KEYCODE_F5 -> tildeKey(15)
+            KeyEvent.KEYCODE_F6 -> tildeKey(17)
+            KeyEvent.KEYCODE_F7 -> tildeKey(18)
+            KeyEvent.KEYCODE_F8 -> tildeKey(19)
+            KeyEvent.KEYCODE_F9 -> tildeKey(20)
+            KeyEvent.KEYCODE_F10 -> tildeKey(21)
+            KeyEvent.KEYCODE_F11 -> tildeKey(23)
+            KeyEvent.KEYCODE_F12 -> tildeKey(24)
             else -> null
         }
         if (named != null) {
-            return if (alt) "\u001B$named" else named
+            // The modified forms already carry Alt in their parameter; the
+            // other keys (and profiles without modified keys) keep the
+            // classic ESC prefix for Alt.
+            val carriesAlt = useMods && keyCode in MODIFIABLE_KEYS
+            return if (alt && !carriesAlt) "\u001B$named" else named
         }
 
         // Everything else (letters, digits, punctuation, numpad digits):
@@ -169,6 +248,22 @@ object PhysicalKeyEvent {
                 ?: KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
             val ch = fallback.get(keyCode, plainMeta)
             if (ch != 0) ch.toChar() else return null
+        }
+
+        // modifyOtherKeys for character keys: level 2 reports every Ctrl/Alt
+        // combination as "CSI 27 ; mods ; code ~", level 1 only the Ctrl ones
+        // that would otherwise be ambiguous or impossible (Ctrl+Shift+letter,
+        // Ctrl+digit, ...). The code is the key's character with Shift applied
+        // but Ctrl/Alt ignored.
+        if (modifyOtherKeys > 0 && (ctrl || alt)) {
+            val legacyCtrlExists = resolvedChar.uppercaseChar() in 'A'..'Z' || resolvedChar in "[\\]^_?"
+            val report = if (modifyOtherKeys >= 2) true else (ctrl && (shift || !legacyCtrlExists))
+            if (report) {
+                val shiftMeta = if (shift) KeyEvent.META_SHIFT_ON else 0
+                val baseMap = event.device?.keyCharacterMap ?: KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
+                val code = baseMap.get(keyCode, shiftMeta).takeIf { it != 0 } ?: resolvedChar.code
+                return "\u001B[27;$modParam;$code~"
+            }
         }
 
         return if (ctrl) {
@@ -294,7 +389,8 @@ object PhysicalKeyEvent {
         // other flag reads for consistency with reportEventTypes/
         // reportAllKeys.
         val reportAssociatedText = kittyFlags and 16 != 0
-        val eventType = if (isRelease) 3 else 1 // repeat (2) isn't distinguishable from a fresh Android ACTION_DOWN here
+        // Android marks auto-repeat as ACTION_DOWN with repeatCount > 0.
+        val eventType = if (isRelease) 3 else if (event.repeatCount > 0) 2 else 1
         // The trailing ":<event-type>" sub-field, or "" for a plain press
         // under a terminal that hasn't asked for release/repeat reporting -
         // omitted entirely rather than sent as ":1", matching the spec's
@@ -366,113 +462,89 @@ object PhysicalKeyEvent {
             append('u')
         }
 
+        // Progressive-enhancement flags (kitty keyboard protocol):
+        //  1 disambiguate - Esc and any Ctrl/Alt/Meta-modified key use CSI u;
+        //    plain and Shift-only text, and unmodified Enter/Tab/Backspace, stay
+        //    legacy; modified Enter/Tab/Backspace and functional keys use their
+        //    modifier forms.
+        //  2 report event types (repeat / release), 8 report all keys as CSI u.
+        // Returning null means "leave this key to the legacy encoding", which
+        // is also what keeps plain typing, DECCKM and the TERM profile working.
+        val disambiguate = kittyFlags and 1 != 0
+        val reportAll = kittyFlags and 8 != 0
+        val nonShiftMods = modBits and 1.inv() != 0 // Ctrl / Alt / Meta
+        val eventReported = reportEventTypes && eventType != 1 // a repeat or release
+
+        fun functional(form: String): String? =
+            if (reportAll || modBits != 0 || eventReported) form else null
+
+        fun enterTabBackspace(code: Int): String? = when {
+            reportAll -> uForm(code)
+            disambiguate && modBits != 0 && !isRelease -> uForm(code)
+            else -> null
+        }
+
         when (keyCode) {
-            // Enter/Tab/Backspace/Escape keep their fixed legacy bytes on
-            // PRESS unconditionally (spec's own "C0 controls" table) so
-            // `reset` still works at a shell prompt if a program that
-            // engaged this mode crashes without popping back out of it -
-            // genuinely ignores modifiers/event-type here on purpose,
-            // matching every other kitty-protocol terminal's behavior for
-            // these four keys specifically (this is the one place
-            // disambiguation deliberately does NOT disambiguate). On
-            // RELEASE, though, the spec is explicit these four do NOT get
-            // release events at all unless "report all keys" (bit 3) is
-            // also set - report-all-keys implies full disambiguation for
-            // every key including these, which this function doesn't
-            // implement (see this function's own doc on the bit-3 scope
-            // cut), so a release is never sent for them: returning null
-            // here means releaseSequenceFor sends nothing, rather than
-            // duplicating the press byte and risking a shell seeing two
-            // Enters (double command execution) for one keystroke.
-            KeyEvent.KEYCODE_ESCAPE -> return if (isRelease) null else "\u001B"
-            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> return if (isRelease) null else "\r"
-            KeyEvent.KEYCODE_TAB -> return if (isRelease) null else "\t"
-            KeyEvent.KEYCODE_DEL -> return if (isRelease) null else "\u007F"
+            KeyEvent.KEYCODE_ESCAPE -> return if (reportAll || disambiguate) uForm(27) else null
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> return enterTabBackspace(13)
+            KeyEvent.KEYCODE_TAB -> return enterTabBackspace(9)
+            KeyEvent.KEYCODE_DEL -> return enterTabBackspace(127)
 
-            KeyEvent.KEYCODE_DPAD_UP -> return legacyLetterForm('A')
-            KeyEvent.KEYCODE_DPAD_DOWN -> return legacyLetterForm('B')
-            KeyEvent.KEYCODE_DPAD_RIGHT -> return legacyLetterForm('C')
-            KeyEvent.KEYCODE_DPAD_LEFT -> return legacyLetterForm('D')
-            KeyEvent.KEYCODE_MOVE_HOME -> return legacyLetterForm('H')
-            KeyEvent.KEYCODE_MOVE_END -> return legacyLetterForm('F')
-            KeyEvent.KEYCODE_F1 -> return legacyLetterForm('P')
-            KeyEvent.KEYCODE_F2 -> return legacyLetterForm('Q')
-            KeyEvent.KEYCODE_F4 -> return legacyLetterForm('S')
+            KeyEvent.KEYCODE_DPAD_UP -> return functional(legacyLetterForm('A'))
+            KeyEvent.KEYCODE_DPAD_DOWN -> return functional(legacyLetterForm('B'))
+            KeyEvent.KEYCODE_DPAD_RIGHT -> return functional(legacyLetterForm('C'))
+            KeyEvent.KEYCODE_DPAD_LEFT -> return functional(legacyLetterForm('D'))
+            KeyEvent.KEYCODE_MOVE_HOME -> return functional(legacyLetterForm('H'))
+            KeyEvent.KEYCODE_MOVE_END -> return functional(legacyLetterForm('F'))
+            KeyEvent.KEYCODE_F1 -> return functional(legacyLetterForm('P'))
+            KeyEvent.KEYCODE_F2 -> return functional(legacyLetterForm('Q'))
+            KeyEvent.KEYCODE_F4 -> return functional(legacyLetterForm('S'))
 
-            KeyEvent.KEYCODE_INSERT -> return legacyTildeForm(2)
-            KeyEvent.KEYCODE_FORWARD_DEL -> return legacyTildeForm(3)
-            KeyEvent.KEYCODE_PAGE_UP -> return legacyTildeForm(5)
-            KeyEvent.KEYCODE_PAGE_DOWN -> return legacyTildeForm(6)
-            KeyEvent.KEYCODE_F3 -> return legacyTildeForm(13) // spec removed the CSI R form (clashes with CPR) - ~ only
-            KeyEvent.KEYCODE_F5 -> return legacyTildeForm(15)
-            KeyEvent.KEYCODE_F6 -> return legacyTildeForm(17)
-            KeyEvent.KEYCODE_F7 -> return legacyTildeForm(18)
-            KeyEvent.KEYCODE_F8 -> return legacyTildeForm(19)
-            KeyEvent.KEYCODE_F9 -> return legacyTildeForm(20)
-            KeyEvent.KEYCODE_F10 -> return legacyTildeForm(21)
-            KeyEvent.KEYCODE_F11 -> return legacyTildeForm(23)
-            KeyEvent.KEYCODE_F12 -> return legacyTildeForm(24)
+            KeyEvent.KEYCODE_INSERT -> return functional(legacyTildeForm(2))
+            KeyEvent.KEYCODE_FORWARD_DEL -> return functional(legacyTildeForm(3))
+            KeyEvent.KEYCODE_PAGE_UP -> return functional(legacyTildeForm(5))
+            KeyEvent.KEYCODE_PAGE_DOWN -> return functional(legacyTildeForm(6))
+            KeyEvent.KEYCODE_F3 -> return functional(legacyTildeForm(13)) // spec removed the CSI R form (clashes with CPR)
+            KeyEvent.KEYCODE_F5 -> return functional(legacyTildeForm(15))
+            KeyEvent.KEYCODE_F6 -> return functional(legacyTildeForm(17))
+            KeyEvent.KEYCODE_F7 -> return functional(legacyTildeForm(18))
+            KeyEvent.KEYCODE_F8 -> return functional(legacyTildeForm(19))
+            KeyEvent.KEYCODE_F9 -> return functional(legacyTildeForm(20))
+            KeyEvent.KEYCODE_F10 -> return functional(legacyTildeForm(21))
+            KeyEvent.KEYCODE_F11 -> return functional(legacyTildeForm(23))
+            KeyEvent.KEYCODE_F12 -> return functional(legacyTildeForm(24))
 
-            // Bare modifier keys - only ever reached from sequenceFor/
-            // releaseSequenceFor when bit 3 ("report all keys") is set;
-            // both call sites gate on that bit before routing these
-            // keycodes in here at all, so no additional flag check is
-            // needed at this level. PUA codepoints per the spec's own
-            // "Functional key definitions" table
-            // (https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions) -
-            // these have no legacy-compatible form at all (unlike the
-            // arrows/Home/End/etc. above), so they always go through
-            // uForm's plain "CSI code;modifiers u" shape. Left/right
-            // variants of the same physical modifier get distinct
-            // codepoints (spec's own table splits them), which is also
-            // why this can't just check event.isCtrlPressed/etc. the way
-            // the rest of this app's modifier handling does - those
-            // booleans can't tell LEFT from RIGHT, only this per-keycode
-            // dispatch can.
-            KeyEvent.KEYCODE_SHIFT_LEFT -> return uForm(57441)
-            KeyEvent.KEYCODE_SHIFT_RIGHT -> return uForm(57447)
-            KeyEvent.KEYCODE_CTRL_LEFT -> return uForm(57442)
-            KeyEvent.KEYCODE_CTRL_RIGHT -> return uForm(57448)
-            KeyEvent.KEYCODE_ALT_LEFT -> return uForm(57443)
-            KeyEvent.KEYCODE_ALT_RIGHT -> return uForm(57449)
-            KeyEvent.KEYCODE_META_LEFT -> return uForm(57444)
-            KeyEvent.KEYCODE_META_RIGHT -> return uForm(57450)
-            KeyEvent.KEYCODE_CAPS_LOCK -> return uForm(57358)
-            KeyEvent.KEYCODE_NUM_LOCK -> return uForm(57360)
-            KeyEvent.KEYCODE_SCROLL_LOCK -> return uForm(57359)
+            // Bare modifier / lock keys are only ever reported under "report all keys".
+            KeyEvent.KEYCODE_SHIFT_LEFT -> return if (reportAll) uForm(57441) else null
+            KeyEvent.KEYCODE_SHIFT_RIGHT -> return if (reportAll) uForm(57447) else null
+            KeyEvent.KEYCODE_CTRL_LEFT -> return if (reportAll) uForm(57442) else null
+            KeyEvent.KEYCODE_CTRL_RIGHT -> return if (reportAll) uForm(57448) else null
+            KeyEvent.KEYCODE_ALT_LEFT -> return if (reportAll) uForm(57443) else null
+            KeyEvent.KEYCODE_ALT_RIGHT -> return if (reportAll) uForm(57449) else null
+            KeyEvent.KEYCODE_META_LEFT -> return if (reportAll) uForm(57444) else null
+            KeyEvent.KEYCODE_META_RIGHT -> return if (reportAll) uForm(57450) else null
+            KeyEvent.KEYCODE_CAPS_LOCK -> return if (reportAll) uForm(57358) else null
+            KeyEvent.KEYCODE_NUM_LOCK -> return if (reportAll) uForm(57360) else null
+            KeyEvent.KEYCODE_SCROLL_LOCK -> return if (reportAll) uForm(57359) else null
 
             else -> {}
         }
 
-        // Plain character key - resolve the same way the legacy path does
-        // (see sequenceFor's own doc on why CTRL suppresses unicodeChar on
-        // some layouts), but WITHOUT applying Ctrl's control-code folding:
-        // kitty reports the base codepoint plus modifiers separately
-        // rather than xterm's legacy "Ctrl+letter becomes byte 1-26"
-        // collapsing, which is exactly the ambiguity (was that really
-        // Ctrl+I, or a literal Tab byte?) disambiguation exists to
-        // resolve. The spec requires the UN-shifted codepoint here (shift
-        // is reported purely via the modifier bit, then applied on the
-        // receiving end) - resolving with metaState 0 below (no SHIFT, no
-        // CTRL) is exactly that: KeyCharacterMap's own base/unshifted
-        // mapping for this physical key, unlike the legacy path's own
-        // fallback further up which needs shift baked into the resolved
-        // char since legacy has no separate modifier field for text keys.
+        // Text keys: the key code is the unshifted character. Plain and
+        // Shift-only typing stays legacy (the user types text) unless "report
+        // all keys" is on; Ctrl/Alt/Meta combinations go out as CSI u under
+        // "disambiguate". Release events exist only under "report all keys".
+        val send = when {
+            reportAll -> true
+            disambiguate && nonShiftMods && !isRelease -> true
+            else -> false
+        }
+        if (!send) return null
         val fallback = event.device?.keyCharacterMap
             ?: KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
         val unshifted = fallback.get(keyCode, 0)
         val codepoint = if (unshifted != 0) unshifted else return null
-        // Associated-text reporting (bit 4, value 16) - the ACTUAL text
-        // this keystroke produces (shift/altgr/dead-key composition and
-        // all), as opposed to codepoint above which is deliberately the
-        // UNshifted base key. Only meaningful on press (the spec defines
-        // this sub-parameter for key-down text production; a release
-        // carries no new text) and only when the resolved char is an
-        // actual printable/composed character - event.unicodeChar with
-        // the REAL (not zeroed) metaState is exactly what sequenceFor's
-        // own legacy path already resolves for the non-kitty case, reused
-        // here rather than re-deriving it a third way.
-        val associatedText = if (!isRelease && reportAssociatedText) {
+        val associatedText = if (!isRelease && reportAssociatedText && !nonShiftMods) {
             val real = event.unicodeChar
             if (real != 0) real.toChar().toString() else null
         } else null

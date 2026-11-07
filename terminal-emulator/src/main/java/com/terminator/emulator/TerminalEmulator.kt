@@ -483,8 +483,6 @@ class TerminalEmulator(
     // VT100 line-drawing charset (rather than writing UTF-8 box-drawing
     // characters directly, which most modern TUIs do instead) rendered its
     // borders as literal "qqqx" text instead of ─│┐ etc.
-    private var g0IsSpecialGraphics = false
-    private var g1IsSpecialGraphics = false
     // G2/G3 designated character sets (SCS, "ESC * X" / "ESC + X") - the
     // other half of the four-way G0/G1/G2/G3 designation set VT220 and
     // later terminals support, alongside G0/G1 above. Real-world use is
@@ -496,8 +494,76 @@ class TerminalEmulator(
     // g0.../g1IsSpecialGraphics (true = DEC special graphics line-drawing,
     // false = plain ASCII/UK) and same "only '0' is modeled as special
     // graphics" simplification - see State.CHARSET's own doc.
-    private var g2IsSpecialGraphics = false
-    private var g3IsSpecialGraphics = false
+    // The four designated character sets (G0..G3). Replaces the former
+    // per-slot "is special graphics" booleans so the VT220 National
+    // Replacement Character Sets, UK, DEC/ISO supplemental and DEC special
+    // graphics can all be designated - see Nrcs.kt for the tables.
+    private val gSets = arrayOf(CharsetId.ASCII, CharsetId.ASCII, CharsetId.ASCII, CharsetId.ASCII)
+    // "ESC - / . / X" designate a 96-character set rather than a 94-character one.
+    private var pendingCharset96 = false
+    // True once a '%' intermediate was seen in "ESC ( % 5" style designators.
+    private var charsetPercent = false
+    // The intermediate byte ('%' or ' ') of a two-byte "ESC <int> <final>" sequence.
+    private var escIntermediate = ' '
+
+    /**
+     * Terminal type this session was launched as (Settings > Keyboard >
+     * Terminal Type). Decides the DA1/DA2/DECID identity and exposes the key
+     * encodings the key layer must use - see [TermProfile].
+     */
+    @Volatile
+    var termProfile: TermProfile = TermProfile.GENERIC
+        set(value) {
+            field = value
+            conformanceLevel = value.defaultConformanceLevel
+        }
+
+    /** DEC conformance level 1..4 (DECSCL "CSI 61..64 ; Ps \" p"). */
+    var conformanceLevel: Int = TermProfile.GENERIC.defaultConformanceLevel
+        private set
+
+    /** S8C1T: send C1 controls as single 8-bit codes (U+0080..U+009F) in replies. */
+    private var s8c1t = false
+
+    /** DECNRCM (CSI ? 42 h): national replacement sets are honoured when set. */
+    private var nrcsMode = false
+
+    /** DECBKM (CSI ? 67 h/l): null = never set by the program (use the profile default), true = BS, false = DEL. */
+    var backarrowKeyMode: Boolean? = null
+        private set
+
+    /** DECSCA: cells written while this is set are protected from DECSED/DECSEL. */
+    private var curProtected = false
+
+    /** Mode 12 (att610 cursor blink) - tracked so DECRQM/XTSAVE report it truthfully. */
+    var cursorBlinkMode: Boolean = false
+        private set(value) { field = value; buffer.cursorBlink = value }
+
+    /** Mode 45 (reverse wraparound): backspace at column 0 wraps to the previous line. */
+    private var reverseWrapMode = false
+
+    /** Mode 1007 (alternate scroll): wheel acts as arrow keys on the alternate screen. */
+    var alternateScrollMode: Boolean = false
+        private set
+
+    /** Mode 1005 (UTF-8 mouse coordinates) and 1015 (urxvt decimal coordinates). */
+    var mouseUtf8Mode: Boolean = false
+        private set
+    var mouseUrxvtMode: Boolean = false
+        private set
+
+    /**
+     * XTMODKEYS "modifyOtherKeys" level (CSI > 4 ; Pv m): 0 = off, 1 = report
+     * modified keys that have no legacy encoding, 2 = report every modified
+     * key as "CSI 27 ; mods ; code ~". vim and others turn this on while
+     * running; the key layer reads it (see PhysicalKeyEvent).
+     */
+    @Volatile
+    var modifyOtherKeysLevel: Int = 0
+        private set
+
+    // XTSAVE / XTRESTORE ("CSI ? Pm s" / "CSI ? Pm r") storage.
+    private val savedPrivateModes = HashMap<Int, Boolean>()
     // Which designator ('(' G0 / ')' G1 / '*' G2 / '+' G3) the CHARSET
     // state is currently waiting on the follow-up byte for - set the
     // instant one of those four bytes is seen (see handleEscape's own
@@ -769,7 +835,7 @@ class TerminalEmulator(
     }
 
     // Parser state
-    private enum class State { NORMAL, ESCAPE, CSI, OSC, CHARSET, DCS, APC, DECALN_CHECK }
+    private enum class State { NORMAL, ESCAPE, CSI, OSC, CHARSET, DCS, APC, DECALN_CHECK, ESC_INTERMEDIATE }
     private var state = State.NORMAL
     private val paramBuffer = StringBuilder()
     private val oscBuffer = StringBuilder()
@@ -1511,6 +1577,49 @@ class TerminalEmulator(
     }
 
     private fun processChar(ch: Char) {
+        val code = ch.code
+        // C1 control characters (U+0080..U+009F), the 8-bit forms of ESC-
+        // prefixed controls. xterm honours them even in UTF-8 mode. Only
+        // acted on between sequences; inside OSC/DCS/APC strings 0x9C is the
+        // String Terminator (rewritten to ESC \ so the existing terminator
+        // handling and its recovery paths are reused), everything else there
+        // stays payload.
+        if (code in 0x80..0x9F) {
+            if (code == 0x9C && (state == State.OSC || state == State.DCS || state == State.APC)) {
+                processChar('\u001B')
+                processChar('\\')
+                return
+            }
+            if (state == State.NORMAL) {
+                handleC1(code)
+                return
+            }
+        }
+        // CAN / SUB abort a sequence in progress; ESC restarts one; other
+        // C0 controls arriving mid-CSI are executed without disturbing the
+        // sequence (what real terminals do) rather than ending it as an
+        // unknown final byte and leaking the rest as text.
+        when (state) {
+            State.CSI, State.ESCAPE, State.CHARSET, State.DECALN_CHECK, State.ESC_INTERMEDIATE -> {
+                if (ch == '\u0018' || ch == '\u001A') {
+                    state = State.NORMAL
+                    csiIntermediate = null
+                    charsetPercent = false
+                    return
+                }
+                if (ch == '\u001B') {
+                    state = State.ESCAPE
+                    csiIntermediate = null
+                    charsetPercent = false
+                    return
+                }
+                if (state == State.CSI && code < 0x20) {
+                    handleNormal(ch)
+                    return
+                }
+            }
+            else -> {}
+        }
         when (state) {
             State.NORMAL -> handleNormal(ch)
             State.ESCAPE -> handleEscape(ch)
@@ -1519,6 +1628,7 @@ class TerminalEmulator(
             State.DCS -> handleDcs(ch)
             State.APC -> handleApc(ch)
             State.DECALN_CHECK -> handleDecAlnCheck(ch)
+            State.ESC_INTERMEDIATE -> handleEscIntermediate(ch)
             State.CHARSET -> {
                 // The designator byte itself (e.g. 'B' in ESC(B, '0' in
                 // ESC(0) - only '0' (DEC special graphics) is modeled as
@@ -1526,14 +1636,25 @@ class TerminalEmulator(
                 // is treated as "plain, no translation" the same as this
                 // module already only ever produces ASCII/Unicode text
                 // otherwise. See g0/g1/g2/g3IsSpecialGraphics's own doc.
-                val isSpecialGraphics = ch == '0'
-                when (pendingCharsetSlot) {
-                    CharsetSlot.G0 -> g0IsSpecialGraphics = isSpecialGraphics
-                    CharsetSlot.G1 -> g1IsSpecialGraphics = isSpecialGraphics
-                    CharsetSlot.G2 -> g2IsSpecialGraphics = isSpecialGraphics
-                    CharsetSlot.G3 -> g3IsSpecialGraphics = isSpecialGraphics
+                // Now also resolves the VT220 national replacement sets, the
+                // UK set and the DEC / ISO Latin-1 supplemental sets (see
+                // Nrcs.designate94 / designate96) instead of treating every
+                // designator other than '0' as plain ASCII. A '%' intermediate
+                // ("ESC ( % 5") is consumed so the final byte never leaks.
+                if (ch == '%' && !charsetPercent && !pendingCharset96) {
+                    charsetPercent = true
+                } else if (ch.code in 0x20..0x2F) {
+                    // Any other intermediate (e.g. the '"' of Greek/Hebrew/
+                    // Turkish designators) - swallow it, keep waiting for the final.
+                } else {
+                    gSets[pendingCharsetSlot.ordinal] = if (pendingCharset96) {
+                        Nrcs.designate96(ch)
+                    } else {
+                        Nrcs.designate94(charsetPercent, ch, nrcsMode)
+                    }
+                    charsetPercent = false
+                    state = State.NORMAL
                 }
-                state = State.NORMAL
             }
         }
     }
@@ -1562,7 +1683,16 @@ class TerminalEmulator(
             '\r' -> cursorCol = 0
             // Backspace from a pending-wrap cursor (cursorCol == columns) moves
             // to columns-2, matching xterm.
-            '\b' -> cursorCol = (pendingWrapCol() - 1).coerceAtLeast(0)
+            '\b' -> {
+                val col = pendingWrapCol()
+                if (col == 0 && reverseWrapMode && autoWrapMode && cursorRow > scrollTop) {
+                    // Mode 45 (reverse wraparound)
+                    cursorRow -= 1
+                    cursorCol = buffer.columns - 1
+                } else {
+                    cursorCol = (col - 1).coerceAtLeast(0)
+                }
+            }
             '\t' -> cursorCol = nextTabStop(cursorCol)
             // SO (Shift Out) / SI (Shift In) - lock in G1/G0 respectively
             // (see lockingGSet's own doc). Classic ncurses line-drawing
@@ -1681,10 +1811,13 @@ class TerminalEmulator(
             // records WHICH designator this was (see State.CHARSET's own
             // doc) so the follow-up byte writes into the right one of
             // g0/g1/g2/g3IsSpecialGraphics instead of always assuming G0.
-            '(' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G0 }
-            ')' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G1 }
-            '*' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G2 }
-            '+' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G3 }
+            '(' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G0; pendingCharset96 = false; charsetPercent = false }
+            ')' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G1; pendingCharset96 = false; charsetPercent = false }
+            '-' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G1; pendingCharset96 = true; charsetPercent = false }
+            '*' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G2; pendingCharset96 = false; charsetPercent = false }
+            '.' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G2; pendingCharset96 = true; charsetPercent = false }
+            '+' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G3; pendingCharset96 = false; charsetPercent = false }
+            '/' -> { state = State.CHARSET; pendingCharsetSlot = CharsetSlot.G3; pendingCharset96 = true; charsetPercent = false }
             // LS2/LS3 (Locking Shift 2/3, "ESC n"/"ESC o") - the G2/G3
             // counterparts of SI/SO (which lock G0/G1 instead - see
             // lockingGSet's own doc). Stays in effect for every
@@ -1755,6 +1888,18 @@ class TerminalEmulator(
             // as literal text the exact same way an unconsumed SCS
             // designator used to (see '('/')' cases' own doc).
             '#' -> { state = State.DECALN_CHECK }
+            // DECID (ESC Z) - the legacy "what are you?" query; answered
+            // exactly like DA1.
+            'Z' -> { respond(da1Reply()); state = State.NORMAL }
+            // ESC SP F / G (S7C1T / S8C1T) and ESC % @ / G (select default /
+            // UTF-8 charset) are two-byte sequences whose second byte used to
+            // leak into the screen as literal text.
+            ' ', '%' -> { escIntermediate = ch; state = State.ESC_INTERMEDIATE }
+            // PM ("ESC ^") and SOS ("ESC X") strings carry arbitrary payload
+            // up to ST; route them through the APC reader, which discards
+            // everything that isn't a kitty graphics command, so the payload
+            // no longer prints.
+            '^', 'X' -> { state = State.APC; apcBuffer.clear() }
             else -> state = State.NORMAL
         }
     }
@@ -1950,25 +2095,7 @@ class TerminalEmulator(
         if (ch == 'p' && csiIntermediate == '$') {
             val queriedPs = params.getOrElse(0) { 0 }
             val reportedValue = if (private) {
-                when (queriedPs) {
-                    1 -> if (applicationCursorKeys) 1 else 2
-                    3 -> if (deccolm132Mode) 1 else 2
-                    5 -> if (buffer.reverseVideoMode) 1 else 2
-                    6 -> if (originMode) 1 else 2
-                    7 -> if (autoWrapMode) 1 else 2
-                    8 -> if (autoRepeatMode) 1 else 2
-                    9 -> if (mouseMode == MouseMode.X10) 1 else 2
-                    25 -> if (cursorVisible) 1 else 2
-                    47, 1049 -> if (buffer.inAlternateScreen) 1 else 2
-                    1000 -> if (mouseMode == MouseMode.NORMAL) 1 else 2
-                    1002 -> if (mouseMode == MouseMode.BUTTON_EVENT) 1 else 2
-                    1003 -> if (mouseMode == MouseMode.ANY_EVENT) 1 else 2
-                    1004 -> if (focusReportingMode) 1 else 2
-                    1006 -> if (mouseSgrMode) 1 else 2
-                    2004 -> if (bracketedPasteMode) 1 else 2
-                    2026 -> if (inSynchronizedUpdate) 1 else 2
-                    else -> 0
-                }
+                privateModeState(queriedPs)
             } else {
                 // IRM/SRM/LNM (ANSI "CSI 4/12/20 h/l") are the three
                 // non-DEC-private modes this emulator actually tracks
@@ -1985,16 +2112,65 @@ class TerminalEmulator(
                 }
             }
             val prefix = if (private) "?" else ""
-            listener.onRespond("\u001B[$prefix$queriedPs;$reportedValue\$y")
+            respond("\u001B[$prefix$queriedPs;$reportedValue\$y")
             state = State.NORMAL
             csiIntermediate = null
             return
         }
 
         if (private) {
-            handlePrivateMode(params, ch)
+            // Only h/l are mode set/reset. Every other '?'-prefixed final used
+            // to be fed to handlePrivateMode as if it were a reset, so e.g.
+            // DECXCPR ("CSI ? 6 n") silently cleared origin mode and homed the
+            // cursor, "CSI ? 1 s" (XTSAVE) cleared DECCKM and DECSEL
+            // ("CSI ? 1 K") did the same.
+            if (csiIntermediate == null) {
+                when (ch) {
+                    'h', 'l' -> handlePrivateMode(params, ch)
+                    // DECSED / DECSEL: selective erase (skips DECSCA-protected cells)
+                    'J' -> { cursorCol = pendingWrapCol(); selectiveEraseInDisplay(params.getOrElse(0) { 0 }) }
+                    'K' -> { cursorCol = pendingWrapCol(); selectiveEraseInLine(params.getOrElse(0) { 0 }) }
+                    // DECDSR: DEC-specific status reports (cursor, printer, UDK, keyboard...)
+                    'n' -> handleDecDsr(params)
+                    // XTQMODKEYS: "CSI ? 4 m" asks for the modifyOtherKeys level
+                    'm' -> if (params.getOrElse(0) { 0 } == 4) respond("\u001B[>4;${modifyOtherKeysLevel}m")
+                    // XTSAVE / XTRESTORE
+                    's' -> for (pm in params) {
+                        val st = privateModeState(pm)
+                        if (st != 0) savedPrivateModes[pm] = (st == 1)
+                    }
+                    'r' -> for (pm in params) {
+                        val wanted = savedPrivateModes[pm] ?: continue
+                        // Skip no-ops so restoring e.g. 1049 while already in the right
+                        // screen doesn't re-run the screen switch.
+                        if (privateModeState(pm) != (if (wanted) 1 else 2)) {
+                            handlePrivateMode(listOf(pm), if (wanted) 'h' else 'l')
+                        }
+                    }
+                    else -> { /* unsupported private-prefixed final - ignore */ }
+                }
+            }
             listener.onCursorMoved(cursorRow, cursorCol)
-            state = State.NORMAL
+            endCsi()
+            return
+        }
+        // XTMODKEYS: "CSI > 4 ; Pv m" sets modifyOtherKeys (no value = off);
+        // "CSI > 4 n" resets it. The other resources (0-3: cursor/function/
+        // keypad key modifiers) have no effect here.
+        if (secondaryDA && csiIntermediate == null && (ch == 'm' || ch == 'n')) {
+            if (params.getOrElse(0) { 0 } == 4) {
+                modifyOtherKeysLevel = if (ch == 'm' && params.size > 1) params[1].coerceIn(0, 2) else 0
+            }
+            endCsi()
+            return
+        }
+        // '>' / '=' / '<' prefixed sequences live in their own command space
+        // (XTMODKEYS "CSI > 4 ; 2 m", XTSMTITLE, DA2/DA3, XTVERSION ...). Only
+        // the DA/XTVERSION finals below are implemented; everything else used
+        // to fall into the plain-CSI table, so vim's "CSI > 4 ; 2 m" (enable
+        // modifyOtherKeys) was applied as SGR 4;2 - underline + dim stuck on.
+        if ((secondaryDA || raw.startsWith("=") || raw.startsWith("<")) && ch != 'c' && ch != 'q') {
+            endCsi()
             return
         }
 
@@ -2173,8 +2349,8 @@ class TerminalEmulator(
             // answered with a fixed "OK" status report; some scripts probe
             // it before deciding whether to enable fancier prompt features.
             'n' -> when (params.getOrElse(0) { 0 }) {
-                6 -> listener.onRespond("\u001B[${cursorRow + 1};${cursorCol + 1}R")
-                5 -> listener.onRespond("\u001B[0n")
+                6 -> respond("\u001B[${reportRow()};${reportCol()}R")
+                5 -> respond("\u001B[0n")
             }
             // Primary Device Attributes (DA1), `CSI c` or `CSI 0 c` - "what
             // kind of terminal are you?" Distinct from the ESC-c (RIS, full
@@ -2202,10 +2378,13 @@ class TerminalEmulator(
             // won't recognize as a valid DA2 answer, so it still sits out
             // its timeout. "64" here is an arbitrary but plausible xterm
             // patch-level; "0" is the (unused) ROM cartridge param.
-            'c' -> if (secondaryDA) {
-                listener.onRespond("\u001B[>0;64;0c")
+            'c' -> if (raw.startsWith("=")) {
+                // DA3 (tertiary): unit id, "00000000" like xterm
+                respond("\u001BP!|00000000\u001B\\")
+            } else if (secondaryDA) {
+                respond(termProfile.da2)
             } else if (params.getOrElse(0) { 0 } == 0) {
-                listener.onRespond("\u001B[?1;2;4c")
+                respond(da1Reply())
             }
             // TBC (Tab Clear), "CSI g" / "CSI 0 g" clears the stop at the
             // cursor column, "CSI 3 g" clears every stop. Same silent-drop
@@ -2249,13 +2428,20 @@ class TerminalEmulator(
             // <name>(<version>) ST; the exact text is cosmetic, a querying
             // program only needs a well-formed reply to stop waiting.
             'q' -> if (csiIntermediate == ' ') {
-                cursorStyle = when (params.getOrElse(0) { 1 }) {
+                // Odd values (and 0, the default) are the blinking variants.
+                val shape = params.getOrElse(0) { 1 }
+                cursorBlinkMode = shape == 0 || shape % 2 == 1
+                cursorStyle = when (shape) {
                     3, 4 -> CursorStyle.UNDERLINE
                     5, 6 -> CursorStyle.BAR
                     else -> CursorStyle.BLOCK
                 }
             } else if (secondaryDA && params.getOrElse(0) { 0 } == 0) {
-                listener.onRespond("\u001BP>|Terminator(1.0)\u001B\\")
+                respond("\u001BP>|Terminator(1.0)\u001B\\")
+            } else if (csiIntermediate == '"') {
+                // DECSCA (CSI Ps " q): 1 = protect subsequently written cells
+                // from selective erase, 0 / 2 = unprotect.
+                curProtected = params.getOrElse(0) { 0 } == 1
             }
             // IRM (Insert Mode, "CSI 4 h/l") - see insertMode's own doc.
             // Alongside SRM (CSI 12 h/l, see sendReceiveMode's own doc)
@@ -2315,11 +2501,11 @@ class TerminalEmulator(
                 // when TIOCGWINSZ reports 0 pixels. No reply while the
                 // size is still unknown (0) rather than a bogus 0x0 one.
                 14 -> if (windowWidthPx > 0 && windowHeightPx > 0)
-                    listener.onRespond("\u001B[4;${windowHeightPx};${windowWidthPx}t")
+                    respond("\u001B[4;${windowHeightPx};${windowWidthPx}t")
                 16 -> if (cellWidthPx > 0 && cellHeightPx > 0)
-                    listener.onRespond("\u001B[6;${cellHeightPx};${cellWidthPx}t")
-                18 -> listener.onRespond("\u001B[8;${buffer.rows};${buffer.columns}t")
-                19 -> listener.onRespond("\u001B[9;${buffer.rows};${buffer.columns}t")
+                    respond("\u001B[6;${cellHeightPx};${cellWidthPx}t")
+                18 -> respond("\u001B[8;${buffer.rows};${buffer.columns}t")
+                19 -> respond("\u001B[9;${buffer.rows};${buffer.columns}t")
                 22 -> {
                     if (titleStack.size >= 64) titleStack.removeFirst()
                     titleStack.addLast(currentIconName to currentTitle)
@@ -2337,11 +2523,267 @@ class TerminalEmulator(
                 }
                 else -> { /* window position/resize/(de)iconify etc - not applicable, ignore */ }
             }
+            // DECSTR (CSI ! p) soft terminal reset / DECSCL (CSI Ps ; Ps " p) conformance level
+            'p' -> when (csiIntermediate) {
+                '!' -> softReset()
+                '"' -> setConformanceLevel(params)
+                else -> { /* other CSI ... p forms - ignore */ }
+            }
+            // DECREQTPARM (CSI 0|1 x): VT100 terminal parameter report
+            'x' -> if (csiIntermediate == null) {
+                val ps = params.getOrElse(0) { 0 }
+                if (ps == 0 || ps == 1) respond("\u001B[${ps + 2};1;1;112;112;1;0x")
+            }
             else -> { /* unsupported final byte - ignore */ }
         }
         listener.onCursorMoved(cursorRow, cursorCol)
         state = State.NORMAL
         csiIntermediate = null
+    }
+
+    // ---------------------------------------------------------------
+    // DEC VT220-class additions: identity replies, soft reset, selective
+    // erase, DEC status reports, DECRQSS, DECRQM table.
+    // ---------------------------------------------------------------
+
+    private fun endCsi() {
+        state = State.NORMAL
+        csiIntermediate = null
+    }
+
+    /** C1 control (U+0080..U+009F) received between sequences: re-dispatched as its ESC-prefixed form. */
+    private fun handleC1(code: Int) {
+        val esc = when (code) {
+            0x84 -> 'D' // IND
+            0x85 -> 'E' // NEL
+            0x88 -> 'H' // HTS
+            0x8D -> 'M' // RI
+            0x8E -> 'N' // SS2
+            0x8F -> 'O' // SS3
+            0x90 -> 'P' // DCS
+            0x98 -> 'X' // SOS
+            0x9A -> 'Z' // DECID
+            0x9B -> '[' // CSI
+            0x9D -> ']' // OSC
+            0x9E -> '^' // PM
+            0x9F -> '_' // APC
+            else -> return // ST on its own and the unassigned codes: nothing to do
+        }
+        state = State.ESCAPE
+        handleEscape(esc)
+    }
+
+    /** Second byte of "ESC SP x" / "ESC % x". */
+    private fun handleEscIntermediate(ch: Char) {
+        if (escIntermediate == ' ') {
+            when (ch) {
+                'F' -> s8c1t = false // S7C1T
+                'G' -> s8c1t = true  // S8C1T
+                else -> {}           // ESC SP L/M/N (ANSI conformance level): nothing to switch
+            }
+        }
+        // ESC % @ / ESC % G (default / UTF-8 charset): this emulator is always UTF-8.
+        state = State.NORMAL
+    }
+
+    /** Primary DA, also the DECID reply. DECSCL level 1 identifies as a plain VT100 whatever the profile. */
+    private fun da1Reply(): String =
+        if (conformanceLevel <= 1) "\u001B[?1;2c" else termProfile.da1
+
+    /** With S8C1T active, replies introduced by ESC [ / ESC P / ESC ] use the single-code C1 forms. */
+    private fun respond(s: String) {
+        if (!s8c1t || s.length < 2 || s[0] != '\u001B') {
+            listener.onRespond(s)
+            return
+        }
+        val c1 = when (s[1]) {
+            '[' -> '\u009B'
+            'P' -> '\u0090'
+            ']' -> '\u009D'
+            else -> {
+                listener.onRespond(s)
+                return
+            }
+        }
+        var body = s.substring(2)
+        if (body.endsWith("\u001B\\")) body = body.dropLast(2) + '\u009C'
+        listener.onRespond(c1 + body)
+    }
+
+    private fun reportRow(): Int = (if (originMode) cursorRow - scrollTop else cursorRow).coerceAtLeast(0) + 1
+    private fun reportCol(): Int = (if (originMode) pendingWrapCol() - scrollLeft else pendingWrapCol()).coerceAtLeast(0) + 1
+
+    /** DECSTR: soft terminal reset - modes and attributes back to defaults, screen and cursor position untouched. */
+    private fun softReset() {
+        cursorVisible = true
+        insertMode = false
+        originMode = false
+        autoWrapMode = true
+        applicationCursorKeys = false
+        applicationKeypadMode = false
+        reverseWrapMode = false
+        backarrowKeyMode = null
+        curProtected = false
+        declrmmEnabled = false
+        scrollTop = 0
+        scrollBottom = buffer.rows - 1
+        scrollLeft = 0
+        scrollRight = buffer.columns - 1
+        resetSgr()
+        savedCursorRow = 0
+        savedCursorCol = 0
+        decscSgr = null
+        gSets.fill(CharsetId.ASCII)
+        lockingGSet = CharsetSlot.G0
+        singleShiftGSet = null
+        pendingCharset96 = false
+        charsetPercent = false
+    }
+
+    /** DECSCL ("CSI 61..65 ; Ps1 \" p"): choose conformance level and 7/8-bit controls; implies a soft reset. */
+    private fun setConformanceLevel(params: List<Int>) {
+        val ps = params.getOrElse(0) { return }
+        if (ps !in 61..65) return
+        softReset()
+        conformanceLevel = (ps - 60).coerceAtMost(4)
+        s8c1t = ps > 61 && params.getOrElse(1) { 0 } != 1
+    }
+
+    private fun selectiveEraseInLine(mode: Int) {
+        when (mode) {
+            0 -> selectiveEraseSpan(cursorRow, cursorCol, buffer.columns - 1)
+            1 -> selectiveEraseSpan(cursorRow, 0, cursorCol)
+            2 -> selectiveEraseSpan(cursorRow, 0, buffer.columns - 1)
+            else -> {}
+        }
+    }
+
+    private fun selectiveEraseInDisplay(mode: Int) {
+        when (mode) {
+            0 -> {
+                selectiveEraseInLine(0)
+                for (r in cursorRow + 1 until buffer.rows) selectiveEraseSpan(r, 0, buffer.columns - 1)
+            }
+            1 -> {
+                for (r in 0 until cursorRow) selectiveEraseSpan(r, 0, buffer.columns - 1)
+                selectiveEraseInLine(1)
+            }
+            2 -> for (r in 0 until buffer.rows) selectiveEraseSpan(r, 0, buffer.columns - 1)
+            else -> {}
+        }
+    }
+
+    private fun selectiveEraseSpan(row: Int, from: Int, to: Int) {
+        if (row !in 0 until buffer.rows) return
+        for (c in from.coerceAtLeast(0)..to.coerceAtMost(buffer.columns - 1)) {
+            val cell = buffer.cellAt(row, c)
+            // The reserved right half of a wide glyph shares its left half's protection.
+            val protectedHere = cell.protectedCell ||
+                (cell.isWideContinuation && c > 0 && buffer.cellAt(row, c - 1).protectedCell)
+            if (!protectedHere) buffer.setCell(row, c, TerminalBuffer.Cell(bg = curBg))
+        }
+    }
+
+    /** DECDSR ("CSI ? Ps n"). Replies follow the VT220 / xterm wording. */
+    private fun handleDecDsr(params: List<Int>) {
+        when (params.getOrElse(0) { 0 }) {
+            6 -> respond("\u001B[?${reportRow()};${reportCol()};1R") // DECXCPR, page 1
+            15 -> respond("\u001B[?13n")        // printer: none
+            25 -> respond("\u001B[?20n")        // user-defined keys: unlocked
+            26 -> respond("\u001B[?27;1;0;0n")  // keyboard: North American, ready
+            53, 55 -> respond("\u001B[?50n")    // locator: none
+            56 -> respond("\u001B[?57;0n")      // locator type: unknown
+            62 -> respond("\u001B[0*{")         // macro space: 0 bytes
+            63 -> respond("\u001BP${params.getOrElse(1) { 0 }}!~0000\u001B\\") // DECCKSR
+            75 -> respond("\u001B[?70n")        // data integrity: ready, no malfunction
+            85 -> respond("\u001B[?83n")        // multi-session: not configured
+            else -> {}
+        }
+    }
+
+    private fun cursorStyleCode(): Int {
+        val base = when (cursorStyle) {
+            CursorStyle.BLOCK -> 1
+            CursorStyle.UNDERLINE -> 3
+            CursorStyle.BAR -> 5
+        }
+        return if (cursorBlinkMode) base else base + 1
+    }
+
+    private fun sgrReport(): String {
+        val sb = StringBuilder("0")
+        if (curBold) sb.append(";1")
+        if (curDim) sb.append(";2")
+        if (curItalic) sb.append(";3")
+        if (curUnderline) sb.append(if (curUnderlineCurly) ";4:3" else ";4")
+        if (curBlink) sb.append(";5")
+        if (curInverse) sb.append(";7")
+        if (curConceal) sb.append(";8")
+        if (curStrikethrough) sb.append(";9")
+        if (curOverline) sb.append(";53")
+        fun color(c: Int, isFg: Boolean) {
+            val default = if (isFg) TerminalBuffer.DEFAULT_FOREGROUND else TerminalBuffer.DEFAULT_BACKGROUND
+            if (c == default) return
+            val base = if (isFg) 30 else 40
+            when {
+                (c and TerminalPalette.TRUECOLOR_MARKER) == TerminalPalette.TRUECOLOR_MARKER ->
+                    sb.append(";${base + 8};2;${(c shr 16) and 0xFF};${(c shr 8) and 0xFF};${c and 0xFF}")
+                c in 0..7 -> sb.append(";${base + c}")
+                c in 8..15 -> sb.append(";${base + 60 + (c - 8)}")
+                else -> sb.append(";${base + 8};5;$c")
+            }
+        }
+        color(curFg, true)
+        color(curBg, false)
+        sb.append('m')
+        return sb.toString()
+    }
+
+    /** DECRQSS ("DCS $ q Pt ST"): report the current value of a control function's setting. */
+    private fun handleDecrqss(pt: String) {
+        val reply: String? = when (pt) {
+            "m" -> sgrReport()
+            "r" -> "${scrollTop + 1};${scrollBottom + 1}r"
+            "s" -> "${scrollLeft + 1};${scrollRight + 1}s"
+            " q" -> "${cursorStyleCode()} q"
+            "\"q" -> "${if (curProtected) 1 else 0}\"q"
+            "\"p" -> "6${conformanceLevel};${if (s8c1t) 0 else 1}\"p"
+            else -> null
+        }
+        respond(if (reply != null) "\u001BP1\$r$reply\u001B\\" else "\u001BP0\$r\u001B\\")
+    }
+
+    /** DECRQM / XTSAVE view of a DEC private mode: 1 = set, 2 = reset, 0 = not recognised. */
+    private fun privateModeState(ps: Int): Int {
+        fun f(v: Boolean) = if (v) 1 else 2
+        return when (ps) {
+            1 -> f(applicationCursorKeys)
+            3 -> f(deccolm132Mode)
+            5 -> f(buffer.reverseVideoMode)
+            6 -> f(originMode)
+            7 -> f(autoWrapMode)
+            8 -> f(autoRepeatMode)
+            9 -> f(mouseMode == MouseMode.X10)
+            12 -> f(cursorBlinkMode)
+            25 -> f(cursorVisible)
+            42 -> f(nrcsMode)
+            45 -> f(reverseWrapMode)
+            47, 1047, 1049 -> f(buffer.inAlternateScreen)
+            66 -> f(applicationKeypadMode)
+            67 -> f(backarrowKeyMode == true)
+            69 -> f(declrmmEnabled)
+            1000 -> f(mouseMode == MouseMode.NORMAL)
+            1002 -> f(mouseMode == MouseMode.BUTTON_EVENT)
+            1003 -> f(mouseMode == MouseMode.ANY_EVENT)
+            1004 -> f(focusReportingMode)
+            1005 -> f(mouseUtf8Mode)
+            1006 -> f(mouseSgrMode)
+            1007 -> f(alternateScrollMode)
+            1015 -> f(mouseUrxvtMode)
+            2004 -> f(bracketedPasteMode)
+            2026 -> f(inSynchronizedUpdate)
+            else -> 0
+        }
     }
 
     private fun handlePrivateMode(params: List<Int>, finalByte: Char) {
@@ -2397,7 +2839,7 @@ class TerminalEmulator(
                     cursorRow = 0
                     cursorCol = 0
                 }
-                1049, 47 -> {
+                1049, 47, 1047 -> {
                     // Alternate screen buffer, used by nano/vim/less/htop
                     // etc. Without this their full-screen redraws land
                     // directly in the primary grid/scrollback instead of a
@@ -2481,6 +2923,22 @@ class TerminalEmulator(
                         scrollRight = buffer.columns - 1
                     }
                 }
+                12 -> cursorBlinkMode = enable
+                42 -> nrcsMode = enable
+                45 -> reverseWrapMode = enable
+                66 -> applicationKeypadMode = enable
+                67 -> backarrowKeyMode = enable
+                1005 -> mouseUtf8Mode = enable
+                1007 -> alternateScrollMode = enable
+                1015 -> mouseUrxvtMode = enable
+                // 1048: save / restore cursor (the cursor half of 1049)
+                1048 -> if (enable) {
+                    savedCursorRow = cursorRow; savedCursorCol = cursorCol; decscSgr = captureSgr()
+                } else {
+                    cursorRow = savedCursorRow.coerceIn(0, buffer.rows - 1)
+                    cursorCol = savedCursorCol.coerceIn(0, buffer.columns - 1)
+                    decscSgr?.let { applySgr(it) }
+                }
                 else -> { /* unsupported private mode - ignore */ }
             }
         }
@@ -2539,7 +2997,7 @@ class TerminalEmulator(
     private fun handleKittyKeyboardProtocol(raw: String, params: List<Int>) {
         when {
             raw.startsWith("?") -> {
-                listener.onRespond("\u001B[?${kittyKeyboardFlags}u")
+                respond("\u001B[?${kittyKeyboardFlags}u")
             }
             raw.startsWith(">") -> {
                 kittyFlagStack.addLast(kittyKeyboardFlags)
@@ -2630,14 +3088,19 @@ class TerminalEmulator(
             // release byte for one.
             val finalByte = if (kind == MouseEventKind.RELEASE) 'm' else 'M'
             "\u001B[<$cb;$c;$r$finalByte"
+        } else if (mouseUrxvtMode) {
+            // 1015 (urxvt): decimal "CSI Cb ; Cx ; Cy M", Cb offset by 32 like legacy
+            "\u001B[${cb + 32};$c;${r}M"
         } else {
             // Legacy X10/1000/1002 encoding: CSI M then three raw bytes
             // (button+32, col+32, row+32). Breaks past col/row 223 - real
             // xterm has the same limitation in this mode, that's why 1006
             // exists and everything modern asks for it too.
-            val btnByte = (cb + 32).coerceIn(32, 255).toChar()
-            val colByte = (c + 32).coerceIn(32, 255).toChar()
-            val rowByte = (r + 32).coerceIn(32, 255).toChar()
+            // 1005 (UTF-8 coordinates) lifts the 223 column/row ceiling to 2015
+            val maxByte = if (mouseUtf8Mode) 2047 else 255
+            val btnByte = (cb + 32).coerceIn(32, maxByte).toChar()
+            val colByte = (c + 32).coerceIn(32, maxByte).toChar()
+            val rowByte = (r + 32).coerceIn(32, maxByte).toChar()
             "\u001B[M$btnByte$colByte$rowByte"
         }
     }
@@ -3080,6 +3543,8 @@ class TerminalEmulator(
     private fun finishDcs() {
         if (dcsIsSixel) {
             finishSixel()?.let { placeSixelImage(it) }
+        } else if (dcsBuffer.startsWith("\$q")) {
+            handleDecrqss(dcsBuffer.substring(2))
         }
         dcsIsSixel = false
         dcsBuffer.setLength(0)
@@ -3968,7 +4433,7 @@ class TerminalEmulator(
         val keys = StringBuilder("i=$imageId")
         if (imageNumber != null) keys.append(",I=").append(imageNumber)
         if (placementId != null) keys.append(",p=").append(placementId)
-        listener.onRespond("\u001B_G$keys;$message\u001B\\")
+        respond("\u001B_G$keys;$message\u001B\\")
     }
 
     // ---------------------------------------------------------------
@@ -4422,14 +4887,14 @@ class TerminalEmulator(
         // one wasn't itself a special-graphics designator.
         val activeGSet = singleShiftGSet ?: lockingGSet
         singleShiftGSet = null
-        val activeIsSpecialGraphics = when (activeGSet) {
-            CharsetSlot.G0 -> g0IsSpecialGraphics
-            CharsetSlot.G1 -> g1IsSpecialGraphics
-            CharsetSlot.G2 -> g2IsSpecialGraphics
-            CharsetSlot.G3 -> g3IsSpecialGraphics
-        }
-        val effectiveText = if (activeIsSpecialGraphics && text.length == 1) {
-            DEC_SPECIAL_GRAPHICS[text[0]]?.toString() ?: text
+        val activeCharset = gSets[activeGSet.ordinal]
+        val activeIsSpecialGraphics = activeCharset == CharsetId.GRAPHICS
+        val effectiveText = if (text.length == 1) {
+            when (activeCharset) {
+                CharsetId.ASCII -> text
+                CharsetId.GRAPHICS -> DEC_SPECIAL_GRAPHICS[text[0]]?.toString() ?: text
+                else -> Nrcs.translate(activeCharset, text[0]).toString()
+            }
         } else {
             text
         }
@@ -4515,7 +4980,8 @@ class TerminalEmulator(
                 underlineCurly = curUnderlineCurly, underlineColor = curUnderlineColor,
                 hyperlink = curHyperlink,
                 kittyPlaceholder = placeholderRef,
-                wide = canFitWide
+                wide = canFitWide,
+                protectedCell = curProtected
             )
         )
         cursorCol++
@@ -4959,10 +5425,21 @@ class TerminalEmulator(
         lineFeedNewLineMode = false
         sendReceiveMode = false
         autoRepeatMode = true
-        g0IsSpecialGraphics = false
-        g1IsSpecialGraphics = false
-        g2IsSpecialGraphics = false
-        g3IsSpecialGraphics = false
+        gSets.fill(CharsetId.ASCII)
+        pendingCharset96 = false
+        charsetPercent = false
+        s8c1t = false
+        nrcsMode = false
+        backarrowKeyMode = null
+        curProtected = false
+        cursorBlinkMode = false
+        reverseWrapMode = false
+        alternateScrollMode = false
+        modifyOtherKeysLevel = 0
+        mouseUtf8Mode = false
+        mouseUrxvtMode = false
+        savedPrivateModes.clear()
+        conformanceLevel = termProfile.defaultConformanceLevel
         lockingGSet = CharsetSlot.G0
         singleShiftGSet = null
         oscPendingSt = false
@@ -5049,7 +5526,7 @@ class TerminalEmulator(
      *  class. */
     fun reportFocusChange(focused: Boolean) {
         if (!focusReportingMode) return
-        listener.onRespond(if (focused) "\u001B[I" else "\u001B[O")
+        respond(if (focused) "\u001B[I" else "\u001B[O")
     }
 
     /** Called when the underlying buffer is resized (e.g. on rotation) so

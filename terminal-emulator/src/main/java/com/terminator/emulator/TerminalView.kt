@@ -2396,7 +2396,8 @@ private fun DrawScope.drawTerminal(
         // the keyboard - i.e. triggers a resize) while the shell was also
         // actively producing output.
         val cursor = buffer.cursorSnapshot()
-        if (!suppressCursor && scrollOffset == 0 && cursor.visible && cursor.row in 0 until cursor.rows && cursor.col in 0 until cursor.columns) {
+        val cursorBlinking = CursorBlinkPolicy.shouldBlink(buffer.cursorBlink)
+        if (!suppressCursor && scrollOffset == 0 && cursor.visible && (blinkPhaseOn || !cursorBlinking) && cursor.row in 0 until cursor.rows && cursor.col in 0 until cursor.columns) {
             val cursorX = cursor.col * charWidth
             val cursorY = (cursor.row + 1) * charHeight
             bgPaint.color = android.graphics.Color.WHITE

@@ -254,7 +254,10 @@ class TerminalSession(
 
     fun start(listener: TerminalEmulator.Listener, columns: Int, rows: Int) {
         buffer.resize(columns, rows)
-        emulator = TerminalEmulator(buffer, listener)
+        emulator = TerminalEmulator(buffer, listener).also {
+            // DA1/DA2/DECID identity and key encodings follow the selected $TERM.
+            it.termProfile = TermProfile.fromTermType(termType)
+        }
 
         val executablePath = when (spec) {
             is SessionSpec.CommandArg -> spec.commandPath

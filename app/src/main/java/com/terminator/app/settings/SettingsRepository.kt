@@ -224,6 +224,10 @@ object SettingsKeys {
     // the way a normal terminal does - you can still scroll up to see it.
     val CLEAR_ALWAYS_PTY = booleanPreferencesKey("clear_always_pty")
 
+    // Settings > Keyboard > Cursor blink: "OFF" (default), "PROGRAM" (follow
+    // DECSET 12 / DECSCUSR) or "ALWAYS". See CursorBlinkPolicy.
+    val CURSOR_BLINK = stringPreferencesKey("cursor_blink")
+
     // Terminal > Behaviour > "Allow custom app schemes". Tapping an OSC 8
     // hyperlink hands its URI to ACTION_VIEW - but that URI is untrusted
     // program output (whatever the running command, or a remote ssh host,

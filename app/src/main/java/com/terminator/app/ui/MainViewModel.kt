@@ -360,6 +360,11 @@ class MainViewModel(
             }
         }
         viewModelScope.launch {
+            settingsRepository.flow(SettingsKeys.CURSOR_BLINK, "OFF").collect { value ->
+                com.terminator.emulator.CursorBlinkPolicy.mode = value
+            }
+        }
+        viewModelScope.launch {
             settingsRepository.flow(SettingsKeys.CLEAR_ALWAYS_PTY, false).collect { value ->
                 clearAlwaysPurgesScrollback = value
                 // Unlike termType/seccomp (spawn-time only), this needs to
@@ -1887,6 +1892,15 @@ class MainViewModel(
      *  doc for what each bit means. PhysicalKeyEvent/VirtualKeyBar read
      *  this to decide whether (and how) to encode a keypress as a kitty
      *  "CSI <code>[...] u" report instead of the legacy sequence. */
+    /** The active session's $TERM behaviour profile (key encodings, DA identity). */
+    fun activeSessionTermProfile(): com.terminator.emulator.TermProfile =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.termProfile
+            ?: com.terminator.emulator.TermProfile.GENERIC
+
+    /** DECBKM override set by the running program (null = use the profile default). */
+    fun activeSessionBackarrowMode(): Boolean? =
+        liveSessions[_uiState.value.activeSessionId]?.emulator?.backarrowKeyMode
+
     fun activeSessionKittyKeyboardFlags(): Int =
         liveSessions[_uiState.value.activeSessionId]?.emulator?.kittyKeyboardFlags ?: 0
 

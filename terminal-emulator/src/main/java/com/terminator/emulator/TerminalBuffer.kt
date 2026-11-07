@@ -209,7 +209,10 @@ class TerminalBuffer(
         // - see TerminalView's drawTerminal `cell.isWideContinuation`
         // branch - since its background is already covered by the wide
         // glyph's own stretched-across-two-columns draw call.
-        var isWideContinuation: Boolean = false
+        var isWideContinuation: Boolean = false,
+        // DECSCA (CSI 1 " q): protected from selective erase (DECSED / DECSEL).
+        // Plain ED / EL ignore it, like real terminals.
+        var protectedCell: Boolean = false
 
     )
 
@@ -231,6 +234,9 @@ class TerminalBuffer(
     var cursorCol: Int = 0
     // Whether the cursor should be drawn at all (CSI ?25h/l) - full-screen
     // TUI apps commonly hide it during a redraw pass.
+    /** True while the running program asked for a blinking cursor (DECSET 12 / DECSCUSR odd values). */
+    @Volatile var cursorBlink: Boolean = false
+
     var cursorVisible: Boolean = true
     // Cursor on-screen shape (DECSCUSR) - mirrors cursorVisible: a plain
     // field kept in sync by TerminalEmulator on every SGR-shape change,
