@@ -30,6 +30,8 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Defines what a session executes.
@@ -152,7 +154,16 @@ class TerminalSession(
     // interleave mid-mutation on two different threads - a real data
     // race, not a hypothetical one. Both call sites synchronize on this
     // same object so at most one is ever inside append() at a time.
-    private val emulatorAppendLock = Any()
+    //
+    // FAIR on purpose (ReentrantLock(true)), not a plain `synchronized`: a
+    // full-screen program streaming continuous output (btop at a zoomed-out,
+    // several-hundred-column grid) keeps the reader thread cycling
+    // read -> lock -> append -> unlock -> read with only a microsecond gap, and
+    // a non-fair monitor lets it re-take the lock before a waiter ever wakes.
+    // resize() runs on the UI thread, so that starvation showed up as the app
+    // freezing while zooming. Fair ordering hands the lock to the waiting
+    // resize() after at most one chunk.
+    private val emulatorAppendLock = ReentrantLock(true)
 
     // True while more pty bytes are already waiting right behind the chunk
     // the reader is currently appending. A full-screen redraw (ncurses:
@@ -254,7 +265,10 @@ class TerminalSession(
 
     fun start(listener: TerminalEmulator.Listener, columns: Int, rows: Int) {
         buffer.resize(columns, rows)
-        emulator = TerminalEmulator(buffer, listener)
+        emulator = TerminalEmulator(buffer, listener).also {
+            // DA1/DA2/DECID identity and key encodings follow the selected $TERM.
+            it.termProfile = TermProfile.fromTermType(termType)
+        }
 
         val executablePath = when (spec) {
             is SessionSpec.CommandArg -> spec.commandPath
@@ -308,6 +322,18 @@ class TerminalSession(
         pid = pidOut[0]
         alive = true
 
+        // Reap the child. Nothing ever called waitpid, so every session that
+        // exited stayed a zombie (<defunct>) until the whole app process died.
+        // Blocks until the child exits, so it lives on its own daemon thread.
+        val childPid = pid
+        if (childPid > 0) {
+            Thread { NativePty.waitFor(childPid) }.apply {
+                isDaemon = true
+                name = "pty-reaper-$childPid"
+                start()
+            }
+        }
+
         val pfd = ParcelFileDescriptor.adoptFd(masterFd)
         masterPfd = pfd
         inputStream = FileInputStream(pfd.fileDescriptor)
@@ -324,7 +350,16 @@ class TerminalSession(
                     val chunk = String(buf, 0, n)
                     inputPending = isr.ready()
                     if (n >= 3500) burstUntilNanos = System.nanoTime() + 8_000_000L
-                    synchronized(emulatorAppendLock) { emulator.append(chunk) }
+                    emulatorAppendLock.withLock {
+                        try {
+                            emulator.append(chunk)
+                        } catch (e: RuntimeException) {
+                            // A parser/buffer bug on one chunk must not kill the
+                            // reader thread: an uncaught exception on a non-main
+                            // thread takes the whole app down. Logged, not hidden.
+                            android.util.Log.e("TerminatorSession", "emulator.append failed; chunk dropped", e)
+                        }
+                    }
                     appendHistory(chunk)
                 }
             } catch (_: IOException) {
@@ -336,7 +371,7 @@ class TerminalSession(
                 // next chunk to see if this cluster keeps extending" no
                 // longer applies; render whatever was captured instead of
                 // silently dropping the last partial sequence.
-                emulator.flushPendingCluster()
+                emulatorAppendLock.withLock { emulator.flushPendingCluster() }
                 // Stop the periodic flusher before closing the stream it
                 // flushes - interrupt() breaks it out of its sleep loop
                 // (see historyFlusher's own doc), then close() below does
@@ -524,7 +559,7 @@ class TerminalSession(
      * DEL/BS bytes handled separately above.
      */
     private fun localEchoAppend(data: String) {
-        synchronized(emulatorAppendLock) {
+        emulatorAppendLock.withLock {
             var runStart = 0
             var i = 0
             while (i < data.length) {
@@ -628,7 +663,7 @@ class TerminalSession(
         // cursor row on the resized (alt) grid: the "top is cloned / alt
         // screen mixes with the normal screen" symptom after the keyboard
         // opens or a pinch-zoom.
-        synchronized(emulatorAppendLock) {
+        emulatorAppendLock.withLock {
             buffer.resize(columns, rows)
             if (::emulator.isInitialized) emulator.onBufferResized()
         }
@@ -791,7 +826,10 @@ class TerminalSession(
         // the drawer trash icon (kill(), which is a SIGKILL per spec).
         if (::emulator.isInitialized) {
             val message = "\r\n[Process completed - press Enter]\r\n"
-            emulator.append(message)
+            // Same lock as the reader thread's append(): destroy()/kill() run
+            // this on the UI thread while the reader may still be inside
+            // append(), and the emulator/buffer are not thread-safe.
+            emulatorAppendLock.withLock { emulator.append(message) }
             appendHistory(message)
         }
         // See mainHandler's doc above - this MUST NOT invoke exitListener
