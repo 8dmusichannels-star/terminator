@@ -20,6 +20,7 @@
 
 package com.terminator.app.ui
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -102,6 +103,11 @@ import com.terminator.emulator.MouseGestureTracker
 import com.terminator.emulator.TerminalPalette
 import com.terminator.emulator.TerminalView
 
+// RestrictedApi false positive: androidx.activity.ComponentActivity inherits
+// dispatchKeyEvent (and friends) from the library-group-restricted
+// androidx.core.app.ComponentActivity, so overriding them from an app
+// module trips lint even though it's the documented way to intercept keys.
+@SuppressLint("RestrictedApi")
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels {
@@ -152,6 +158,12 @@ class MainActivity : ComponentActivity() {
     // other terminal's out-of-the-box default.
     private var physicalKeyRepeatEnabled = true
 
+    // downTime of the physical Enter press that just dismissed an exited
+    // session. Holding Enter keeps generating ACTION_DOWN repeats with the
+    // same downTime; without this the repeats would immediately dismiss (or
+    // type into) whichever session became active next.
+    private var dismissEnterDownTime = -1L
+
     // SelectionOverrideToolbar.kt's own doc says this is required
     // alongside the Compose-level NoOpTextToolbar block ("some
     // compose-foundation versions still go through real ActionMode
@@ -193,6 +205,75 @@ class MainActivity : ComponentActivity() {
         viewModel.broadcastFocusChange(hasFocus)
     }
 
+    /** The emulator the next physical key press is routed to (see PhysicalKeyboardRouting.dispatch). */
+    private fun physicalTargetEmulator(): com.terminator.emulator.TerminalEmulator? {
+        val routing = physicalKeyboardRouting
+        val state = viewModel.uiState.value
+        val id = when {
+            routing.isMultiPane -> state.focusedPaneRuntimeId ?: state.activeSessionId
+            routing.splitPaneFocused && routing.splitRuntimeId != null -> routing.splitRuntimeId
+            else -> state.activeSessionId
+        }
+        return id?.let { viewModel.emulatorFor(it) }
+    }
+
+    /** Zoom callback for Ctrl+'+' / Ctrl+'-' / Ctrl+'0' (also numpad), or null when [event] isn't one. */
+    private fun physicalZoomAction(event: android.view.KeyEvent): (() -> Unit)? {
+        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return null
+        val r = physicalKeyboardRouting
+        return when (event.keyCode) {
+            android.view.KeyEvent.KEYCODE_EQUALS,
+            android.view.KeyEvent.KEYCODE_PLUS,
+            android.view.KeyEvent.KEYCODE_NUMPAD_ADD -> r.zoomIn
+            android.view.KeyEvent.KEYCODE_MINUS,
+            android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> r.zoomOut
+            android.view.KeyEvent.KEYCODE_0,
+            android.view.KeyEvent.KEYCODE_NUMPAD_0 -> r.zoomReset
+            else -> null
+        }
+    }
+
+    /**
+     * Physical-keyboard counterpart of the on-screen/IME paths' Ctrl+D and
+     * "Enter on an exited session" handling, which the physical path never
+     * had:
+     *  - Ctrl+D goes through the foreground-aware kill (SIGKILL when the
+     *    shell itself is in the foreground, plain EOT otherwise) so the
+     *    "exited" flag is set synchronously, instead of a raw EOT that the
+     *    shell only acts on asynchronously.
+     *  - Enter on an exited session dismisses it (and closes the app when it
+     *    was the last one) instead of writing \r into a closed pty.
+     * Multi-pane mode is left to MainViewModel.sendPaneInput, which already
+     * does both. Returns true when the key was consumed here.
+     */
+    private fun handlePhysicalSessionControl(event: android.view.KeyEvent, sequence: String): Boolean {
+        val routing = physicalKeyboardRouting
+        if (routing.isMultiPane) return false
+        val state = viewModel.uiState.value
+        val splitId = routing.splitRuntimeId
+        val onSplit = routing.splitPaneFocused && splitId != null
+        val targetId = if (onSplit) splitId else state.activeSessionId
+        val exited = state.runningSessions.firstOrNull { it.runtimeId == targetId }?.exited == true
+        // By key code rather than by the bytes: with the kitty protocol's "report
+        // all keys" still set by a program that died, Enter would be "CSI 13 u".
+        val isEnter = event.keyCode == android.view.KeyEvent.KEYCODE_ENTER ||
+            event.keyCode == android.view.KeyEvent.KEYCODE_NUMPAD_ENTER
+        if (exited && isEnter) {
+            dismissEnterDownTime = event.downTime
+            if (onSplit) {
+                viewModel.killSession(splitId!!)
+            } else if (viewModel.dismissExitedActiveSession()) {
+                finish()
+            }
+            return true
+        }
+        if (sequence == "\u0004") {
+            if (onSplit) viewModel.killSessionHard(splitId!!) else viewModel.killActiveSessionHard()
+            return true
+        }
+        return false
+    }
+
     // Entry point for every hardware/Bluetooth keyboard key press. Only
     // ACTION_DOWN is forwarded to the terminal - ACTION_UP is consumed
     // silently (return true) so the platform never falls through to its
@@ -203,6 +284,32 @@ class MainActivity : ComponentActivity() {
     // events (e.g. media keys, the system back gesture) continue through
     // the platform's normal dispatch instead of being silently eaten.
     @Suppress("RestrictedApi")
+    /**
+     * Physical mouse wheel -> DECSET 1007 (alternate scroll). On the alternate
+     * screen with mouse tracking off and mode 1007 set, a wheel step is sent
+     * as Up/Down cursor keys (DECCKM- and profile-aware) so less/man/vim
+     * scroll with the wheel. Every other case falls through untouched
+     * (mouse tracking, primary screen, touch scrolling).
+     */
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        if (event.action == android.view.MotionEvent.ACTION_SCROLL &&
+            event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
+        ) {
+            val em = physicalTargetEmulator()
+            val v = event.getAxisValue(android.view.MotionEvent.AXIS_VSCROLL)
+            if (em != null && v != 0f && em.alternateScrollMode &&
+                em.mouseMode == com.terminator.emulator.TerminalEmulator.MouseMode.NONE &&
+                em.buffer.inAlternateScreen
+            ) {
+                val steps = maxOf(1, kotlin.math.abs(v).toInt()) * 3
+                val key = em.termProfile.cursorKey(if (v > 0f) 'A' else 'B', em.applicationCursorKeys)
+                physicalKeyboardRouting.dispatch(viewModel, key.repeat(steps))
+                return true
+            }
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
         // source check excludes the on-screen/IME keyboard (which reports
         // SOURCE_KEYBOARD too on some OEM IMEs) from actually mattering
@@ -229,7 +336,31 @@ class MainActivity : ComponentActivity() {
             return true
         }
 
-        val sequence = PhysicalKeyEvent.sequenceFor(event) ?: return super.dispatchKeyEvent(event)
+        // Ctrl + / Ctrl - / Ctrl 0: text size zoom on the physical keyboard,
+        // checked after user-bound app shortcuts so a custom binding still
+        // wins. Both ACTION_DOWN (zoom, key repeat steps it further) and
+        // ACTION_UP (swallowed) are consumed so the combo never also reaches
+        // the shell as Ctrl+- (0x1F) etc.
+        physicalZoomAction(event)?.let { zoom ->
+            if (event.action == android.view.KeyEvent.ACTION_DOWN) zoom()
+            return true
+        }
+
+        // Everything below (profile, DECCKM, DECBKM, kitty flags, modifyOtherKeys)
+        // is read from the emulator of the pane the key is actually going to -
+        // the focused multi-pane tile, the focused split pane or the active
+        // session - not always the active session.
+        val targetEmulator = physicalTargetEmulator()
+        val kittyFlags = targetEmulator?.kittyKeyboardFlags ?: 0
+        val sequence = PhysicalKeyEvent.sequenceFor(
+            event,
+            kittyFlags = kittyFlags,
+            profile = targetEmulator?.termProfile ?: com.terminator.emulator.TermProfile.GENERIC,
+            applicationCursorKeys = targetEmulator?.applicationCursorKeys == true,
+            backarrowMode = targetEmulator?.backarrowKeyMode,
+            modifyOtherKeys = targetEmulator?.modifyOtherKeysLevel ?: 0,
+            applicationKeypad = targetEmulator?.applicationKeypadMode == true
+        ) ?: return super.dispatchKeyEvent(event)
         if (event.action == android.view.KeyEvent.ACTION_DOWN) {
             // repeatCount > 0 marks a synthetic repeat generated by the
             // held-down key itself (the device/firmware keeps resending
@@ -240,14 +371,24 @@ class MainActivity : ComponentActivity() {
             // (return true) either way so a suppressed repeat doesn't leak
             // into Compose's default handling.
             val isRepeat = event.repeatCount > 0
+            if (isRepeat && event.downTime == dismissEnterDownTime) return true
             if (sequence.isNotEmpty() && (!isRepeat || physicalKeyRepeatEnabled)) {
-                physicalKeyboardRouting.dispatch(viewModel, sequence)
+                if (!handlePhysicalSessionControl(event, sequence)) {
+                    physicalKeyboardRouting.dispatch(viewModel, sequence)
+                }
             }
             return true
         }
         if (event.action == android.view.KeyEvent.ACTION_UP) {
-            // Swallow the matching UP too - see this function's own doc
-            // above for why letting it fall through is unsafe.
+            // Key-up is only ever forwarded under the kitty protocol's "report
+            // event types" enhancement (releaseSequenceFor returns null
+            // otherwise). It is swallowed either way - see this function's own
+            // doc above for why letting it fall through is unsafe.
+            if (kittyFlags != 0) {
+                PhysicalKeyEvent.releaseSequenceFor(event, kittyFlags)
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { physicalKeyboardRouting.dispatch(viewModel, it) }
+            }
             return true
         }
         return super.dispatchKeyEvent(event)
@@ -3861,14 +4002,19 @@ class MainActivity : ComponentActivity() {
                                                     // only correct in normal mode; in application mode
                                                     // the same keys must go out as SS3 (\EO..) instead,
                                                     // or the program won't recognize them as anything.
-                                                    if (viewModel.activeSessionApplicationCursorKeys()) {
+                                                    // Same profile + DECCKM logic as the physical keyboard
+                                                    // (PhysicalKeyEvent), so Home/End differ per $TERM
+                                                    // (screen/tmux/vt220: \E[1~ / \E[4~).
+                                                    run {
+                                                        val profile = viewModel.activeSessionTermProfile()
+                                                        val appCursor = viewModel.activeSessionApplicationCursorKeys()
                                                         seq = when (key) {
-                                                            VirtualKey.UP -> "\u001BOA"
-                                                            VirtualKey.DOWN -> "\u001BOB"
-                                                            VirtualKey.RIGHT -> "\u001BOC"
-                                                            VirtualKey.LEFT -> "\u001BOD"
-                                                            VirtualKey.HOME -> "\u001BOH"
-                                                            VirtualKey.END -> "\u001BOF"
+                                                            VirtualKey.UP -> profile.cursorKey('A', appCursor)
+                                                            VirtualKey.DOWN -> profile.cursorKey('B', appCursor)
+                                                            VirtualKey.RIGHT -> profile.cursorKey('C', appCursor)
+                                                            VirtualKey.LEFT -> profile.cursorKey('D', appCursor)
+                                                            VirtualKey.HOME -> profile.home(appCursor)
+                                                            VirtualKey.END -> profile.end(appCursor)
                                                             else -> seq
                                                         }
                                                     }

@@ -86,11 +86,16 @@ gradle assembleRelease --stacktrace
 
 ## Showcase
 
-[<img src="showcase/showcase1.png" width=19% alt="Showcase1">](showcase/showcase1.png)
-[<img src="showcase/showcase2.png" width=19% alt="Showcase2">](showcase/showcase2.png)
-[<img src="showcase/showcase3.png" width=19% alt="Showcase3">](showcase/showcase3.png)
-[<img src="showcase/showcase4.png" width=19% alt="Showcase4">](showcase/showcase4.png)
-[<img src="showcase/showcase5.png" width=19% alt="Showcase5">](showcase/showcase5.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/1.png" width=19% alt="Showcase1">](fastlane/metadata/android/en-US/images/phoneScreenshots/1.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/2.png" width=19% alt="Showcase2">](fastlane/metadata/android/en-US/images/phoneScreenshots/2.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/3.png" width=19% alt="Showcase3">](fastlane/metadata/android/en-US/images/phoneScreenshots/3.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/4.png" width=19% alt="Showcase4">](fastlane/metadata/android/en-US/images/phoneScreenshots/4.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/5.png" width=19% alt="Showcase5">](fastlane/metadata/android/en-US/images/phoneScreenshots/5.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/6.png" width=19% alt="Showcase6">](fastlane/metadata/android/en-US/images/phoneScreenshots/6.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/7.png" width=19% alt="Showcase7">](fastlane/metadata/android/en-US/images/phoneScreenshots/7.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/8.png" width=19% alt="Showcase8">](fastlane/metadata/android/en-US/images/phoneScreenshots/8.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/9.png" width=19% alt="Showcase9">](fastlane/metadata/android/en-US/images/phoneScreenshots/9.png)
+[<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/10.png" width=19% alt="Showcase10">](fastlane/metadata/android/en-US/images/phoneScreenshots/10.png)
 
 # Support and Donate
 
