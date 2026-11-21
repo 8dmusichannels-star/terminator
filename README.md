@@ -97,10 +97,15 @@ gradle assembleRelease --stacktrace
 [<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/9.png" width=19% alt="Showcase9">](fastlane/metadata/android/en-US/images/phoneScreenshots/9.png)
 [<img src="fastlane/metadata/android/en-US/images/phoneScreenshots/10.png" width=19% alt="Showcase10">](fastlane/metadata/android/en-US/images/phoneScreenshots/10.png)
 
+# Docs
+
+[For more information about the Terminator project](https://docs.kerneluser.space/docs/terminator.html)
+
 # Support and Donate
 
 If you want to contribute to development:
 
 [Support and Donate](https://www.patreon.com/Azccriminal)
+
 
 [Contributed](https://github.com/8dmusichannels-star/terminator/pulls)
